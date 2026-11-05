@@ -8,6 +8,9 @@
 // Before running: the phone is unlocked on the home screen, and the icon named by --tap-label
 // (default "Settings") is visible on the current home screen page.
 //
+// idevice-tools often exits 0 on failure, so any standard-error line containing error, unable, failed or
+// panicked counts as a failed step; a benign log line with those words would also fail it.
+//
 // POKI_HID_OPEN_MS and POKI_HID_CLOSE_MS pass through to the bridge to try longer input waits.
 //
 // The script prints a Markdown table for docs/linux-smoke-test.md. It never prints the pairing file,

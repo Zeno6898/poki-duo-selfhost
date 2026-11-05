@@ -46,34 +46,42 @@ fi
 
 umask 077
 partial="$out.partial.$$"
-trap 'rm -f "$partial"' EXIT INT TERM
-# idevice-tools pair prints the new pairing record on standard output and also saves it with usbmuxd.
-if ! "$tools" pair --name "$name" "$udid" >"$partial"; then
+errors="$out.stderr.$$"
+trap 'rm -f "$partial" "$errors"' EXIT INT TERM
+# idevice-tools pair prints the new pairing record on standard output, then asks usbmuxd to save it.
+# That save can fail (Apple's usbmuxd may refuse it) after the record is complete, so the exit status
+# is ignored and the captured record decides.
+"$tools" pair --name "$name" "$udid" >"$partial" 2>"$errors" || true
+if ! grep -q '<plist' "$partial" || ! grep -q '</plist>' "$partial"; then
   echo 'Pairing failed. Unlock the phone, tap Trust when it asks, and run bin/pair again.' >&2
-  exit 1
-fi
-if ! grep -q '<plist' "$partial"; then
-  echo 'idevice-tools pair did not print a pairing record. Unlock the phone, tap Trust, and run bin/pair again.' >&2
+  tail -n 5 "$errors" >&2
   exit 1
 fi
 chmod 600 "$partial"
 mv "$partial" "$out"
+rm -f "$errors"
 trap - EXIT INT TERM
 echo "Pairing file written to $out (mode 0600)."
 
-# iOS 17 and later answer lockdown over the network only with Wi-Fi debugging enabled.
+# iOS 17 and later answer lockdown over the network only with Wi-Fi connections enabled.
+if command -v pymobiledevice3 >/dev/null 2>&1; then
+  if pymobiledevice3 lockdown wifi-connections on --udid "$udid"; then
+    echo 'Turned on Wi-Fi connections with pymobiledevice3.'
+  else
+    echo 'pymobiledevice3 could not turn on Wi-Fi connections. Keep the phone on USB and unlocked, then run: pymobiledevice3 lockdown wifi-connections on' >&2
+  fi
+else
+  cat <<'HINT'
+Turn on Wi-Fi connections for the phone, with it on USB and unlocked, in one of two ways:
+  - macOS Finder: select the phone, General tab, check "Show this iPhone when on Wi-Fi", then Apply.
+  - Install pymobiledevice3 (pip install pymobiledevice3) and run: pymobiledevice3 lockdown wifi-connections on
+HINT
+fi
 domain=com.apple.mobile.wireless_lockdown
-set_output=$("$tools" --udid "$udid" lockdown --domain "$domain" set true EnableWifiDebugging 2>&1 || true)
-case $set_output in
-  *'Successfully set'*) echo "Set EnableWifiDebugging in $domain." ;;
-  *) echo "Could not set EnableWifiDebugging: $set_output" >&2 ;;
-esac
-readback=$("$tools" --udid "$udid" lockdown --domain "$domain" get EnableWifiDebugging 2>&1 || true)
-echo "EnableWifiDebugging now reads: $readback"
-case $readback in
-  *true*) ;;
-  *) echo 'Wi-Fi debugging does not read as true. Network connections may be refused. With pymobiledevice3 installed, run: pymobiledevice3 lockdown wifi-connections on' >&2 ;;
-esac
+for key in EnableWifiConnections EnableWifiDebugging; do
+  value=$("$tools" --udid "$udid" lockdown --domain "$domain" get "$key" 2>&1 || true)
+  echo "$key reads: ${value:-unset}"
+done
 
 cat <<EOF
 
