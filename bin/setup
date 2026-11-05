@@ -2,8 +2,8 @@
 # On Linux (no Xcode), the device tools build with these two commands after cloning
 # https://github.com/jkcoxson/idevice into .deps/idevice at the revision pinned below:
 #   (cd .deps/idevice && cargo build --locked --release -p idevice-tools --bin idevice-tools --bin idevice_id)
-#   cargo build --locked --release --manifest-path native/bridge/Cargo.toml --target-dir build/native-target --bin poki-native
-#   cp build/native-target/release/poki-native build/poki-native
+#   cargo build --locked --release --manifest-path native/bridge/Cargo.toml --target-dir build/native-target --bin poki-native --bin poki-pair-remote
+#   cp build/native-target/release/poki-native build/native-target/release/poki-pair-remote build/
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if [ "$(uname -s)" != Darwin ]; then

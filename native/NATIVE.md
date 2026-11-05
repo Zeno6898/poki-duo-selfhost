@@ -6,6 +6,8 @@ Build with `./bin/build-native`. This remaps build paths before producing `build
 
 Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-file PATH` to reach the device over the network with a saved pairing file, and send one JSON object through standard input. Success returns JSON on standard output. Failure returns JSON on standard error and exits with code 1. The overall command timeout is 90 seconds.
 
+`build/poki-native --host IP --rp-pairing-file PATH [--rp-host-name NAME]` reaches the device through its remote pairing service on port 49152 instead of lockdown, for networks where iOS closes lockdown (port 62078), such as a tailnet. The bridge runs pair-verify with the RPPairing file, opens a TLS-PSK CDTunnel and runs the RSD handshake inside it; it never falls back to pairing. Installation, uninstallation and the SpringBoard names in `list_apps` use the `*.shim.remote` RSD services inside the tunnel. Errors start with `pair-verify failed:` when the phone rejects the file (make a new one) and with `tunnel failed after pair-verify:` when the file is good and the tunnel did not come up. Make the RPPairing file once over USB with `bin/pair-remote`, which records the host name under the `sending_host` key; `--rp-host-name` is used only when the file has none, and this machine's host name otherwise. At the pinned idevice revision pair-verify signs with the file's `identifier` and sends no host name, so the name matters only for a file whose pairing will be redone. `bin/pair-remote --check --host IP --rp-pairing-file PATH` runs the same path and lists the RSD services.
+
 | op | Parameters | Behavior |
 | --- | --- | --- |
 | `display_info` | None | Read the device's raw display media capabilities. |

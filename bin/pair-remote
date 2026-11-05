@@ -1,0 +1,56 @@
+#!/bin/sh
+# Make an RPPairing file for the bridge's remote pairing transport, or check one over the network.
+#
+# Recent iOS versions close plain lockdown over routed networks such as a tailnet, while the phone's
+# remote pairing service (port 49152) keeps answering. The bridge reaches that service with
+#   build/poki-native --host IP --rp-pairing-file PATH
+# and needs an RPPairing file, which this script makes over USB once.
+#
+# usage: bin/pair-remote [--name HOST] [--out FILE] UDID
+#          Pair over USB, with the phone unlocked and already trusting this computer (bin/pair).
+#          There is no PIN; tap Trust if the phone asks. Writes FILE (default ./UDID.rppairing.plist)
+#          with mode 0600 and records HOST (default: this machine's hostname) in it.
+#        bin/pair-remote --check --host IP --rp-pairing-file FILE [--rp-host-name HOST]
+#          Run pair-verify, open the tunnel and list the RSD services, as the bridge does.
+# iPhones do not accept PIN pairing over the network, so the file has to be made over USB.
+# The RPPairing file is a credential: never commit or share it.
+# Set POKI_PAIR_REMOTE to use a poki-pair-remote other than build/poki-pair-remote.
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+usage='usage: bin/pair-remote [--name HOST] [--out FILE] UDID
+       bin/pair-remote --check --host IP --rp-pairing-file FILE [--rp-host-name HOST]'
+tool=${POKI_PAIR_REMOTE:-$project_dir/build/poki-pair-remote}
+if [ ! -x "$tool" ]; then
+  tool=$project_dir/build/native-target/release/poki-pair-remote
+fi
+if [ ! -x "$tool" ]; then
+  echo 'poki-pair-remote was not found. Build it with:' >&2
+  echo '  cargo build --locked --release --manifest-path native/bridge/Cargo.toml --target-dir build/native-target --bin poki-pair-remote' >&2
+  exit 1
+fi
+if [ "${1:-}" = --check ]; then
+  shift
+  exec "$tool" check "$@"
+fi
+name=
+out=
+udid=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --name) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; name=$2; shift 2 ;;
+    --out) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; out=$2; shift 2 ;;
+    -h|--help) echo "$usage"; exit 0 ;;
+    -*) echo "$usage" >&2; exit 2 ;;
+    *) [ -z "$udid" ] || { echo "$usage" >&2; exit 2; }; udid=$1; shift ;;
+  esac
+done
+if [ -z "$udid" ]; then
+  echo "$usage" >&2
+  exit 2
+fi
+out=${out:-./$udid.rppairing.plist}
+umask 077
+if [ -n "$name" ]; then
+  exec "$tool" pair --udid "$udid" --out "$out" --name "$name"
+fi
+exec "$tool" pair --udid "$udid" --out "$out"

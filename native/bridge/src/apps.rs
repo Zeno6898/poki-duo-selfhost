@@ -137,7 +137,7 @@ async fn installed_apps(
 pub async fn list(
     adapter: &mut AdapterHandle,
     rsd: &mut RsdHandshake,
-    provider: &dyn IdeviceProvider,
+    provider: Option<&dyn IdeviceProvider>,
 ) -> Result<Value> {
     let mut service = AppServiceClient::connect_rsd(adapter, rsd).await?;
     let mut apps = installed_apps(&mut service, rsd).await?.into_iter().map(|app| {
@@ -145,7 +145,10 @@ pub async fn list(
         json!({"bundle_id":app.bundle_identifier,"name":app.name,"version":app.version,"system":system,"path":app.path,"developer":app.is_developer_app,"aliases":[]})
     }).collect::<Vec<_>>();
     let icons = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut springboard = SpringBoardServicesClient::connect(provider).await?;
+        let mut springboard = match provider {
+            Some(provider) => SpringBoardServicesClient::connect(provider).await?,
+            None => SpringBoardServicesClient::connect_rsd(adapter, rsd).await?,
+        };
         springboard.get_icon_state(Some("2")).await
     })
     .await;

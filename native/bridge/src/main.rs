@@ -4,11 +4,12 @@ mod configuration;
 mod gesture;
 mod installation;
 mod pasteboard;
+mod remote;
 mod stream;
 
 use gesture::{Drag, Pinch, pinch_contacts};
 use idevice::{
-    IdeviceService, ReadWrite, RsdService,
+    IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::hid::{
         ButtonState, IndigoHidClient, KeyboardUsage, MainKeyboardService,
         TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
@@ -17,6 +18,7 @@ use idevice::{
     pairing_file::PairingFile,
     provider::{IdeviceProvider, TcpProvider},
     rsd::RsdHandshake,
+    tcp::handle::AdapterHandle,
     usbmuxd::{UsbmuxdAddr, UsbmuxdConnection},
 };
 use serde::Deserialize;
@@ -237,30 +239,40 @@ impl Request {
     }
 }
 
-/// How the bridge reaches the device: through usbmuxd by UDID (the default), or directly over the
-/// network with a saved pairing file.
+/// How the bridge reaches the device: through usbmuxd by UDID (the default), over the network with
+/// a saved lockdown pairing file, or over the network through the phone's remote pairing service
+/// with a saved RPPairing file.
 #[derive(Debug, PartialEq)]
 enum Target {
-    Usbmuxd { udid: String },
-    Network { host: IpAddr, pairing_file: PathBuf },
+    Usbmuxd {
+        udid: String,
+    },
+    Network {
+        host: IpAddr,
+        pairing_file: PathBuf,
+    },
+    RemotePairing {
+        host: IpAddr,
+        rp_pairing_file: PathBuf,
+        host_name: Option<String>,
+    },
 }
 
-const USAGE: &str = "usage: poki-native --udid ID < request.json\n       poki-native --host IP --pairing-file PATH < request.json";
+const USAGE: &str = "usage: poki-native --udid ID < request.json\n       poki-native --host IP --pairing-file PATH < request.json\n       poki-native --host IP --rp-pairing-file PATH [--rp-host-name NAME] < request.json";
 
 fn parse_args(args: &[String]) -> Result<Target> {
-    if args.len() == 3 && args[1] == "--udid" {
-        return Ok(Target::Usbmuxd {
-            udid: args[2].clone(),
-        });
-    }
-    if args.len() != 5 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Err(USAGE.into());
     }
-    let (mut host, mut pairing_file) = (None, None);
+    let (mut udid, mut host, mut pairing_file, mut rp_pairing_file, mut host_name) =
+        (None, None, None, None, None);
     for pair in args[1..].chunks(2) {
         let slot = match pair[0].as_str() {
+            "--udid" => &mut udid,
             "--host" => &mut host,
             "--pairing-file" => &mut pairing_file,
+            "--rp-pairing-file" => &mut rp_pairing_file,
+            "--rp-host-name" => &mut host_name,
             _ => return Err(USAGE.into()),
         };
         if slot.is_some() || pair[1].is_empty() {
@@ -268,18 +280,29 @@ fn parse_args(args: &[String]) -> Result<Target> {
         }
         *slot = Some(pair[1].as_str());
     }
-    let (Some(host), Some(pairing_file)) = (host, pairing_file) else {
-        return Err(USAGE.into());
+    let ip = |host: &str| {
+        host.parse::<IpAddr>()
+            .map_err(|_| format!("--host must be an IP address, got {host}"))
     };
-    let host = host
-        .parse::<IpAddr>()
-        .map_err(|_| format!("--host must be an IP address, got {host}"))?;
-    Ok(Target::Network {
-        host,
-        pairing_file: PathBuf::from(pairing_file),
-    })
+    Ok(
+        match (udid, host, pairing_file, rp_pairing_file, host_name) {
+            (Some(udid), None, None, None, None) => Target::Usbmuxd { udid: udid.into() },
+            (None, Some(host), Some(pairing_file), None, None) => Target::Network {
+                host: ip(host)?,
+                pairing_file: PathBuf::from(pairing_file),
+            },
+            (None, Some(host), None, Some(rp_pairing_file), host_name) => Target::RemotePairing {
+                host: ip(host)?,
+                rp_pairing_file: PathBuf::from(rp_pairing_file),
+                host_name: host_name.map(String::from),
+            },
+            _ => return Err(USAGE.into()),
+        },
+    )
 }
 
+/// A lockdown provider for the usbmuxd and lockdown network targets. The remote pairing target has
+/// none: its lockdown-era services come from their RSD shims (see [`Lockdown`]).
 async fn provider(target: &Target) -> Result<Box<dyn IdeviceProvider>> {
     Ok(match target {
         Target::Usbmuxd { udid } => {
@@ -307,7 +330,37 @@ async fn provider(target: &Target) -> Result<Box<dyn IdeviceProvider>> {
                 label: "poki-mcp".into(),
             })
         }
+        Target::RemotePairing { .. } => {
+            return Err("The remote pairing target has no lockdown provider.".into());
+        }
     })
+}
+
+/// Where the installation_proxy, AFC and SpringBoard services come from: lockdown through a
+/// provider, or the `*.shim.remote` RSD services inside a tunnel.
+pub enum Lockdown<'a> {
+    Provider(&'a dyn IdeviceProvider),
+    Rsd(&'a mut AdapterHandle, &'a mut RsdHandshake),
+}
+
+impl Lockdown<'_> {
+    pub async fn connect<S: IdeviceService + RsdService>(
+        &mut self,
+    ) -> std::result::Result<S, IdeviceError> {
+        match self {
+            Self::Provider(provider) => S::connect(*provider).await,
+            Self::Rsd(adapter, rsd) => S::connect_rsd(&mut **adapter, rsd).await,
+        }
+    }
+}
+
+/// An RSD session inside a tunnel. `provider` is set for the usbmuxd and lockdown network targets;
+/// `_control` keeps the remote pairing control connection open while the tunnel is in use.
+struct Device {
+    adapter: AdapterHandle,
+    rsd: RsdHandshake,
+    provider: Option<Box<dyn IdeviceProvider>>,
+    _control: Option<remote::Control>,
 }
 
 #[tokio::main]
@@ -341,19 +394,35 @@ async fn main() {
     }
 }
 
-async fn connect_device(
-    target: &Target,
-) -> Result<(
-    idevice::tcp::handle::AdapterHandle,
-    RsdHandshake,
-    Box<dyn IdeviceProvider>,
-)> {
+async fn connect_device(target: &Target) -> Result<Device> {
+    if let Target::RemotePairing {
+        host,
+        rp_pairing_file,
+        host_name,
+    } = target
+    {
+        let (mut file, sending_host) =
+            remote::read_pairing_file(rp_pairing_file, host_name.as_deref())?;
+        let (adapter, rsd, control) =
+            remote::connect(*host, &mut file, &sending_host, trace).await?;
+        return Ok(Device {
+            adapter,
+            rsd,
+            provider: None,
+            _control: Some(control),
+        });
+    }
     let provider = provider(target).await?;
     let proxy = CoreDeviceProxy::connect(&*provider).await?;
     let port = proxy.tunnel_info().server_rsd_port;
     let mut adapter = proxy.create_software_tunnel()?.to_async_handle();
     let rsd = RsdHandshake::new(adapter.connect(port).await?).await?;
-    Ok((adapter, rsd, provider))
+    Ok(Device {
+        adapter,
+        rsd,
+        provider: Some(provider),
+        _control: None,
+    })
 }
 
 async fn execute(target: &Target, request: Request) -> Result<Value> {
@@ -362,7 +431,14 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
         Request::InstallApp { .. } | Request::UninstallApp { .. }
     ) {
         let result = async {
-            let provider = provider(target).await?;
+            let (mut device, lockdown_provider);
+            let mut link = if matches!(target, Target::RemotePairing { .. }) {
+                device = connect_device(target).await?;
+                Lockdown::Rsd(&mut device.adapter, &mut device.rsd)
+            } else {
+                lockdown_provider = provider(target).await?;
+                Lockdown::Provider(&*lockdown_provider)
+            };
             match request {
                 Request::InstallApp {
                     ipa_path,
@@ -370,7 +446,7 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
                     staging_id,
                 } => {
                     installation::install(
-                        &*provider,
+                        &mut link,
                         std::path::Path::new(&ipa_path),
                         &bundle_id,
                         &staging_id,
@@ -378,7 +454,7 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
                     .await
                 }
                 Request::UninstallApp { bundle_id } => {
-                    installation::uninstall(&*provider, &bundle_id).await
+                    installation::uninstall(&mut link, &bundle_id).await
                 }
                 _ => unreachable!(),
             }
@@ -390,15 +466,20 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
     }
     if let Request::LaunchApp(request) = request {
         let result = async {
-            let (mut adapter, mut rsd, _provider) = connect_device(target).await?;
-            apps::launch(&mut adapter, &mut rsd, request).await
+            let mut device = connect_device(target).await?;
+            apps::launch(&mut device.adapter, &mut device.rsd, request).await
         }
         .await;
         return Ok(result.unwrap_or_else(apps::not_sent));
     }
-    let (mut adapter, mut rsd, provider) = connect_device(target).await?;
+    let Device {
+        mut adapter,
+        mut rsd,
+        provider,
+        _control,
+    } = connect_device(target).await?;
     if matches!(request, Request::ListApps) {
-        return apps::list(&mut adapter, &mut rsd, &*provider).await;
+        return apps::list(&mut adapter, &mut rsd, provider.as_deref()).await;
     }
     if let Request::Configuration { method, value } = request {
         return configuration::execute(&mut adapter, &mut rsd, &method, value).await;
@@ -727,6 +808,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_pairing_arguments_accept_any_order() {
+        let expected = Target::RemotePairing {
+            host: "192.0.2.1".parse().unwrap(),
+            rp_pairing_file: PathBuf::from("/tmp/rp.plist"),
+            host_name: None,
+        };
+        for list in [
+            ["--host", "192.0.2.1", "--rp-pairing-file", "/tmp/rp.plist"],
+            ["--rp-pairing-file", "/tmp/rp.plist", "--host", "192.0.2.1"],
+        ] {
+            assert_eq!(parse_args(&args(&list)).unwrap(), expected);
+        }
+        assert_eq!(
+            parse_args(&args(&[
+                "--rp-host-name",
+                "pairing-mac",
+                "--host",
+                "2001:db8::1",
+                "--rp-pairing-file",
+                "rp.plist",
+            ]))
+            .unwrap(),
+            Target::RemotePairing {
+                host: "2001:db8::1".parse().unwrap(),
+                rp_pairing_file: PathBuf::from("rp.plist"),
+                host_name: Some("pairing-mac".into()),
+            }
+        );
+    }
+
+    #[test]
     fn hid_waits_fall_back_to_the_defaults() {
         assert_eq!(parse_wait(None, 1000), 1000);
         assert_eq!(parse_wait(Some("2500"), 1000), 2500);
@@ -746,6 +858,34 @@ mod tests {
             &["--host", "192.0.2.1", "--pairing-file", ""],
             &["--host", "192.0.2.1", "--udid", "a"],
             &["--host", "phone.tailnet", "--pairing-file", "p"],
+            &["--host", "phone.tailnet", "--rp-pairing-file", "p"],
+            &[
+                "--host",
+                "192.0.2.1",
+                "--pairing-file",
+                "p",
+                "--rp-pairing-file",
+                "q",
+            ],
+            &[
+                "--host",
+                "192.0.2.1",
+                "--pairing-file",
+                "p",
+                "--rp-host-name",
+                "n",
+            ],
+            &["--udid", "a", "--rp-host-name", "n"],
+            &["--rp-pairing-file", "p"],
+            &[
+                "--host",
+                "192.0.2.1",
+                "--rp-pairing-file",
+                "p",
+                "--rp-host-name",
+                "",
+            ],
+            &["--host", "192.0.2.1", "--rp-pairing-file"],
         ] {
             assert!(parse_args(&args(list)).is_err(), "{list:?}");
         }

@@ -1,9 +1,7 @@
-use super::Result;
+use super::{Lockdown, Result};
 use idevice::{
-    IdeviceService,
     afc::{AfcClient, opcode::AfcFopenMode},
     installation_proxy::InstallationProxyClient,
-    provider::IdeviceProvider,
 };
 use plist::Dictionary;
 use serde_json::{Value, json};
@@ -38,7 +36,7 @@ async fn cleanup(afc: &mut AfcClient, directory: &str) -> Value {
 /// The caller owns package validation, operator approval and post-install lookup.
 /// No install command is retried, including after an unknown receipt.
 pub async fn install(
-    provider: &dyn IdeviceProvider,
+    link: &mut Lockdown<'_>,
     ipa_path: &Path,
     bundle_id: &str,
     staging_id: &str,
@@ -56,8 +54,8 @@ pub async fn install(
         return Err("Staging ID must be a canonical version 4 UUID.".into());
     }
     let bytes = tokio::fs::read(ipa_path).await?;
-    let mut installer = InstallationProxyClient::connect(provider).await?;
-    let mut afc = AfcClient::connect(provider).await?;
+    let mut installer: InstallationProxyClient = link.connect().await?;
+    let mut afc: AfcClient = link.connect().await?;
     if !afc
         .list_dir("/")
         .await?
@@ -110,11 +108,11 @@ pub async fn install(
 }
 
 /// The caller must authorize the exact bundle and verify absence afterwards.
-pub async fn uninstall(provider: &dyn IdeviceProvider, bundle_id: &str) -> Result<Value> {
+pub async fn uninstall(link: &mut Lockdown<'_>, bundle_id: &str) -> Result<Value> {
     if bundle_id.is_empty() {
         return Err("Uninstall requires a nonempty bundle_id.".into());
     }
-    let mut installer = InstallationProxyClient::connect(provider).await?;
+    let mut installer: InstallationProxyClient = link.connect().await?;
     let mut result = receipt(installer.uninstall(bundle_id, None).await);
     result["bundle_id"] = bundle_id.into();
     result["operation"] = "uninstall".into();
@@ -135,7 +133,7 @@ mod tests {
         };
         let path = std::env::temp_dir().join(format!("poki-missing-{}.IPA", uuid::Uuid::new_v4()));
         let error = install(
-            &provider,
+            &mut Lockdown::Provider(&provider),
             &path,
             "local.fixture",
             &uuid::Uuid::new_v4().to_string(),
