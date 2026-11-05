@@ -14,12 +14,14 @@ use idevice::{
         TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
     },
     core_device_proxy::CoreDeviceProxy,
+    pairing_file::PairingFile,
+    provider::{IdeviceProvider, TcpProvider},
     rsd::RsdHandshake,
     usbmuxd::{UsbmuxdAddr, UsbmuxdConnection},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{io::Read, time::Duration};
+use std::{io::Read, net::IpAddr, path::PathBuf, time::Duration};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Touch = UniversalHidServiceClient<Box<dyn ReadWrite>>;
@@ -235,13 +237,84 @@ impl Request {
     }
 }
 
+/// How the bridge reaches the device: through usbmuxd by UDID (the default), or directly over the
+/// network with a saved pairing file.
+#[derive(Debug, PartialEq)]
+enum Target {
+    Usbmuxd { udid: String },
+    Network { host: IpAddr, pairing_file: PathBuf },
+}
+
+const USAGE: &str = "usage: poki-native --udid ID < request.json\n       poki-native --host IP --pairing-file PATH < request.json";
+
+fn parse_args(args: &[String]) -> Result<Target> {
+    if args.len() == 3 && args[1] == "--udid" {
+        return Ok(Target::Usbmuxd {
+            udid: args[2].clone(),
+        });
+    }
+    if args.len() != 5 {
+        return Err(USAGE.into());
+    }
+    let (mut host, mut pairing_file) = (None, None);
+    for pair in args[1..].chunks(2) {
+        let slot = match pair[0].as_str() {
+            "--host" => &mut host,
+            "--pairing-file" => &mut pairing_file,
+            _ => return Err(USAGE.into()),
+        };
+        if slot.is_some() || pair[1].is_empty() {
+            return Err(USAGE.into());
+        }
+        *slot = Some(pair[1].as_str());
+    }
+    let (Some(host), Some(pairing_file)) = (host, pairing_file) else {
+        return Err(USAGE.into());
+    };
+    let host = host
+        .parse::<IpAddr>()
+        .map_err(|_| format!("--host must be an IP address, got {host}"))?;
+    Ok(Target::Network {
+        host,
+        pairing_file: PathBuf::from(pairing_file),
+    })
+}
+
+async fn provider(target: &Target) -> Result<Box<dyn IdeviceProvider>> {
+    Ok(match target {
+        Target::Usbmuxd { udid } => {
+            let mut mux = UsbmuxdConnection::default().await?;
+            let device = mux.get_device(udid).await?;
+            Box::new(device.to_provider(UsbmuxdAddr::from_env_var()?, "poki-mcp"))
+        }
+        Target::Network { host, pairing_file } => {
+            let bytes = std::fs::read(pairing_file).map_err(|error| {
+                format!(
+                    "Cannot read pairing file {}: {error}",
+                    pairing_file.display()
+                )
+            })?;
+            let pairing = PairingFile::from_bytes(&bytes).map_err(|error| {
+                format!(
+                    "{} is not a valid pairing file ({error}). Make a new one with bin/pair.",
+                    pairing_file.display()
+                )
+            })?;
+            Box::new(TcpProvider {
+                addr: *host,
+                scope_id: None,
+                pairing_file: pairing,
+                label: "poki-mcp".into(),
+            })
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let result = async {
         let args: Vec<String> = std::env::args().collect();
-        if args.len() != 3 || args[1] != "--udid" {
-            return Err("usage: poki-native --udid ID < request.json".into());
-        }
+        let target = parse_args(&args)?;
         let mut input = String::new();
         std::io::stdin()
             .take(2 * 1024 * 1024)
@@ -253,7 +326,7 @@ async fn main() {
         } else {
             90
         };
-        tokio::time::timeout(Duration::from_secs(limit), execute(&args[2], request)).await?
+        tokio::time::timeout(Duration::from_secs(limit), execute(&target, request)).await?
     }
     .await;
     match result {
@@ -269,31 +342,27 @@ async fn main() {
 }
 
 async fn connect_device(
-    udid: &str,
+    target: &Target,
 ) -> Result<(
     idevice::tcp::handle::AdapterHandle,
     RsdHandshake,
-    idevice::provider::UsbmuxdProvider,
+    Box<dyn IdeviceProvider>,
 )> {
-    let mut mux = UsbmuxdConnection::default().await?;
-    let device = mux.get_device(udid).await?;
-    let provider = device.to_provider(UsbmuxdAddr::from_env_var()?, "poki-mcp");
-    let proxy = CoreDeviceProxy::connect(&provider).await?;
+    let provider = provider(target).await?;
+    let proxy = CoreDeviceProxy::connect(&*provider).await?;
     let port = proxy.tunnel_info().server_rsd_port;
     let mut adapter = proxy.create_software_tunnel()?.to_async_handle();
     let rsd = RsdHandshake::new(adapter.connect(port).await?).await?;
     Ok((adapter, rsd, provider))
 }
 
-async fn execute(udid: &str, request: Request) -> Result<Value> {
+async fn execute(target: &Target, request: Request) -> Result<Value> {
     if matches!(
         request,
         Request::InstallApp { .. } | Request::UninstallApp { .. }
     ) {
         let result = async {
-            let mut mux = UsbmuxdConnection::default().await?;
-            let device = mux.get_device(udid).await?;
-            let provider = device.to_provider(UsbmuxdAddr::from_env_var()?, "poki-mcp");
+            let provider = provider(target).await?;
             match request {
                 Request::InstallApp {
                     ipa_path,
@@ -301,7 +370,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                     staging_id,
                 } => {
                     installation::install(
-                        &provider,
+                        &*provider,
                         std::path::Path::new(&ipa_path),
                         &bundle_id,
                         &staging_id,
@@ -309,7 +378,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                     .await
                 }
                 Request::UninstallApp { bundle_id } => {
-                    installation::uninstall(&provider, &bundle_id).await
+                    installation::uninstall(&*provider, &bundle_id).await
                 }
                 _ => unreachable!(),
             }
@@ -321,15 +390,15 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
     }
     if let Request::LaunchApp(request) = request {
         let result = async {
-            let (mut adapter, mut rsd, _provider) = connect_device(udid).await?;
+            let (mut adapter, mut rsd, _provider) = connect_device(target).await?;
             apps::launch(&mut adapter, &mut rsd, request).await
         }
         .await;
         return Ok(result.unwrap_or_else(apps::not_sent));
     }
-    let (mut adapter, mut rsd, provider) = connect_device(udid).await?;
+    let (mut adapter, mut rsd, provider) = connect_device(target).await?;
     if matches!(request, Request::ListApps) {
-        return apps::list(&mut adapter, &mut rsd, &provider).await;
+        return apps::list(&mut adapter, &mut rsd, &*provider).await;
     }
     if let Request::Configuration { method, value } = request {
         return configuration::execute(&mut adapter, &mut rsd, &method, value).await;
@@ -347,7 +416,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
         .await
         .map_err(|e| format!("Cannot establish input media session: {e}"))?;
     trace("media ready");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(hid_wait("POKI_HID_OPEN_MS", 1000)).await;
     // The device sometimes drops a touch whose connection closes straight after its last report, with no
     // error. The touch connection therefore stays open through the wait that follows the action;
     // NATIVE.md has the counts.
@@ -478,7 +547,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
         Ok(json!({"sent":true,"screen_change_verified":false}))
     }
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(hid_wait("POKI_HID_CLOSE_MS", 300)).await;
     drop(touch);
     let stop = media.client.stop_media_stream().await;
     drop(media.audio_udp);
@@ -486,6 +555,18 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
     let output = action?;
     stop?;
     Ok(output)
+}
+
+/// The waits around an input session, overridable for slow links such as a relayed tailnet.
+fn hid_wait(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(parse_wait(std::env::var(name).ok().as_deref(), default_ms))
+}
+
+fn parse_wait(value: Option<&str>, default_ms: u64) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms <= 10000)
+        .unwrap_or(default_ms)
 }
 
 async fn held_tap(hid: &mut Touch, x: u16, y: u16, ms: u64) -> Result<()> {
@@ -601,4 +682,72 @@ async fn chord(keyboard: &mut Keyboard, key: u64, modifiers: &[u64]) -> Result<(
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("poki-native")
+            .chain(list.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn udid_argument_is_unchanged() {
+        assert_eq!(
+            parse_args(&args(&["--udid", "00008150-ABC"])).unwrap(),
+            Target::Usbmuxd {
+                udid: "00008150-ABC".into()
+            }
+        );
+    }
+
+    #[test]
+    fn network_arguments_accept_either_order() {
+        let expected = Target::Network {
+            host: "192.0.2.1".parse().unwrap(),
+            pairing_file: PathBuf::from("/tmp/phone.plist"),
+        };
+        for list in [
+            ["--host", "192.0.2.1", "--pairing-file", "/tmp/phone.plist"],
+            ["--pairing-file", "/tmp/phone.plist", "--host", "192.0.2.1"],
+        ] {
+            assert_eq!(parse_args(&args(&list)).unwrap(), expected);
+        }
+        assert!(matches!(
+            parse_args(&args(&["--host", "2001:db8::1", "--pairing-file", "p"])).unwrap(),
+            Target::Network {
+                host: IpAddr::V6(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hid_waits_fall_back_to_the_defaults() {
+        assert_eq!(parse_wait(None, 1000), 1000);
+        assert_eq!(parse_wait(Some("2500"), 1000), 2500);
+        assert_eq!(parse_wait(Some("0"), 300), 0);
+        assert_eq!(parse_wait(Some("soon"), 300), 300);
+        assert_eq!(parse_wait(Some("10001"), 300), 300);
+    }
+
+    #[test]
+    fn invalid_arguments_are_rejected() {
+        for list in [
+            &[][..],
+            &["--udid"],
+            &["--udid", "a", "--host", "192.0.2.1"],
+            &["--host", "192.0.2.1"],
+            &["--host", "192.0.2.1", "--host", "192.0.2.2"],
+            &["--host", "192.0.2.1", "--pairing-file", ""],
+            &["--host", "192.0.2.1", "--udid", "a"],
+            &["--host", "phone.tailnet", "--pairing-file", "p"],
+        ] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
+    }
 }

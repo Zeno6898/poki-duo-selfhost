@@ -1,0 +1,86 @@
+#!/bin/sh
+# Pair an iPhone over USB and save a pairing file for network use.
+#
+# Run this once on any Linux or macOS machine that has the phone on USB, with
+# the phone unlocked. It writes a pairing file (mode 0600) and turns on Wi-Fi
+# lockdown so the phone answers over the network, then prints how to copy the
+# file to the server. The pairing file is a credential: never commit or share it.
+#
+# usage: bin/pair [--name HOST] [--out FILE] UDID
+#   --name  host name the phone shows for this pairing (default: this machine's hostname)
+#   --out   where to write the pairing file (default: ./UDID.plist)
+# Set IDEVICE_TOOLS to use an idevice-tools other than .deps/idevice/target/release/idevice-tools.
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+usage='usage: bin/pair [--name HOST] [--out FILE] UDID'
+name=$(hostname)
+out=
+udid=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --name) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; name=$2; shift 2 ;;
+    --out) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; out=$2; shift 2 ;;
+    -h|--help) echo "$usage"; exit 0 ;;
+    -*) echo "$usage" >&2; exit 2 ;;
+    *) [ -z "$udid" ] || { echo "$usage" >&2; exit 2; }; udid=$1; shift ;;
+  esac
+done
+if [ -z "$udid" ]; then
+  echo "$usage" >&2
+  echo 'Find the UDID of the USB-connected phone with: .deps/idevice/target/release/idevice_id' >&2
+  exit 2
+fi
+tools=${IDEVICE_TOOLS:-$project_dir/.deps/idevice/target/release/idevice-tools}
+if [ ! -x "$tools" ]; then
+  tools=$(command -v idevice-tools 2>/dev/null || true)
+fi
+if [ -z "$tools" ] || [ ! -x "$tools" ]; then
+  echo 'idevice-tools was not found. Build it as described at the top of bin/setup, or set IDEVICE_TOOLS.' >&2
+  exit 1
+fi
+out=${out:-./$udid.plist}
+if [ -e "$out" ]; then
+  echo "$out already exists; it was left unchanged. Choose another path with --out." >&2
+  exit 1
+fi
+
+umask 077
+partial="$out.partial.$$"
+trap 'rm -f "$partial"' EXIT INT TERM
+# idevice-tools pair prints the new pairing record on standard output and also saves it with usbmuxd.
+if ! "$tools" pair --name "$name" "$udid" >"$partial"; then
+  echo 'Pairing failed. Unlock the phone, tap Trust when it asks, and run bin/pair again.' >&2
+  exit 1
+fi
+if ! grep -q '<plist' "$partial"; then
+  echo 'idevice-tools pair did not print a pairing record. Unlock the phone, tap Trust, and run bin/pair again.' >&2
+  exit 1
+fi
+chmod 600 "$partial"
+mv "$partial" "$out"
+trap - EXIT INT TERM
+echo "Pairing file written to $out (mode 0600)."
+
+# iOS 17 and later answer lockdown over the network only with Wi-Fi debugging enabled.
+domain=com.apple.mobile.wireless_lockdown
+set_output=$("$tools" --udid "$udid" lockdown --domain "$domain" set true EnableWifiDebugging 2>&1 || true)
+case $set_output in
+  *'Successfully set'*) echo "Set EnableWifiDebugging in $domain." ;;
+  *) echo "Could not set EnableWifiDebugging: $set_output" >&2 ;;
+esac
+readback=$("$tools" --udid "$udid" lockdown --domain "$domain" get EnableWifiDebugging 2>&1 || true)
+echo "EnableWifiDebugging now reads: $readback"
+case $readback in
+  *true*) ;;
+  *) echo 'Wi-Fi debugging does not read as true. Network connections may be refused. With pymobiledevice3 installed, run: pymobiledevice3 lockdown wifi-connections on' >&2 ;;
+esac
+
+cat <<EOF
+
+Copy the pairing file to the server's Poki state directory and keep it private:
+  ssh SERVER 'mkdir -p -m 700 ~/.local/state/poki'
+  scp $out SERVER:~/.local/state/poki/
+  ssh SERVER 'chmod 600 ~/.local/state/poki/$(basename -- "$out")'
+Then on the server:
+  node bin/linux-smoke-test.mjs --host PHONE_TAILNET_IP --pairing-file ~/.local/state/poki/$(basename -- "$out")
+EOF

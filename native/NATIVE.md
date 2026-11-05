@@ -4,7 +4,7 @@ The standalone Rust program in `native/bridge/` uses the public protocol interfa
 
 Build with `./bin/build-native`. This remaps build paths before producing `build/poki-native`.
 
-Run `build/poki-native --udid ID` and send one JSON object through standard input. Success returns JSON on standard output. Failure returns JSON on standard error and exits with code 1. The overall command timeout is 90 seconds.
+Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-file PATH` to reach the device over the network with a saved pairing file, and send one JSON object through standard input. Success returns JSON on standard output. Failure returns JSON on standard error and exits with code 1. The overall command timeout is 90 seconds.
 
 | op | Parameters | Behavior |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Touch coordinates and pinch distances use the normalized HID range `0..65535`. C
 
 Drag and pinch schedule each contact against a monotonic start time. Transport time consumes the remaining wait budget. Each contact is sent once, in order, including the final contact when the schedule runs late. Drag starts its movement clock after the first contact and `hold_ms`; pinch starts before the first two-contact send. The final movement target is start plus `duration_ms`, but slow transport can finish later. Drag's `end_hold_ms` begins after that final send completes.
 
-Input establishes a CoreDevice displayservice media session, waits 1000 milliseconds, sends the action, and closes after another 300 milliseconds. Recoverable action errors release contacts and modifier keys. Touch connections remain open throughout the final 300-millisecond wait. Keyboard input registers a mainKeyboard through UniversalHID with a fixed full-key report descriptor. Modifiers precede ordinary keys; release and keyboard removal follow.
+Input establishes a CoreDevice displayservice media session, waits 1000 milliseconds, sends the action, and closes after another 300 milliseconds. `POKI_HID_OPEN_MS` and `POKI_HID_CLOSE_MS` override these two waits (0..10000) for slower network links. Recoverable action errors release contacts and modifier keys. Touch connections remain open throughout the final 300-millisecond wait. Keyboard input registers a mainKeyboard through UniversalHID with a fixed full-key report descriptor. Modifiers precede ordinary keys; release and keyboard removal follow.
 
 `sent=true, screen_change_verified=false` means only that reports were written to the connection. Devices do not acknowledge those reports and may discard them without an error. The caller must check native accessibility or a screenshot for the actual result.
 
