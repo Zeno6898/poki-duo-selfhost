@@ -84,7 +84,8 @@ function fromLive(picture) {
   if (!picture?.jpeg) throw new Error('The live screen returned no picture.');
   const capturedMs = Date.parse(picture.capturedAt);
   return { capturedMs, changedMs: capturedMs, capturedAt: picture.capturedAt, image: picture.jpeg, settled: picture.settled, quietMs: picture.quietMs ?? undefined,
-    changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, ...(picture.videoStalled ? { videoStalled: true, stalledMs: picture.stalledMs } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
+    changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, ...(picture.videoStalled ? { videoStalled: true, stalledMs: picture.stalledMs } : {}),
+    ...(picture.source ? { pictureSource: picture.source } : {}), ...(picture.fallbackReason ? { fallbackReason: picture.fallbackReason } : {}), ...(picture.foreground ? { foreground: picture.foreground } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
 // A failure inside a read is not the call being stopped: only the caller's own deadline or cancel is.
@@ -122,7 +123,7 @@ const lostText = {
 };
 lostText.needs_wifi = lostText.wifi_required;
 // Reasons the picture may be old while inputs still work: reported as unverified, not blocked.
-const degraded = new Set(['video_stalled', 'decode_backlog']);
+const degraded = new Set(['video_stalled', 'decode_backlog', 'picture_damaged']);
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
 const inside = (box, [x, y, w, h], size) => {
   const f = box.frame ?? box, cx = (f.x + f.width / 2) / size.width, cy = (f.y + f.height / 2) / size.height;
@@ -167,6 +168,9 @@ export class World {
     // A picture from a stalled video is older than the screen, whatever its number says.
     if (frame.videoStalled) return false;
     if (!input) return true;
+    // A source that watched the screen since the input and saw it settle without moving has proven
+    // it unchanged, with no newer picture needed.
+    if (frame.settled === true && frame.changedSinceInput === false && frame.observation) return true;
     // A source that numbers its frames says itself whether one is newer than the input (upstream's rule).
     if (frame.observation) return frame.observation !== 'unverified';
     if ((frame.startedMs ?? frame.capturedMs) >= input.sentMs || frame.pictureAfterInput === true) return true;
@@ -253,6 +257,8 @@ export class World {
     const lines = [...new Set(elements.map(lineOf).filter(Boolean))];
     const prompt = promptWarning(elements);
     const page = screenIdentity({ foreground, elements, prompt });
+    // Without a tree, the app in front is the one the bridge named with the picture.
+    foreground ??= frame.foreground;
     return { frame, source, elements, foreground: foreground ? { bundle_id: foreground.bundle_id ?? null, pid: foreground.pid ?? null } : null, tree, lines, prompt, page, ocrOnly };
   }
   // How a session's last look differs from this one, so a result can lead with what is new.

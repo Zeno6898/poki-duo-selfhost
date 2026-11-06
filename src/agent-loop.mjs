@@ -155,7 +155,9 @@ function outcomeOf(judged, base, inputSent) {
   if (judged.expectation === 'met') return { outcome: 'as_expected' };
   if (!inputSent) return { outcome: 'unchanged', reason: 'no input was sent' };
   if (!frame.proven) return { outcome: 'unverified', reason: 'no frame newer than the input arrived: the screen may not have changed, or the picture may be the one the input was sent to' };
-  const moved = compare(base.frame.thumb, frame.thumb)?.changed;
+  // The bridge's own verdict from the video's activity: nothing moved after the input.
+  const quiet = frame.settled && frame.changedSinceInput === false;
+  const moved = !quiet && compare(base.frame.thumb, frame.thumb)?.changed;
   const app = view.tree === 'current' && base.foreground !== null && (view.foreground?.pid ?? null) !== base.foreground;
   const tree = base.key !== undefined && treeKey(view) !== undefined && treeKey(view) !== base.key;
   if (!frame.settled) return { outcome: 'unknown', reason: `the screen was still changing when time ran out${moved ? ' (it did change after the input)' : ''}` };

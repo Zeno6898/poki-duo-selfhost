@@ -31,8 +31,14 @@ export async function frameFromAnswer(answer, { rgb = false } = {}) {
     ...(answer.frame ? { identity: answer.frame } : {}),
     ...(Number.isInteger(answer.frame?.seq ?? answer.epoch) ? { epoch: answer.frame?.seq ?? answer.epoch } : {}),
     ...(answer.observation ? { observation: answer.observation } : {}),
-    // Packets arrive but nothing decodes: the picture is older than the screen.
-    ...(answer.video_stalled ? { videoStalled: true, stalledMs: answer.stalled_ms ?? null } : {}),
+    // Packets arrive but nothing decodes: the picture is older than the screen. A screenshot taken in
+    // its place (source "screenshot") is not.
+    ...(answer.video_stalled && answer.source !== 'screenshot' ? { videoStalled: true, stalledMs: answer.stalled_ms ?? null } : {}),
+    // Where the picture came from (video or screenshot) and what the bridge saw of movement and the app
+    // in front without reading accessibility.
+    ...(answer.source ? { source: answer.source } : {}), ...(answer.fallback_reason ? { fallbackReason: answer.fallback_reason } : {}),
+    ...(answer.moving !== undefined ? { moving: Boolean(answer.moving) } : {}), ...(answer.animating_region ? { animatingRegion: answer.animating_region } : {}),
+    ...(answer.foreground?.pid ? { foreground: answer.foreground } : {}),
   };
   if (rgb && jpeg) frame.rgb = await sharp(jpeg).removeAlpha().raw().toBuffer();
   return frame;
