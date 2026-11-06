@@ -94,7 +94,7 @@ async fn shown(live: Option<&crate::frames::Live>, after: Instant, cap: Duration
     let deadline = Instant::now() + cap;
     let left = || deadline.saturating_duration_since(Instant::now());
     if live.wait_picture_after(after, left()).await {
-        live.wait_settled(Duration::from_millis(80), left()).await;
+        live.wait_quiet(Duration::from_millis(80), left()).await;
     } else {
         // No picture: nothing changed yet. Wait out the cap as poki-native does.
         tokio::time::sleep(left()).await;
@@ -666,7 +666,7 @@ async fn shown_in_field(
     let deadline = after + Duration::from_millis(700);
     let left = || deadline.saturating_duration_since(Instant::now());
     if !live.wait_picture_after(after, left()).await
-        || !live.wait_settled(Duration::from_millis(80), left()).await
+        || !live.wait_quiet(Duration::from_millis(80), left()).await
     {
         return None;
     }
@@ -855,7 +855,7 @@ mod fast_tests {
                 let paste = async |next: &[u8], ocr: &crate::ocr::Ocr| {
                     screen.show(empty).await;
                     assert!(
-                        live.wait_settled(Duration::from_millis(80), Duration::from_secs(2))
+                        live.wait_quiet(Duration::from_millis(80), Duration::from_secs(2))
                             .await
                     );
                     let after = Instant::now();
@@ -899,7 +899,7 @@ mod fast_tests {
                 // Nothing changes: the check gives up within its 700 ms.
                 screen.show(empty).await;
                 assert!(
-                    live.wait_settled(Duration::from_millis(80), Duration::from_secs(2))
+                    live.wait_quiet(Duration::from_millis(80), Duration::from_secs(2))
                         .await
                 );
                 let after = Instant::now();

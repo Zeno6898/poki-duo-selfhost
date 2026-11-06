@@ -56,6 +56,28 @@ pub fn no_response_time() -> Duration {
     )
 }
 
+/// How long the screen must be quiet after a change an input caused
+/// (POKI_LIVE_SETTLE_AFTER_CHANGE_MS, default 350).
+pub fn settle_after_change() -> Duration {
+    Duration::from_millis(
+        std::env::var("POKI_LIVE_SETTLE_AFTER_CHANGE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(350),
+    )
+}
+
+/// How long wait_settled looks again after an input-driven change settled, before saying so
+/// (POKI_LIVE_SETTLE_RECHECK_MS, default 250; 0 for none).
+pub fn settle_recheck() -> Duration {
+    Duration::from_millis(
+        std::env::var("POKI_LIVE_SETTLE_RECHECK_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250),
+    )
+}
+
 pub fn settle_time() -> Duration {
     Duration::from_millis(
         std::env::var("POKI_LIVE_SETTLE_MS")
@@ -289,7 +311,7 @@ struct Animations {
 }
 
 const IN_PLACE_FOR: Duration = Duration::from_millis(600);
-/// How long after an input no change counts as in place.
+/// How long after an input a change counts as in place only inside a known animating region.
 const AFTER_INPUT: Duration = Duration::from_millis(300);
 const IN_PLACE_AREA: f64 = 0.10;
 const IN_PLACE_MARGIN: f64 = 0.01;
@@ -325,7 +347,9 @@ fn contains(outer: [f64; 4], inner: [f64; 4], margin: f64) -> bool {
 
 impl Animations {
     /// Records a change; whether it repeats in place (and so is not movement).
-    fn in_place(&mut self, now: Instant, region: [f64; 4]) -> bool {
+    /// `answering` (right after an input): only a change inside where something was already
+    /// seen repeating in place counts, so the input's own effect is never taken for it.
+    fn in_place(&mut self, now: Instant, region: [f64; 4], answering: bool) -> bool {
         let keep = IN_PLACE_FOR * 3;
         while self
             .history
@@ -350,11 +374,13 @@ impl Animations {
             .collect();
         let oldest = touching.iter().map(|(at, _)| *at).min();
         let place = touching.iter().map(|(_, r)| *r).reduce(union);
+        let known = self.region(now);
         let in_place = touching.len() >= 3
             && oldest.is_some_and(|at| now.duration_since(at) >= IN_PLACE_FOR)
             && place.is_some_and(|b| {
                 b[2] * b[3] < IN_PLACE_AREA && contains(b, region, IN_PLACE_MARGIN)
-            });
+            })
+            && (!answering || known.is_some_and(|k| contains(k, region, IN_PLACE_MARGIN)));
         self.history.push_back((now, region));
         if in_place {
             self.minor.push_back((now, region));
@@ -602,7 +628,14 @@ impl Live {
         self.screen.lock().unwrap().decoder_error.clone()
     }
 
+    /// The screen now. After a change an input caused, quiet must last settle_after_change()
+    /// (an app's response comes in steps: a 150 ms lull inside a push is not the end of it).
     pub fn state(&self, settle: Duration) -> State {
+        self.state_with(settle, settle_after_change())
+    }
+
+    /// state() with the quiet needed after an input-driven change given (`settle` for none).
+    pub fn state_with(&self, settle: Duration, after_change: Duration) -> State {
         let screen = self.screen.lock().unwrap();
         let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
         // When decoding, the pixel difference is the authority on movement; otherwise the size
@@ -617,12 +650,17 @@ impl Live {
             .flatten()
             .max()
             .or(screen.decoding_since);
-        let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
-        // After an input, quiet is not settled until the screen answered or had time to: apps
-        // take 100 to 300 ms to start reacting, so quiet before then proves nothing.
         let changed_since_input = screen
             .last_input
             .map(|input| moved.is_some_and(|at| at > input));
+        let settle = if changed_since_input == Some(true) {
+            settle.max(after_change)
+        } else {
+            settle
+        };
+        let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
+        // After an input, quiet is not settled until the screen answered or had time to: apps
+        // take 100 to 300 ms to start reacting, so quiet before then proves nothing.
         let answer_by = screen
             .last_input
             .filter(|_| changed_since_input == Some(false))
@@ -715,13 +753,44 @@ impl Live {
 
     /// Waits until the screen is settled, for at most `timeout`; whether it settled.
     pub async fn wait_settled(&self, settle: Duration, timeout: Duration) -> bool {
+        self.wait_settled_with(settle, settle_after_change(), settle_recheck(), timeout)
+            .await
+    }
+
+    /// Waits for `settle` of quiet alone, with no longer quiet after an input-driven change and
+    /// no re-check: for type_text, which knows what it waits for.
+    pub async fn wait_quiet(&self, settle: Duration, timeout: Duration) -> bool {
+        self.wait_settled_with(settle, settle, Duration::ZERO, timeout)
+            .await
+    }
+
+    async fn wait_settled_with(
+        &self,
+        settle: Duration,
+        after_change: Duration,
+        recheck: Duration,
+        timeout: Duration,
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changed = self.changed.clone();
         loop {
             changed.mark_unchanged();
-            let state = self.state(settle);
+            let state = self.state_with(settle, after_change);
             if state.settled {
-                return true;
+                // An input's effect may come in steps: look once more before saying it ended.
+                if state.changed_since_input != Some(true) || recheck.is_zero() {
+                    return true;
+                }
+                let until = (tokio::time::Instant::now() + recheck).min(deadline);
+                tokio::time::sleep_until(until).await;
+                let again = self.state_with(settle, after_change);
+                if again.settled && again.quiet_since == state.quiet_since {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                continue;
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -1326,14 +1395,16 @@ fn decode_loop(
                         && difference.changed > 0.0
                     {
                         screen.counters.changes += 1;
-                        // Right after an input, every change is movement: the input's own effect
-                        // may land where something changed before (deleting what was typed).
+                        // Right after an input, a change counts as in place only inside a region
+                        // already animating (a spinner keeps spinning after a no-op tap); the
+                        // input's own effect may land where something changed before (deleting
+                        // what was typed), and that is movement.
                         let answering = screen
                             .last_input
                             .and_then(|input| arrived.checked_duration_since(input))
                             .is_some_and(|after| after < AFTER_INPUT);
                         let in_place = difference.region.is_some_and(|region| {
-                            screen.animations.in_place(arrived, region) && !answering
+                            screen.animations.in_place(arrived, region, answering)
                         });
                         if in_place {
                             screen.counters.in_place_changes += 1;
@@ -1764,8 +1835,8 @@ mod tests {
                 for index in 21..25 {
                     send(index, false).await;
                 }
-                let at_25 = decoded(9).await;
-                assert!(at_25 >= 9);
+                let at_25 = decoded(14).await;
+                assert!(at_25 >= 14, "16 to 24 are decoded: {at_25}");
                 assert!(live.state(Duration::from_millis(150)).epoch >= epoch + 5);
                 let latest = live.state(Duration::from_millis(150)).latest.unwrap();
                 assert_eq!((latest.2, latest.3), (320, 640));
@@ -1896,7 +1967,29 @@ mod tests {
                 assert_eq!(state.changed_since_input, Some(true));
                 assert!(state.units_since_input >= 4);
                 assert!(!live.unchanged_since(started));
-                assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
+                // The response comes in two steps with a 200 ms lull between: not settled in
+                // the lull, settled only settle_after_change() after the second step.
+                let waiting = {
+                    let live = live.clone();
+                    tokio::spawn(async move {
+                        let settled = live.wait_settled(settle, Duration::from_secs(3)).await;
+                        (settled, Instant::now())
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                for _ in 0..4 {
+                    unit(3000);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                let second_step = Instant::now();
+                let (settled, at) = waiting.await.unwrap();
+                assert!(settled);
+                let after = at.duration_since(second_step);
+                assert!(
+                    after >= settle_after_change(),
+                    "settled {after:?} after the second step"
+                );
+                assert!(after < Duration::from_millis(1000), "{after:?}");
 
                 // An input followed by idle units only: quiet right after an input proves
                 // nothing (apps take a moment to react), so it settles as unchanged only after
@@ -1960,22 +2053,26 @@ mod tests {
         let at = |ms: u64| start + Duration::from_millis(ms);
         let spinner = [0.80, 0.30, 0.04, 0.02];
         // The first second of a spinner is movement: nothing says yet that it repeats.
-        assert!(!animations.in_place(at(0), spinner));
+        assert!(!animations.in_place(at(0), spinner, false));
         for ms in (50..600).step_by(50) {
-            assert!(!animations.in_place(at(ms), spinner), "{ms} ms");
+            assert!(!animations.in_place(at(ms), spinner, false), "{ms} ms");
         }
-        assert!(animations.in_place(at(650), spinner));
-        assert!(animations.in_place(at(1000), [0.801, 0.301, 0.038, 0.019]));
+        assert!(animations.in_place(at(650), spinner, false));
+        assert!(animations.in_place(at(1000), [0.801, 0.301, 0.038, 0.019], false));
         let region = animations.region(at(1000)).unwrap();
         assert!(contains(spinner, region, 0.001));
+        // Right after an input: the spinner going on is still in place (a no-op tap), but a
+        // change that only touches it is not (a backspace next to a blinking caret).
+        assert!(animations.in_place(at(1005), spinner, true));
+        assert!(!animations.in_place(at(1006), [0.78, 0.30, 0.06, 0.02], true));
         // Elsewhere, once: movement, however small (a typed character).
-        assert!(!animations.in_place(at(1010), [0.10, 0.50, 0.01, 0.01]));
+        assert!(!animations.in_place(at(1010), [0.10, 0.50, 0.01, 0.01], false));
         // Reaching outside the spinner's box: movement.
-        assert!(!animations.in_place(at(1020), [0.70, 0.30, 0.14, 0.02]));
+        assert!(!animations.in_place(at(1020), [0.70, 0.30, 0.14, 0.02], false));
         // A large region that keeps changing is movement too (a video, a scroll).
         let mut large = Animations::default();
         for ms in (0..2000).step_by(50) {
-            assert!(!large.in_place(at(ms), [0.0, 0.2, 1.0, 0.5]));
+            assert!(!large.in_place(at(ms), [0.0, 0.2, 1.0, 0.5], false));
         }
         assert!(animations.region(at(3000)).is_none(), "gone after a second");
         assert_eq!(animating_json(Some(spinner))["pct"], 0.1);
