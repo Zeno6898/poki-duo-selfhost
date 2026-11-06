@@ -21,7 +21,10 @@ const usedSimulators = new Set();
 const approvedTools = new Set(['install_app', 'uninstall_app', 'build_and_run', 'open_url', 'download_app_container', 'get_clipboard', 'set_clipboard']);
 const platformTools = new Set(['start_simulator', 'shut_down_simulator', 'start_recording', 'stop_recording', 'set_appearance', 'set_accessibility', 'list_apps', 'launch_app', 'terminate_app', 'install_app', 'uninstall_app', 'open_settings', 'open_url', 'build_and_run', 'set_location', 'clear_location', 'get_clipboard', 'set_clipboard', 'list_crashes', 'get_crash', 'download_app_container']);
 
-const settleMs = 600, readbackMs = 5000;
+// A simulator reads its screen in about 0.2 s, so five seconds covers the two reads that call a screen
+// still. A phone over a network tunnel can take two seconds or more per read, so its budget follows
+// the reads it has just measured, up to a cap.
+const settleMs = 600, readbackMs = 5000, maxReadbackMs = 12000;
 const reportsScreen = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'swipe', 'drag', 'scroll', 'pinch', 'type_text', 'fill', 'press_key', 'press_button', 'go_back', 'handle_alert', 'system_gesture']);
 // These exist to act on a control, so the reply says when nothing was seen to change after one.
 const touchesControl = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'go_back', 'handle_alert']);
@@ -38,7 +41,7 @@ export function hidPoint(x, y, width, height) {
 
 export class Devices {
   selected; requested; frame; size; seen; elements = []; elementsAt = 0; lastInputAt = -Infinity; inBatch = false;
-  scales = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
+  scales = new Map(); readCosts = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
     const result = await execute(file, args, { timeout, input });
@@ -235,7 +238,9 @@ export class Devices {
   async structure(maxAge = 0) {
     const target = await this.target();
     if (this.seen?.device === target.id && performance.now() - this.seen.at <= maxAge) return this.seen;
+    const started = performance.now();
     const tree = await phase('accessibility', () => this.bridge({ op: 'ax', include_offscreen: false }));
+    this.readCosts.set(target.id, performance.now() - started);
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     const signature = JSON.stringify(elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; }));
@@ -249,9 +254,16 @@ export class Devices {
   }
   // Reading the result back saves the caller a round trip to look. The action has already happened,
   // so a failed read only loses the report; a stop request still surfaces as a stop.
+  readCost() { return this.readCosts.get(this.resolved?.id) ?? 0; }
+  observationBudget(target) {
+    const cost = this.readCosts.get(target.id);
+    if (target.kind === 'simulator' || cost === undefined) return readbackMs;
+    return Math.min(maxReadbackMs, Math.max(readbackMs, 3 * cost + settleMs));
+  }
   async readback(before) {
     try {
-      const { signature, screen } = await deadline(readbackMs, () => readScreen(this));
+      const target = await this.target();
+      const { signature, screen } = await deadline(this.observationBudget(target), () => readScreen(this));
       const compared = before !== undefined && signature !== undefined;
       return { screen, screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
     } catch (error) {

@@ -3,7 +3,7 @@ import { askHuman } from './human.mjs';
 import { screenIdentity } from './screen-identity.mjs';
 
 const behavior = JSON.parse(readFileSync(new URL('./data/interaction.json', import.meta.url), 'utf8'));
-import { pause, deadline, checkWork, stopped } from './work.mjs';
+import { pause, deadline, checkWork, stopped, remaining } from './work.mjs';
 export { pause } from './work.mjs';
 export const justReadMs = 500;
 const patienceMs = 5000, ocrAfterMs = 1000, ocrEveryMs = 2000, pollMs = 100, quietMs = 3000, stableWithinMs = 2500, focusWithinMs = 2000, screenTextLimit = 80;
@@ -139,35 +139,45 @@ const describeElement = element => {
   return `${element.type ?? element.role ?? 'Element'}: ${parts.join(' = ')}${element.focused ? ' (focused)' : ''}`;
 };
 
+// The reply's view of one read: what is visible, in which app, and any system prompt on it.
+export function describeScreen(seen, elements = seen.elements, source = 'accessibility') {
+  const text = [...new Set(elements.filter(visible).map(describeElement).filter(Boolean))];
+  const warning = promptWarning(elements);
+  return {
+    foreground: seen.foreground?.bundle_id ?? seen.foreground?.name ?? null,
+    source,
+    page_identity: screenIdentity({ foreground: seen.foreground, elements, prompt: warning }),
+    text: text.slice(0, screenTextLimit),
+    ...(text.length > screenTextLimit ? { more: text.length - screenTextLimit } : {}),
+    ...(warning ? { prompt: warning } : {}),
+  };
+}
+
 // What the screen shows once it has stopped changing: a list still coasting after a scroll would
 // otherwise report a position it is about to leave. `compared` is false when accessibility could not
-// read it, because OCR text alone cannot say whether anything moved.
+// read it, because OCR text alone cannot say whether anything moved. Over a slow connection one read
+// can take seconds, so the reads stop when another would not finish inside the caller's deadline, and
+// the last one is reported with screen_stable false rather than lost.
 export async function readScreen(ctx) {
   await ctx.settle();
   const started = performance.now();
+  const cost = () => ctx.readCost?.() ?? 0;
   // A batch that ends on a touch has just read the screen to see whether it changed.
-  let seen = await readStructure(ctx, justReadMs);
-  while (performance.now() - started < stableWithinMs) {
+  let seen = await readStructure(ctx, justReadMs), stable = false;
+  const window = Math.max(stableWithinMs, 2 * cost() + pollMs);
+  while (performance.now() - started < window) {
+    if (remaining() < cost() + pollMs) break;
     await pause(pollMs);
     const next = await readStructure(ctx, 0);
     const same = next.signature === seen.signature;
     seen = next;
-    if (same) break;
+    if (same) { stable = true; break; }
   }
   const compared = seen.elements.length > 0;
   const elements = compared ? seen.elements : (await ctx.recognize({ source: 'ocr', max_elements: Number.MAX_SAFE_INTEGER })).elements;
-  const text = [...new Set(elements.filter(visible).map(describeElement).filter(Boolean))];
-  const warning = promptWarning(elements);
   return {
     signature: compared ? seen.signature : undefined,
-    screen: {
-      foreground: seen.foreground?.bundle_id ?? seen.foreground?.name ?? null,
-      source: compared ? 'accessibility' : 'ocr',
-      page_identity: screenIdentity({ foreground: seen.foreground, elements, prompt: warning }),
-      text: text.slice(0, screenTextLimit),
-      ...(text.length > screenTextLimit ? { more: text.length - screenTextLimit } : {}),
-      ...(warning ? { prompt: warning } : {}),
-    },
+    screen: { ...describeScreen(seen, elements, compared ? 'accessibility' : 'ocr'), ...(compared && !stable ? { screen_stable: false } : {}) },
   };
 }
 
