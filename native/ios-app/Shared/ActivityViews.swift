@@ -296,7 +296,7 @@ struct ElapsedMeta: View {
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "timer").font(.system(size: 10, weight: .semibold))
-            Text(timerInterval: since...Date.distantFuture, countsDown: false)
+            Text(timerInterval: since...since.addingTimeInterval(12 * 3600), countsDown: false)
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .frame(width: 40, alignment: .leading)
         }
@@ -395,10 +395,13 @@ struct ApprovalLayout: View {
 /// The time left to answer, counting down. Fixed width, so it never pushes the header around.
 struct Countdown: View {
     var until: Date
+    /// Counting down to `until`. The start is fixed just under an hour before it (not "now", which the system
+    /// may take at a different moment than it draws), so the remaining time is always `until - now`.
+    static func range(_ until: Date) -> ClosedRange<Date> { until.addingTimeInterval(-3599)...until }
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: "clock.fill").font(.system(size: 10, weight: .bold))
-            Text(timerInterval: Date.now...max(Date.now, until), countsDown: true)
+            Text(timerInterval: Countdown.range(until), countsDown: true)
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
                 .frame(width: 34, alignment: .leading)
         }
@@ -567,7 +570,7 @@ struct IslandTrailing: View {
                 if let guide = state.guide { StepRingSmall(guide: guide).scaleEffect(1.2) } else { StatusPill(state: state) }
             case .working:
                 if let since = state.since {
-                    Text(timerInterval: since...Date.distantFuture, countsDown: false)
+                    Text(timerInterval: since...since.addingTimeInterval(12 * 3600), countsDown: false)
                         .font(.system(size: 15, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.blue)
                         .multilineTextAlignment(.trailing)
@@ -608,7 +611,7 @@ struct CompactTrailing: View {
             switch state.phase {
             case .approval:
                 if let approval = state.approval {
-                    Text(timerInterval: Date.now...max(Date.now, approval.expires), countsDown: true)
+                    Text(timerInterval: Countdown.range(approval.expires), countsDown: true)
                         .font(.system(size: 14, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.approval)
                         .multilineTextAlignment(.trailing)
@@ -621,7 +624,7 @@ struct CompactTrailing: View {
                 if let guide = state.guide { StepRingSmall(guide: guide) } else { glyph }
             case .working:
                 if let since = state.since {
-                    Text(timerInterval: since...Date.distantFuture, countsDown: false)
+                    Text(timerInterval: since...since.addingTimeInterval(12 * 3600), countsDown: false)
                         .font(.system(size: 14, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.blue)
                         .multilineTextAlignment(.trailing)

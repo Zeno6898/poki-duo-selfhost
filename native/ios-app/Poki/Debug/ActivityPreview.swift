@@ -167,7 +167,7 @@ private struct HeightBadge: View {
                 .background(height > 160 ? Color.red : Color.white.opacity(0.15), in: .capsule)
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                .offset(x: -6, y: 20)
+                .offset(x: -10, y: -8)
         }
     }
 }
@@ -181,16 +181,23 @@ enum DemoActivity {
             try? jpeg.write(to: url, options: .atomic)
         }
         var state = sample
-        // Times relative to now, so countdowns are live in the screenshots.
+        // Times relative to now, so countdowns are live in the screenshots: elapsed starts at 0:00 and
+        // an approval has two minutes, which also shows any clock difference between app and widget.
+        let now = Date()
+        if state.since != nil { state.since = now }
+        if let end = state.endedAt, let since = sample.since { state.endedAt = now; state.since = now.addingTimeInterval(-end.timeIntervalSince(since)) }
         if var approval = state.approval {
-            approval.expires = Date().addingTimeInterval(40); state.approval = approval
-            state.approvalSince = Date()
+            approval.expires = now.addingTimeInterval(120); state.approval = approval
+            state.approvalSince = now.addingTimeInterval(-30)
         }
+        // Poki keeps running in the background while it is on; the demo asks for time to send its alert.
+        let task = UIApplication.shared.beginBackgroundTask(withName: "activity demo")
+        defer { UIApplication.shared.endBackgroundTask(task) }
         guard let activity = try? Activity.request(attributes: PokiActivityAttributes(deviceName: "iPhone"), content: .init(state: state, staleDate: nil), pushType: nil) else {
             AppLog.shared.add("activity", "demo did not start")
             return
         }
-        try? await Task.sleep(for: .seconds(6))
+        try? await Task.sleep(for: .seconds(5))
         await activity.update(.init(state: state, staleDate: nil, relevanceScore: 100),
                               alertConfiguration: AlertConfiguration(title: "Poki", body: "\(state.headline)", sound: .default))
     }

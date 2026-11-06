@@ -83,17 +83,18 @@ jobs:
           done
           xcrun simctl ui "$UDID" appearance dark
           # 2. Real Live Activities: compact island, the alert's expanded island, then the Lock Screen.
-          for s in working approval code done setup; do
+          for s in working approval code done setup problem; do
             xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
             xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityDemo "$s" > /dev/null
             sleep 2
             xcrun simctl launch "$UDID" com.apple.Preferences > /dev/null
             sleep 2
             shot "shots/real/$s-compact.png"
-            # The alert goes out six seconds after the start.
-            sleep 2.3; shot "shots/real/$s-alert-1.png"
-            sleep 0.8; shot "shots/real/$s-alert-2.png"
-            sleep 0.8; shot "shots/real/$s-alert-3.png"
+            # The alert goes out five seconds after the start.
+            sleep 0.9; shot "shots/real/$s-alert-1.png"
+            sleep 0.7; shot "shots/real/$s-alert-2.png"
+            sleep 0.7; shot "shots/real/$s-alert-3.png"
+            sleep 0.7; shot "shots/real/$s-alert-4.png"
             # Lock the simulator (Device > Lock, Cmd-L) for the Lock Screen view.
             osascript -e 'tell application "Simulator" to activate' -e 'delay 0.5' -e 'tell application "System Events" to keystroke "l" using command down' 2>&1 || echo "lock keystroke failed"
             sleep 2
