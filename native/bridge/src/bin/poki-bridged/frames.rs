@@ -136,6 +136,12 @@ struct Counters {
     discontinuities: u64,
     /// Times packets kept arriving with no picture for STALL_AFTER.
     stalls: u64,
+    /// Units dropped because decoding fell behind, and how often that started a resync.
+    dropped_units: u64,
+    backlog_resyncs: u64,
+    /// Time inside the decoder only (decode_ms_sum also counts the wait in the queue).
+    decode_work_ms_sum: f64,
+    decode_work_units: u64,
     restart_requests: u64,
     /// Units the decoder took without giving a picture (a missing reference, or a unit it could
     /// not use), and how many in a row now.
@@ -181,6 +187,8 @@ struct Screen {
     stalled_since: Option<Instant>,
     /// Set when resynchronizing did not bring a key frame: the media session should be reopened.
     restart_requested: bool,
+    /// Set by the decoder when it fell behind and dropped units: the receiver asks for a key frame.
+    resync_requested: bool,
 }
 
 enum Job {
@@ -592,6 +600,9 @@ impl Live {
                 "discontinuities": c.discontinuities,
                 "stalls": c.stalls,
                 "restart_requests": c.restart_requests,
+                "dropped_units": c.dropped_units,
+                "decode_work_ms_avg": (c.decode_work_units > 0).then(|| (c.decode_work_ms_sum / c.decode_work_units as f64 * 100.0).round() / 100.0),
+                "backlog_resyncs": c.backlog_resyncs,
                 "units_without_picture": c.units_without_picture,
                 "units_without_picture_run": c.units_without_picture_run,
                 "max_unit_gap_ms": c.max_unit_gap_ms,
@@ -647,6 +658,9 @@ impl Datagrams for UdpSocketHandle {
         UdpSocketHandle::send_to(self, port, data).await
     }
 }
+
+/// A unit that waited this long before decoding started means the decoder is behind.
+const BEHIND: Duration = Duration::from_millis(150);
 
 /// Packets arriving with no picture for this long is a stall, not a still screen (a still screen
 /// sends no packets).
@@ -743,6 +757,13 @@ async fn receive<S: Datagrams>(
             let _ = jobs.send(Job::Flush);
             screen.lock().unwrap().stalled_since.get_or_insert(now);
         }
+        // The decoder fell behind and dropped units: wait for a key unit and ask for one now.
+        if std::mem::take(&mut screen.lock().unwrap().resync_requested) {
+            keyed = false;
+            last_request = None;
+            unit.clear();
+            waiting_since = Some(now);
+        }
         // Packets keep coming but no picture: whatever the decoder waits for is not coming.
         // Start again from a key frame.
         if keyed {
@@ -832,13 +853,30 @@ fn decode_loop(
     let mut encoder = libav::JpegEncoder::default();
     let mut latest: Option<(libav::Picture, Instant, SystemTime, u64)> = None;
     let mut previous: Option<Thumb> = None;
+    // Units waiting behind the one being decoded (see BEHIND), and whether units are being
+    // dropped until the next key unit.
+    let mut pending: VecDeque<Job> = VecDeque::new();
+    let mut skipping = false;
+    let mut skipping_unreferenced = false;
     ready.store(true, Ordering::SeqCst);
-    while let Ok(job) = queue.recv() {
+    loop {
+        if pending.is_empty() {
+            match queue.recv() {
+                Ok(job) => pending.push_back(job),
+                Err(_) => break,
+            }
+        }
+        while let Ok(job) = queue.try_recv() {
+            pending.push_back(job);
+        }
+        let job = pending.pop_front().expect("one job");
+        let more_units = pending.iter().any(|job| matches!(job, Job::Unit(..)));
         match job {
             Job::Flush => {
                 if let Some(decoder) = decoder.as_mut() {
                     decoder.flush();
                 }
+                skipping = false;
             }
             Job::Jpeg {
                 width,
@@ -872,8 +910,43 @@ fn decode_loop(
                         }
                     }
                 }
-                let decoded = decoder.as_mut().unwrap().decode(&unit);
+                let key = nal_units(&unit).any(|(_, kind)| (16..=23).contains(&kind));
+                if skipping && !key {
+                    screen.lock().unwrap().counters.dropped_units += 1;
+                    continue;
+                }
+                if !skipping && !key && arrived.elapsed() > BEHIND {
+                    // Too far behind to catch up: drop what is queued and start again at a key
+                    // frame, so the newest picture is never a queue's worth old.
+                    let decoder = decoder.as_mut().unwrap();
+                    decoder.flush();
+                    skipping = true;
+                    let dropped = 1 + pending
+                        .iter()
+                        .filter(|j| matches!(j, Job::Unit(..)))
+                        .count() as u64;
+                    pending.retain(|j| !matches!(j, Job::Unit(..)));
+                    let mut screen = screen.lock().unwrap();
+                    screen.counters.dropped_units += dropped;
+                    screen.counters.backlog_resyncs += 1;
+                    screen.resync_requested = true;
+                    continue;
+                }
+                skipping = false;
+                let decoder_now = decoder.as_mut().unwrap();
+                if more_units != skipping_unreferenced {
+                    skipping_unreferenced = more_units;
+                    decoder_now.skip_unreferenced(more_units);
+                }
+                let work = Instant::now();
+                let decoded = decoder_now.decode(&unit);
                 let decoded_at = Instant::now();
+                {
+                    let mut screen = screen.lock().unwrap();
+                    let c = &mut screen.counters;
+                    c.decode_work_ms_sum += decoded_at.duration_since(work).as_secs_f64() * 1000.0;
+                    c.decode_work_units += 1;
+                }
                 let pictures = match decoded {
                     Ok(pictures) if pictures.is_empty() => {
                         let mut screen = screen.lock().unwrap();
@@ -891,16 +964,19 @@ fn decode_loop(
                 };
                 for picture in pictures {
                     let wall = SystemTime::now();
-                    let thumb = thumbnailer.gray(&picture, THUMB_WIDTH).ok().map(
-                        |(pixels, width, height)| Thumb {
+                    // Behind: only the newest picture is compared and kept in the ring; its
+                    // change region covers the ones skipped.
+                    let thumb = (!more_units)
+                        .then(|| thumbnailer.gray(&picture, THUMB_WIDTH).ok())
+                        .flatten()
+                        .map(|(pixels, width, height)| Thumb {
                             arrived,
                             wall,
                             epoch: 0,
                             pixels,
                             width,
                             height,
-                        },
-                    );
+                        });
                     let difference = match (&previous, &thumb) {
                         (Some(a), Some(b)) => Some(compare(a, b)),
                         (None, Some(_)) => Some(Difference {
@@ -1067,6 +1143,77 @@ mod tests {
             (wide["orientation"].clone(), wide["scale"].clone()),
             (json!("landscape"), json!(3.0))
         );
+    }
+
+    /// Decoding cost per unit at the phone's size, with and without the loop filter, and a flood
+    /// of units that the decoder cannot keep up with: it drops to the next key unit instead of
+    /// queueing, so the newest picture stays young. Prints the costs.
+    #[test]
+    fn a_decoder_that_falls_behind_drops_to_the_next_key_frame() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        let Some(units) = stream_with(60, "testsrc2=size=1216x2656:rate=60", 30) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        for tuning in [
+            libav::Tuning {
+                threads: 1,
+                skip_loop_filter: false,
+                fast: false,
+            },
+            libav::Tuning {
+                threads: 3,
+                skip_loop_filter: true,
+                fast: true,
+            },
+        ] {
+            let mut decoder = libav::Decoder::hevc_with(&tuning).unwrap();
+            let started = Instant::now();
+            let mut pictures = 0;
+            for unit in &units {
+                pictures += decoder.decode(unit).unwrap().len();
+            }
+            let per_unit = started.elapsed().as_secs_f64() * 1000.0 / units.len() as f64;
+            println!("{tuning:?}: {per_unit:.1} ms per 1216x2656 unit, {pictures} pictures");
+            assert_eq!(pictures, units.len());
+        }
+        let screen = fake::FakeScreen::start().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // 60 units at once: far more than the decoder can do in BEHIND.
+            for unit in &units {
+                screen.send_now(unit);
+            }
+            let sent = Instant::now();
+            let counters =
+                |f: fn(&Counters) -> u64| f(&screen.live.screen.lock().unwrap().counters);
+            // The queue empties quickly: dropped, not decoded one by one.
+            while counters(|c| c.decoded + c.dropped_units) < 60
+                && sent.elapsed() < Duration::from_secs(10)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let drained = sent.elapsed();
+            println!(
+                "flood of 60: {} decoded, {} dropped, {} resyncs, drained in {} ms",
+                counters(|c| c.decoded),
+                counters(|c| c.dropped_units),
+                counters(|c| c.backlog_resyncs),
+                drained.as_millis()
+            );
+            assert!(counters(|c| c.backlog_resyncs) >= 1);
+            assert!(counters(|c| c.dropped_units) > 0);
+            assert!(
+                screen.live.screen.lock().unwrap().resync_requested,
+                "a key frame is asked for"
+            );
+        });
     }
 
     #[test]
@@ -1504,6 +1651,13 @@ pub mod fake {
                 jobs,
                 thread: Some(thread),
             })
+        }
+
+        /// Sends one access unit as if it had just arrived, without waiting.
+        pub fn send_now(&self, unit: &[u8]) {
+            self.jobs
+                .send(Job::Unit(unit.to_vec(), Instant::now()))
+                .unwrap();
         }
 
         /// Sends one access unit and waits for its picture.

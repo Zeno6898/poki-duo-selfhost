@@ -502,8 +502,18 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 });
                 // What observe needs to know before trusting a picture.
                 let mut reasons = Vec::new();
-                if pong["frames"]["video_stalled"] == json!(true) {
+                let frames = &pong["frames"];
+                if frames["video_stalled"] == json!(true) {
                     reasons.push("video_stalled");
+                } else if frames["latest_age_ms"]
+                    .as_u64()
+                    .is_some_and(|age| age > 1000)
+                    && frames["ms_since_last_packet"]
+                        .as_u64()
+                        .is_some_and(|ms| ms < 500)
+                {
+                    // Units arrive but the newest picture is old: decoding is behind.
+                    reasons.push("decode_backlog");
                 }
                 if let Some(down) = &session.tunnel_down {
                     reasons.push(if down.state == "wifi_required" {
@@ -1527,8 +1537,14 @@ mod daemon_tests {
             classify("Connect: 100.64.0.9:49152: Connection refused (os error 111)"),
             "wifi_required"
         );
-        assert_eq!(classify("Connect: 100.64.0.9:49152: no answer within 5s"), "unreachable");
-        assert_eq!(classify("Connect: No route to host (os error 113)"), "unreachable");
+        assert_eq!(
+            classify("Connect: 100.64.0.9:49152: no answer within 5s"),
+            "unreachable"
+        );
+        assert_eq!(
+            classify("Connect: No route to host (os error 113)"),
+            "unreachable"
+        );
         assert_eq!(classify("cannot read the pairing file"), "error");
         let down = TunnelDown {
             state: "wifi_required",
