@@ -310,6 +310,9 @@ struct Timings {
     reused_tunnel: bool,
     reused_input: bool,
     retried: bool,
+    /// Where a quick type_text spent its time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stages: Option<Value>,
     /// How an ax_tree read was served by the held subscription.
     #[serde(skip_serializing_if = "Option::is_none")]
     ax: Option<crate::ax::watch::Served>,
@@ -868,12 +871,67 @@ impl Session {
                 }
                 parse(object)?
             }
+            Request::TypeText {
+                text,
+                clear,
+                submit,
+                ..
+            } if super::paste_again::quick::enabled() => {
+                let result = Box::pin(self.quick_type(&text, clear, submit, object, timings)).await;
+                if result.is_err() {
+                    self.reset().await;
+                }
+                return result;
+            }
             request => request,
         };
         let result = Box::pin(self.input_action(request)).await;
         if result.is_err() {
             self.reset().await;
         }
+        result
+    }
+
+    /// type_text with its independent steps overlapped (see quick_type.rs), using the held tree
+    /// when it is current and the live screen when it runs.
+    async fn quick_type(
+        &mut self,
+        text: &str,
+        clear: bool,
+        submit: bool,
+        object: &Map<String, Value>,
+        timings: &mut Timings,
+    ) -> Result<Value> {
+        use super::paste_again::{Target, quick};
+        let target: Option<Target> = match object.get("target") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone())?),
+        };
+        let held = self.ax.as_ref().and_then(|watch| watch.current());
+        let live = self
+            .input
+            .as_ref()
+            .map(|input| input.frames.live())
+            .filter(|live| live.decoding() && live.error().is_none());
+        let device = &self.link.as_ref().expect("connected").device;
+        let mut stages = quick::Stages::default();
+        let result = quick::paste_text(
+            &device.adapter,
+            &device.rsd,
+            held,
+            live,
+            text,
+            clear,
+            submit,
+            target.as_ref(),
+            &mut stages,
+        )
+        .await;
+        log(&format!(
+            "type_text stages: {}",
+            serde_json::to_string(&stages).unwrap_or_default()
+        ));
+        timings.stages = Some(serde_json::to_value(&stages)?);
         result
     }
 

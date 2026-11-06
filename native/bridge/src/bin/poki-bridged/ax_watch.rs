@@ -350,6 +350,15 @@ impl Watch {
         }));
     }
 
+    /// The held tree, if it shows the screen as it is now (no input since, and not too old).
+    pub fn current(&self) -> Option<Json> {
+        let state = self.inner.state.borrow();
+        let (tree, at) = state.latest.as_ref()?;
+        let fresh = self.push_mode() || at.elapsed() < self.settings.max_age;
+        (state.current() && !state.awaiting && state.failed.is_none() && fresh)
+            .then(|| tree.clone())
+    }
+
     pub fn stats(&self) -> Json {
         let state = self.inner.state.borrow();
         json!({"trees": state.trees, "renewals": state.renewals, "pushed": state.pushed, "push_mode": self.push_mode()})
