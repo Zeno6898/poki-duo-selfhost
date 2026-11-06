@@ -29,7 +29,6 @@ const imageWidth = 300, lineLimit = 120;
 // A read waits this long for accessibility; after that the screenshot's OCR answers instead, so a
 // silent accessibility service costs seconds, not tens of seconds.
 const treeWaitMs = Number(process.env.POKI_CUA_TREE_MS) || 2500;
-const keys = new Set('abcdefghijklmnopqrstuvwxyz0123456789'.split(''));
 
 const roleName = element => String(element.type ?? element.role ?? 'Text').replace(/^XCUIElementType/, '');
 const labelOf = element => [element.label ?? element.text, element.value].filter(value => value !== undefined && value !== null && value !== '').map(String).join(' = ');
@@ -119,14 +118,10 @@ function pointOf(ctx, target) {
 }
 
 async function typeText(ctx, text) {
-  // Direct key presses first; the pasteboard only when a character has no key here.
-  if ([...text].every(ch => keys.has(ch.toLowerCase()) || ch === ' ')) {
-    for (const ch of text) {
-      if (ch === ' ') await ctx.input({ op: 'key', key: 'space' });
-      else await ctx.input({ op: 'key', key: ch.toLowerCase(), modifiers: ch !== ch.toLowerCase() ? ['shift'] : [] });
-    }
-    return 'keys';
-  }
+  // Key presses first, the whole string on one keyboard session; the pasteboard (saved and
+  // restored by type_text) only for text that has no keys.
+  try { await ctx.input({ op: 'type_keys', text, clear: false }); return 'keys'; }
+  catch (error) { if (stopped(error) || !/cannot type/.test(error.message)) throw error; }
   await ctx.input({ op: 'type_text', text, clear: false, submit: false });
   return 'paste';
 }

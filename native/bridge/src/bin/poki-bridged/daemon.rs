@@ -821,6 +821,7 @@ fn is_input(request: &Request) -> bool {
             | Request::Key { .. }
             | Request::Button { .. }
             | Request::TypeText { .. }
+            | Request::TypeKeys { .. }
     )
 }
 
@@ -1567,6 +1568,13 @@ impl Session {
                     tokio::time::sleep(Duration::from_millis(duration)).await;
                     buttons.send_button(0x0c, code, ButtonState::Up).await?;
                 }
+            }
+            Request::TypeKeys { text, clear } => {
+                let mut keyboard = Keyboard::connect(adapter, rsd).await?;
+                let outcome = super::type_keys(&mut keyboard, &text, clear).await;
+                let cleanup = keyboard.close().await;
+                outcome?;
+                cleanup?;
             }
             Request::TypeText {
                 text,
