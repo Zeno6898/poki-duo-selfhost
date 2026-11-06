@@ -89,7 +89,7 @@ private struct LogSection: View {
                 .buttonStyle(.bordered)
             }
             .controlSize(.large).buttonBorderShape(.capsule)
-            .listRowBackground(Color.clear).listRowInsets(EdgeInsets())
+            .padding(.vertical, 4)
             NavigationLink {
                 List(Array(log.lines.reversed().enumerated()), id: \.offset) { _, line in
                     Text(line).font(.caption.monospaced()).textSelection(.enabled)

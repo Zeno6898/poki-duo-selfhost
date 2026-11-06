@@ -12,7 +12,7 @@ struct HomeView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-                    HeroCard()
+                    HeroCard(openSetup: openSetup)
                     ForEach(model.approvals, id: \.id) { ApprovalCard(approval: $0) }
                     if model.sessionOn, !model.runnerPaused, model.activityText != "Idle" || !model.recentSteps.isEmpty { NowCard() }
                     if !model.setupComplete { SetupCard(openSetup: openSetup) }
@@ -58,6 +58,7 @@ private struct CardTitle: View {
 
 private struct HeroCard: View {
     @Environment(AppModel.self) private var model
+    var openSetup: () -> Void
 
     var body: some View {
         VStack(spacing: 18) {
@@ -81,20 +82,21 @@ private struct HeroCard: View {
                            health: model.loopback.isWorking ? .good : model.loopback.state == .checking ? .waiting : .bad)
             }
             Button {
-                model.sessionOn ? model.stopSession() : model.startSession()
+                if !model.sessionOn && model.setup.pairingFile == nil { openSetup() }
+                else { model.sessionOn ? model.stopSession() : model.startSession() }
             } label: {
-                Label(model.sessionOn ? "Turn off" : "Turn on", systemImage: "power")
+                Label(model.sessionOn ? "Turn off" : model.setup.pairingFile == nil ? "Set up Poki" : "Turn on",
+                      systemImage: model.sessionOn || model.setup.pairingFile != nil ? "power" : "checklist")
                     .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 6)
                     .foregroundStyle(model.sessionOn ? Color.white : Brand.blue)
             }
             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
             .tint(model.sessionOn ? Color.white.opacity(0.22) : Color.white)
-            .disabled(!model.sessionOn && model.setup.pairingFile == nil)
         }
         .foregroundStyle(.white)
         .padding(18)
         .background(
-            LinearGradient(colors: model.sessionOn ? [Brand.blue, Color(red: 0.32, green: 0.36, blue: 0.98)] : [Color(white: 0.42), Color(white: 0.30)],
+            LinearGradient(colors: model.sessionOn ? [Brand.blue, Color(red: 0.32, green: 0.36, blue: 0.98)] : [Color(red: 0.22, green: 0.26, blue: 0.38), Color(red: 0.12, green: 0.14, blue: 0.24)],
                            startPoint: .topLeading, endPoint: .bottomTrailing),
             in: .rect(cornerRadius: 26, style: .continuous))
         .shadow(color: (model.sessionOn ? Brand.blue : .black).opacity(0.22), radius: 16, y: 8)
@@ -169,7 +171,7 @@ private struct ApprovalCard: View {
             }
             HStack(spacing: 12) {
                 Button(role: .destructive) { model.resolve(approval, approved: false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.bordered).tint(.red)
                 Button { model.resolve(approval, approved: true) } label: { Text("Allow").frame(maxWidth: .infinity) }
                     .buttonStyle(.borderedProminent).tint(.green)
             }
