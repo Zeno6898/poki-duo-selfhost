@@ -148,20 +148,22 @@ struct State {
     /// Accessibility reads made after the screen settles (live frames), and their arrivals.
     prefetch: live::Prefetcher,
     prefetch_events: Rc<watch::Sender<u64>>,
+    /// The foreground app from the newest tree, and app_for_pid answers (see live::Foreground).
+    foreground: live::ForegroundCell,
 }
 
 impl State {
     fn new(target: Target) -> Self {
         let prefetch = live::Prefetcher::default();
         let prefetch_events = Rc::new(watch::channel(0).0);
+        let foreground = live::ForegroundCell::default();
+        let mut session = Session::new(target, prefetch.clone(), prefetch_events.clone());
+        session.foreground = foreground.clone();
         Self {
-            session: Mutex::new(Session::new(
-                target,
-                prefetch.clone(),
-                prefetch_events.clone(),
-            )),
+            session: Mutex::new(session),
             prefetch,
             prefetch_events,
+            foreground,
             stop: watch::channel(false).0,
             started: Instant::now(),
             version: executable_version(),
@@ -184,6 +186,7 @@ fn executable_version() -> u64 {
 async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let reaper = tokio::task::spawn_local(reap(state.clone()));
+    let resolver = tokio::task::spawn_local(live::resolve_foreground(state.clone()));
     let prefetcher =
         live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     // Load the OCR models before the first type_text or ocr_region needs them.
@@ -204,6 +207,7 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
         }
     }
     reaper.abort();
+    resolver.abort();
     if let Some(prefetcher) = prefetcher {
         prefetcher.abort();
     }
@@ -536,6 +540,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnels"] =
                     json!({"opened": session.tunnels_opened, "lost": session.tunnels_lost});
                 pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
+                pong["foreground"] = live::foreground_json(state);
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
@@ -661,6 +666,7 @@ struct Input {
 
 struct Session {
     target: Target,
+    foreground: live::ForegroundCell,
     prefetch: live::Prefetcher,
     prefetch_events: Rc<watch::Sender<u64>>,
     link: Option<Link>,
@@ -817,6 +823,7 @@ impl Session {
             tunnels_opened: 0,
             tunnels_lost: 0,
             ops: 0,
+            foreground: live::ForegroundCell::default(),
         }
     }
 
@@ -923,6 +930,7 @@ impl Session {
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
         let request = parse(&object)?;
         let changes = !reads_only(&request);
+        let tree = matches!(request, Request::AxTree { .. });
         // The live screen is not settled while an input runs, nor for the settle time after it.
         let noted = changes
             .then(|| self.input.as_ref().map(|input| input.frames.live()))
@@ -931,6 +939,9 @@ impl Session {
             live.note_input();
         }
         let result = Box::pin(self.run(request, object, timings)).await;
+        if tree && let Ok(tree) = &result {
+            live::note_tree(&self.foreground, tree);
+        }
         if changes && let Some(input) = self.input.as_ref() {
             input.frames.live().note_input();
         }
@@ -1633,6 +1644,34 @@ mod daemon_tests {
         let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
         assert_eq!(pong["id"], json!(1));
         assert_eq!(pong["pong"]["tunnel"], json!(false));
+        assert_eq!(pong["pong"]["foreground"], Value::Null, "no tree read yet");
+        live::note_tree(
+            &state.foreground,
+            &json!({"foreground_app": {"pid": 77, "bundle_id": "com.apple.mobilenotes", "name": "Notes"}}),
+        );
+        let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
+        assert_eq!(
+            pong["pong"]["foreground"]["bundle_id"],
+            "com.apple.mobilenotes"
+        );
+        assert_eq!(pong["pong"]["foreground"]["pid"], 77);
+        // No bundle id in the tree: looked up by pid in the background, never waited for.
+        live::note_tree(
+            &state.foreground,
+            &json!({"foreground_app": {"pid": 78, "bundle_id": null}}),
+        );
+        let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
+        assert_eq!(pong["pong"]["foreground"]["resolving"], true);
+        state.foreground.borrow_mut().known.insert(
+            78,
+            json!({"running": true, "bundle_id": "com.apple.Preferences", "name": "Settings"}),
+        );
+        let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
+        assert_eq!(
+            pong["pong"]["foreground"]["bundle_id"],
+            "com.apple.Preferences"
+        );
+        assert_eq!(pong["pong"]["foreground"]["via"], "app_for_pid");
 
         let started = Instant::now();
         let answer = ask(&mut client, r#"{"id":2,"op":"ax_tree"}"#).await;

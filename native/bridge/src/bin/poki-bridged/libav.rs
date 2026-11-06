@@ -269,6 +269,27 @@ impl Decoder {
         })
     }
 
+    /// A still-image decoder ("png" for the screenshot service's pictures), with no options.
+    pub fn image(name: &str) -> Result<Self, String> {
+        let api = api()?;
+        let codec_name = CString::new(name).unwrap();
+        let codec = unsafe { (api.find_decoder_by_name)(codec_name.as_ptr()) };
+        if codec.is_null() {
+            return Err(format!("libavcodec has no {name} decoder"));
+        }
+        let mut context = unsafe { (api.alloc_context3)(codec) };
+        let code = unsafe { (api.open2)(context, codec, std::ptr::null_mut()) };
+        if code < 0 {
+            unsafe { (api.free_context)(&mut context) };
+            return Err(format!("cannot open the {name} decoder ({code})"));
+        }
+        Ok(Self {
+            context,
+            packet: unsafe { (api.packet_alloc)() },
+            frame: unsafe { (api.frame_alloc)() },
+        })
+    }
+
     /// Decodes one access unit (Annex-B); the pictures it completes, usually one.
     pub fn decode(&mut self, unit: &[u8]) -> Result<Vec<Picture>, String> {
         let api = api()?;
@@ -289,6 +310,22 @@ impl Decoder {
             }
             if sent < 0 && pictures.is_empty() {
                 return Err(format!("decode error {sent}"));
+            }
+            Ok(pictures)
+        }
+    }
+
+    /// Tells the decoder the input ended; the pictures it still held.
+    pub fn finish(&mut self) -> Result<Vec<Picture>, String> {
+        let api = api()?;
+        unsafe {
+            (api.send_packet)(self.context, std::ptr::null_mut());
+            let mut pictures = Vec::new();
+            while (api.receive_frame)(self.context, self.frame) == 0 {
+                let picture = (api.frame_alloc)();
+                (api.frame_ref)(picture, self.frame);
+                (api.frame_unref)(self.frame);
+                pictures.push(Picture(picture));
             }
             Ok(pictures)
         }
@@ -403,6 +440,25 @@ impl Thumbnailer {
         }
         Ok((pixels, width, height))
     }
+}
+
+/// A PNG (the screenshot service's) as a JPEG `width` wide at `quality`: (jpeg, width, height,
+/// the PNG's width and height).
+pub fn png_to_jpeg(
+    png: &[u8],
+    width: u32,
+    quality: u32,
+) -> Result<(Vec<u8>, u32, u32, u32, u32), String> {
+    let mut decoder = Decoder::image("png")?;
+    let mut pictures = decoder.decode(png)?;
+    if pictures.is_empty() {
+        // A still-image decoder may hold its picture until told the input ended.
+        pictures = decoder.finish()?;
+    }
+    let picture = pictures.pop().ok_or("the PNG gave no picture")?;
+    let (source_width, source_height) = (picture.width(), picture.height());
+    let (jpeg, width, height) = JpegEncoder::default().encode(&picture, width, quality)?;
+    Ok((jpeg, width, height, source_width, source_height))
 }
 
 /// A JPEG encoder for pictures, scaled to a width.
