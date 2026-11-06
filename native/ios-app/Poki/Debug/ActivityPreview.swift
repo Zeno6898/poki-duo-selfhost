@@ -26,7 +26,7 @@ struct ActivityPreview: View {
                     }
                 }
             }
-            .padding(.vertical)
+            .padding(.vertical).padding(.horizontal, 16)
             .frame(maxWidth: .infinity)
         }
         .background(LinearGradient(colors: [Color(red: 0.32, green: 0.36, blue: 0.55), Color(red: 0.75, green: 0.55, blue: 0.5)], startPoint: .top, endPoint: .bottom).ignoresSafeArea())
@@ -113,7 +113,7 @@ private struct LockScreenFrame: View {
     var body: some View {
         LockScreenView(state: state)
             .padding(.horizontal, 14).padding(.vertical, 12)
-            .frame(width: 371)
+            .frame(maxWidth: 371)
             .background(Brand.night.opacity(0.94), in: .rect(cornerRadius: 24, style: .continuous))
             .overlay(alignment: .bottomTrailing) { HeightBadge() }
             .environment(\.colorScheme, .dark)
@@ -135,7 +135,7 @@ private struct IslandExpandedFrame: View {
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 16)
-        .frame(width: 371)
+        .frame(maxWidth: 371)
         .background(.black, in: .rect(cornerRadius: 44, style: .continuous))
         .overlay(alignment: .top) { Capsule().fill(Color(white: 0.08)).frame(width: 120, height: 36).padding(.top, 11) }
         .environment(\.colorScheme, .dark)
