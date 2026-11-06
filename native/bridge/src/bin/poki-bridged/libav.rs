@@ -294,15 +294,6 @@ impl Decoder {
         }
     }
 
-    /// While behind, pictures nothing refers to are not decoded at all.
-    pub fn skip_unreferenced(&mut self, skip: bool) {
-        let _ = set(
-            self.context,
-            "skip_frame",
-            if skip { "nonref" } else { "default" },
-        );
-    }
-
     /// Forgets the reference pictures, after a gap in the stream.
     pub fn flush(&mut self) {
         if let Ok(api) = api() {

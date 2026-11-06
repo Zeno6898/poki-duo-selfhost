@@ -136,9 +136,11 @@ struct Counters {
     discontinuities: u64,
     /// Times packets kept arriving with no picture for STALL_AFTER.
     stalls: u64,
-    /// Units dropped because decoding fell behind, and how often that started a resync.
-    dropped_units: u64,
-    backlog_resyncs: u64,
+    /// Packet losses inside a decoded stream: pictures after one may show errors until the next
+    /// key unit (this phone sends one only when a session opens).
+    damaging_losses: u64,
+    /// Units given to the decoder (less decode_work_units: how many wait in its queue).
+    units_to_decoder: u64,
     /// Time inside the decoder only (decode_ms_sum also counts the wait in the queue).
     decode_work_ms_sum: f64,
     decode_work_units: u64,
@@ -187,8 +189,8 @@ struct Screen {
     stalled_since: Option<Instant>,
     /// Set when resynchronizing did not bring a key frame: the media session should be reopened.
     restart_requested: bool,
-    /// Set by the decoder when it fell behind and dropped units: the receiver asks for a key frame.
-    resync_requested: bool,
+    /// Since when the pictures may show errors from a lost packet (cleared by a key unit).
+    damaged_since: Option<Instant>,
 }
 
 enum Job {
@@ -585,6 +587,8 @@ impl Live {
             "decoding": screen.decoding_since.is_some(),
             "decoder_error": screen.decoder_error,
             "video_stalled": screen.stalled_since.is_some(),
+            "picture_damaged": screen.damaged_since.is_some(),
+            "queued_units": c.units_to_decoder.saturating_sub(c.decode_work_units),
             "stalled_ms": since(screen.stalled_since),
             "totals": {
                 "packets": c.packets,
@@ -600,9 +604,8 @@ impl Live {
                 "discontinuities": c.discontinuities,
                 "stalls": c.stalls,
                 "restart_requests": c.restart_requests,
-                "dropped_units": c.dropped_units,
+                "damaging_losses": c.damaging_losses,
                 "decode_work_ms_avg": (c.decode_work_units > 0).then(|| (c.decode_work_ms_sum / c.decode_work_units as f64 * 100.0).round() / 100.0),
-                "backlog_resyncs": c.backlog_resyncs,
                 "units_without_picture": c.units_without_picture,
                 "units_without_picture_run": c.units_without_picture_run,
                 "max_unit_gap_ms": c.max_unit_gap_ms,
@@ -659,14 +662,14 @@ impl Datagrams for UdpSocketHandle {
     }
 }
 
-/// A unit that waited this long before decoding started means the decoder is behind.
-const BEHIND: Duration = Duration::from_millis(150);
-
 /// Packets arriving with no picture for this long is a stall, not a still screen (a still screen
-/// sends no packets).
+/// sends no packets): the newest picture is reported stale.
 const STALL_AFTER: Duration = Duration::from_millis(500);
-/// After a key frame request, how long to wait for a key unit before asking for a new session.
-const KEY_WITHIN: Duration = Duration::from_millis(1200);
+/// Units arriving and the newest picture this old (or no key unit this long after decoding
+/// started): ask for a new media session, which opens with a key unit. Measured on an iPhone 17
+/// Pro: the phone does not answer key frame requests, so nothing short of that brings one, and
+/// units are never dropped to catch up (each one after a drop would refer to a missing picture).
+const RECOVER_AFTER: Duration = Duration::from_millis(1500);
 
 async fn receive<S: Datagrams>(
     socket: Arc<S>,
@@ -746,60 +749,52 @@ async fn receive<S: Datagrams>(
             continue;
         }
         if gap && keyed {
-            // A lost packet spoils the pictures that refer to it: start again at a key frame.
-            // The depacketizer too: it would hold everything after the hole, waiting for the lost
-            // packet, until 128 packets had piled up.
+            // The depacketizer would hold everything after the hole, waiting for the lost packet,
+            // until 128 packets had piled up: start it again. The decoder keeps going (it
+            // conceals what refers to the lost unit); the pictures are marked damaged until a key
+            // unit.
             depacketizer = HevcDepacketizer::new();
-            keyed = false;
-            last_request = None;
             unit.clear();
-            waiting_since = Some(now);
-            let _ = jobs.send(Job::Flush);
-            screen.lock().unwrap().stalled_since.get_or_insert(now);
+            let mut s = screen.lock().unwrap();
+            s.counters.damaging_losses += 1;
+            s.damaged_since.get_or_insert(now);
         }
-        // The decoder fell behind and dropped units: wait for a key unit and ask for one now.
-        if std::mem::take(&mut screen.lock().unwrap().resync_requested) {
-            keyed = false;
-            last_request = None;
-            unit.clear();
-            waiting_since = Some(now);
-        }
-        // Packets keep coming but no picture: whatever the decoder waits for is not coming.
-        // Start again from a key frame.
+        // Units keep coming but the newest picture grows old: the decoder is far behind or gets
+        // nothing it can use. Report it stale, and past RECOVER_AFTER ask for a new session.
         if keyed {
             let mut s = screen.lock().unwrap();
             let progress = s.last_decoded_at.into_iter().chain(keyed_at).max();
-            if progress.is_some_and(|at| now.duration_since(at) >= STALL_AFTER) {
+            let age = progress.map(|at| now.duration_since(at));
+            if age.is_some_and(|age| age >= STALL_AFTER) && s.stalled_since.is_none() {
                 s.counters.stalls += 1;
-                s.stalled_since.get_or_insert(now);
+                s.stalled_since = Some(now);
                 let run = s.counters.units_without_picture_run;
-                drop(s);
                 eprintln!(
-                    "{} poki-bridged: live frames: video stalled: packets arrive but no picture for {} ms ({run} units in a row gave none); asking for a key frame",
+                    "{} poki-bridged: live frames: video stalled: units arrive but no picture for {} ms ({run} units in a row gave none)",
                     crate::ax::watch::stamp(),
                     STALL_AFTER.as_millis()
                 );
-                depacketizer = HevcDepacketizer::new();
-                keyed = false;
-                last_request = None;
-                unit.clear();
-                waiting_since = Some(now);
-                let _ = jobs.send(Job::Flush);
+            }
+            if age.is_some_and(|age| age >= RECOVER_AFTER) && !s.restart_requested {
+                s.restart_requested = true;
+                s.counters.restart_requests += 1;
+                eprintln!(
+                    "{} poki-bridged: live frames: newest picture {} ms old while units arrive; the media session should be reopened",
+                    crate::ax::watch::stamp(),
+                    age.unwrap().as_millis()
+                );
             }
         }
-        // A key frame was asked for and none came: the session itself is stuck.
-        if !keyed
-            && last_request.is_some()
-            && waiting_since.is_some_and(|at| now.duration_since(at) >= KEY_WITHIN)
-        {
+        // No key unit since decoding started: a new session starts with one.
+        if !keyed && waiting_since.is_some_and(|at| now.duration_since(at) >= RECOVER_AFTER) {
             let mut s = screen.lock().unwrap();
             if !s.restart_requested {
                 s.restart_requested = true;
                 s.counters.restart_requests += 1;
                 eprintln!(
-                    "{} poki-bridged: live frames: no key frame {} ms after asking; the media session should be reopened",
+                    "{} poki-bridged: live frames: no key unit {} ms after decoding started; the media session should be reopened",
                     crate::ax::watch::stamp(),
-                    KEY_WITHIN.as_millis()
+                    RECOVER_AFTER.as_millis()
                 );
             }
             s.stalled_since.get_or_insert(now);
@@ -825,7 +820,9 @@ async fn receive<S: Datagrams>(
         let complete = std::mem::take(&mut unit);
         let key = nal_units(&complete).any(|(_, kind)| (16..=23).contains(&kind));
         if key {
-            screen.lock().unwrap().counters.key_units += 1;
+            let mut s = screen.lock().unwrap();
+            s.counters.key_units += 1;
+            s.damaged_since = None;
         }
         if complete.is_empty() || (!keyed && !key) {
             // An empty packet would tell the decoder the stream ended.
@@ -839,6 +836,7 @@ async fn receive<S: Datagrams>(
         if jobs.send(Job::Unit(complete, now)).is_err() {
             return;
         }
+        screen.lock().unwrap().counters.units_to_decoder += 1;
     }
 }
 
@@ -853,11 +851,9 @@ fn decode_loop(
     let mut encoder = libav::JpegEncoder::default();
     let mut latest: Option<(libav::Picture, Instant, SystemTime, u64)> = None;
     let mut previous: Option<Thumb> = None;
-    // Units waiting behind the one being decoded (see BEHIND), and whether units are being
-    // dropped until the next key unit.
+    // Units waiting behind the one being decoded. All are decoded, in order: none can be skipped
+    // (see RECOVER_AFTER); only the newest of a batch is thumbnailed and compared.
     let mut pending: VecDeque<Job> = VecDeque::new();
-    let mut skipping = false;
-    let mut skipping_unreferenced = false;
     ready.store(true, Ordering::SeqCst);
     loop {
         if pending.is_empty() {
@@ -876,7 +872,6 @@ fn decode_loop(
                 if let Some(decoder) = decoder.as_mut() {
                     decoder.flush();
                 }
-                skipping = false;
             }
             Job::Jpeg {
                 width,
@@ -910,34 +905,7 @@ fn decode_loop(
                         }
                     }
                 }
-                let key = nal_units(&unit).any(|(_, kind)| (16..=23).contains(&kind));
-                if skipping && !key {
-                    screen.lock().unwrap().counters.dropped_units += 1;
-                    continue;
-                }
-                if !skipping && !key && arrived.elapsed() > BEHIND {
-                    // Too far behind to catch up: drop what is queued and start again at a key
-                    // frame, so the newest picture is never a queue's worth old.
-                    let decoder = decoder.as_mut().unwrap();
-                    decoder.flush();
-                    skipping = true;
-                    let dropped = 1 + pending
-                        .iter()
-                        .filter(|j| matches!(j, Job::Unit(..)))
-                        .count() as u64;
-                    pending.retain(|j| !matches!(j, Job::Unit(..)));
-                    let mut screen = screen.lock().unwrap();
-                    screen.counters.dropped_units += dropped;
-                    screen.counters.backlog_resyncs += 1;
-                    screen.resync_requested = true;
-                    continue;
-                }
-                skipping = false;
                 let decoder_now = decoder.as_mut().unwrap();
-                if more_units != skipping_unreferenced {
-                    skipping_unreferenced = more_units;
-                    decoder_now.skip_unreferenced(more_units);
-                }
                 let work = Instant::now();
                 let decoded = decoder_now.decode(&unit);
                 let decoded_at = Instant::now();
@@ -1053,6 +1021,9 @@ fn identity(screen: &Screen, seq: u64, captured: SystemTime, width: u32, height:
         "size": [width, height],
         "orientation": if landscape { "landscape" } else { "portrait" },
         "scale": scale,
+        "source": "video",
+        // A packet was lost since the last key unit: parts of the picture may be wrong.
+        "damaged": screen.damaged_since.is_some(),
     })
 }
 
@@ -1149,7 +1120,7 @@ mod tests {
     /// of units that the decoder cannot keep up with: it drops to the next key unit instead of
     /// queueing, so the newest picture stays young. Prints the costs.
     #[test]
-    fn a_decoder_that_falls_behind_drops_to_the_next_key_frame() {
+    fn a_burst_is_queued_and_every_unit_decoded() {
         if let Err(error) = libav::available() {
             println!("skipped: {error}");
             return;
@@ -1186,33 +1157,23 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            // 60 units at once: far more than the decoder can do in BEHIND.
+            // 60 units at once: a burst the decoder cannot keep up with. The queue absorbs it.
             for unit in &units {
                 screen.send_now(unit);
             }
             let sent = Instant::now();
             let counters =
                 |f: fn(&Counters) -> u64| f(&screen.live.screen.lock().unwrap().counters);
-            // The queue empties quickly: dropped, not decoded one by one.
-            while counters(|c| c.decoded + c.dropped_units) < 60
-                && sent.elapsed() < Duration::from_secs(10)
-            {
+            while counters(|c| c.decoded) < 60 && sent.elapsed() < Duration::from_secs(20) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let drained = sent.elapsed();
             println!(
-                "flood of 60: {} decoded, {} dropped, {} resyncs, drained in {} ms",
+                "flood of 60: {} decoded, drained in {} ms",
                 counters(|c| c.decoded),
-                counters(|c| c.dropped_units),
-                counters(|c| c.backlog_resyncs),
-                drained.as_millis()
+                sent.elapsed().as_millis()
             );
-            assert!(counters(|c| c.backlog_resyncs) >= 1);
-            assert!(counters(|c| c.dropped_units) > 0);
-            assert!(
-                screen.live.screen.lock().unwrap().resync_requested,
-                "a key frame is asked for"
-            );
+            assert_eq!(counters(|c| c.decoded), 60, "every unit is decoded");
+            assert_eq!(counters(|c| c.decode_errors), 0);
         });
     }
 
@@ -1296,10 +1257,11 @@ mod tests {
     }
 
     /// The receive path from RTP datagrams to pictures, with a fake phone: nothing is decoded
-    /// before a key frame and a key frame is asked for over RTCP; a lost packet flushes, asks
-    /// again and skips to the next key frame; pictures resume there.
+    /// before a key frame and a key frame is asked for over RTCP; after a lost packet decoding
+    /// goes on (nothing is skipped: the phone may never send another key frame), the pictures
+    /// are marked damaged, and the next key unit clears that.
     #[test]
-    fn rtp_becomes_pictures_and_a_lost_packet_waits_for_the_next_key_frame() {
+    fn rtp_becomes_pictures_and_a_lost_packet_marks_them_damaged() {
         if let Err(error) = libav::available() {
             println!("skipped: {error}");
             return;
@@ -1382,23 +1344,32 @@ mod tests {
                 }
                 assert_eq!(decoded(5).await, 5);
                 let epoch = live.state(Duration::from_millis(150)).epoch;
-                // A packet of unit 15 is lost: 15 to 19 refer to it and are skipped.
+                // A packet of unit 15 is lost: unit 15 is gone, 16 to 19 are still decoded.
                 send(15, true).await;
                 assert!(lost_one.get());
                 for index in 16..20 {
                     send(index, false).await;
                 }
                 assert_eq!(counters(|c| c.lost), 1);
+                assert!(decoded(6).await >= 6, "decoding goes on after a loss");
+                assert_eq!(counters(|c| c.damaging_losses), 1);
+                assert_eq!(live.latest_identity().unwrap()["damaged"], true);
                 assert_eq!(
-                    counters(|c| c.decoded),
-                    5,
-                    "nothing until the next key frame"
+                    requests(&socket),
+                    1,
+                    "no key frame request: the phone ignores them"
                 );
-                assert!(requests(&socket) >= 2, "a key frame is asked for again");
-                for index in 20..25 {
+                send(20, false).await;
+                assert_eq!(
+                    live.latest_identity().unwrap()["damaged"],
+                    false,
+                    "a key unit clears it"
+                );
+                for index in 21..25 {
                     send(index, false).await;
                 }
-                assert_eq!(decoded(10).await, 10);
+                let at_25 = decoded(9).await;
+                assert!(at_25 >= 9);
                 assert!(live.state(Duration::from_millis(150)).epoch >= epoch + 5);
                 let latest = live.state(Duration::from_millis(150)).latest.unwrap();
                 assert_eq!((latest.2, latest.3), (320, 640));
@@ -1411,15 +1382,13 @@ mod tests {
                     send(index, false).await;
                 }
                 assert_eq!(counters(|c| c.discontinuities), 1);
-                send(0, false).await;
-                assert_eq!(
-                    decoded(before + 1).await,
-                    before + 1,
-                    "decodes again from the key frame"
+                assert!(
+                    decoded(before + 5).await >= before + 5,
+                    "units after the restart are decoded"
                 );
 
-                // Packets that never give a picture: a stall, then a key frame request, then a
-                // request to reopen the session; a key frame clears it.
+                // Packets that never give a picture: a stall, then a request to reopen the
+                // session; a picture clears it.
                 let junk = |seq: &std::cell::Cell<u16>| {
                     let mut next = seq.get();
                     let packets = packetize(
@@ -1430,7 +1399,6 @@ mod tests {
                     seq.set(next);
                     packets
                 };
-                let requests_before = requests(&socket);
                 let started = Instant::now();
                 while started.elapsed() < Duration::from_millis(2200) {
                     for packet in junk(&seq) {
@@ -1442,10 +1410,6 @@ mod tests {
                 assert!(
                     live.state(Duration::ZERO).stalled_since.is_some(),
                     "stalled"
-                );
-                assert!(
-                    requests(&socket) > requests_before,
-                    "a key frame is asked for"
                 );
                 assert!(
                     live.take_restart_request(),
