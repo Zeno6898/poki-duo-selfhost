@@ -54,6 +54,8 @@ use tokio::{
 
 #[path = "live.rs"]
 mod live;
+#[path = "media.rs"]
+mod media;
 
 const DAEMON_USAGE: &str = "usage: poki-bridged --socket PATH --udid ID\n       poki-bridged --socket PATH --host IP --pairing-file PATH\n       poki-bridged --socket PATH --host IP --rp-pairing-file PATH [--rp-host-name NAME]";
 /// poki-native reads at most 2 MiB of request; the margin covers the `id`.
@@ -220,6 +222,19 @@ async fn reap(state: Rc<State>) {
         };
         let idle = session.last_used.elapsed();
         if live::enabled() {
+            // A stream that stays stuck after a key frame request: reopen the media session on
+            // the same tunnel.
+            if session
+                .input
+                .as_ref()
+                .is_some_and(|input| input.frames.live().take_restart_request())
+            {
+                log(
+                    "live frames: video stalled and no key frame came; reopening the media session",
+                );
+                session.close_input().await;
+                reopened = None;
+            }
             // The live screen keeps the media session open, and opens it again after an error.
             if session.input.is_none()
                 && reopened.is_none_or(|at: Instant| at.elapsed() >= live::REOPEN_AFTER)
@@ -417,6 +432,15 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     let live = input.frames.live();
                     live.report(&live.mark())
                 });
+                // What observe needs to know before trusting a picture.
+                let mut reasons = Vec::new();
+                if pong["frames"]["video_stalled"] == json!(true) {
+                    reasons.push("video_stalled");
+                }
+                if live::enabled() && session.input.is_none() {
+                    reasons.push("media_closed");
+                }
+                pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
@@ -875,7 +899,7 @@ impl Session {
         let device = &mut self.link.as_mut().expect("connected").device;
         if self.input.is_none() {
             let started = Instant::now();
-            let media = stream::start_screen_media_stream(&mut device.adapter, &mut device.rsd, 1)
+            let (media, our_ssrc) = media::start(&mut device.adapter, &mut device.rsd, 1)
                 .await
                 .map_err(|e| format!("Cannot establish input media session: {e}"))?;
             trace("media ready");
@@ -888,7 +912,7 @@ impl Session {
                 .into_iter()
                 .map(|socket| tokio::spawn(async move { while socket.recv().await.is_ok() {} }))
                 .collect();
-            let frames = crate::frames::Frames::new(video_udp, live::enabled());
+            let frames = crate::frames::Frames::new(video_udp, our_ssrc, live::enabled());
             let mut input = Input {
                 client,
                 drains,
