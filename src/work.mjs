@@ -6,6 +6,9 @@ export const work = new AsyncLocalStorage();
 export function checkWork() { const context = work.getStore(); context?.signal.throwIfAborted(); if (context?.deadline !== undefined && performance.now() >= context.deadline) throw new DOMException('Observation deadline exceeded', 'TimeoutError'); }
 // Time left before the innermost deadline, so a caller can skip work that would not finish inside it.
 export function remaining() { const end = work.getStore()?.deadline; return end === undefined ? Infinity : end - performance.now(); }
+// The timing entries other layers recorded after `from`, such as how a long-lived bridge served a read.
+export function timingCount() { return work.getStore()?.timings?.length ?? 0; }
+export function timingsSince(from) { return work.getStore()?.timings?.slice(from) ?? []; }
 export function signal() { return work.getStore()?.signal; }
 export async function pause(ms) { checkWork(); const current = signal(); try { await delay(ms, undefined, { signal: current }); } catch (error) { throw current?.aborted ? current.reason : error; } }
 export function stoppingReason(error) { return error?.stopReason ?? (error?.name === 'TimeoutError' ? 'timeout' : 'cancelled'); }
