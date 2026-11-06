@@ -41,7 +41,10 @@ jobs:
             build/launcher-target
           key: launcher-${{ hashFiles('native/launcher/Cargo.lock', 'native/patches/*.patch') }}
       - name: Tests (macOS host)
-        run: cargo test --release --manifest-path native/launcher/Cargo.toml --target-dir build/launcher-target
+        run: |
+          # The soak's peers listen on 127.0.0.2-4; macOS only answers on 127.0.0.1 until aliased.
+          for n in 2 3 4; do sudo ifconfig lo0 alias "127.0.0.$n" up; done
+          cargo test --release --manifest-path native/launcher/Cargo.toml --target-dir build/launcher-target
       - name: Build for iPhone and the simulator
         run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
@@ -100,10 +103,14 @@ jobs:
           UDID=$(xcrun simctl list devices available -j | python3 -c "
           import json, sys
           d = json.load(sys.stdin)['devices']
-          runtimes = sorted((r for r in d if 'iOS' in r), reverse=True)
+          # A runtime the selected Xcode can test on: its own SDK's, else the newest not above it.
+          # (A newer runtime installed beside an older Xcode builds, but its test run never starts.)
+          sdk = tuple(int(v) for v in sys.argv[1].split('.'))
+          def version(r): return tuple(int(v) for v in r.rsplit('iOS-', 1)[1].split('-'))
+          runtimes = sorted((r for r in d if 'iOS-' in r and version(r) <= sdk), key=version, reverse=True)
           phones = [x for r in runtimes for x in d[r] if x['name'].startswith('iPhone')]
           pro = [x for x in phones if 'Pro' in x['name'] and 'Max' not in x['name']]
-          print((pro or phones)[0]['udid'])")
+          print((pro or phones)[0]['udid'])" "$(xcrun --sdk iphonesimulator --show-sdk-version)")
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
@@ -113,7 +120,7 @@ jobs:
       - name: Start WebDriverAgent
         run: |
           nohup xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd test-without-building > build/wda.log 2>&1 &
-          for i in $(seq 1 150); do curl -sf http://127.0.0.1:8100/status > /dev/null && echo "up after $((i * 2)) s" && exit 0; sleep 2; done
+          for i in $(seq 1 150); do grep -q '\*\* TEST.*FAILED\|Testing failed' build/wda.log && break; curl -sf http://127.0.0.1:8100/status > /dev/null && echo "up after $((i * 2)) s" && exit 0; sleep 2; done
           tail -50 build/wda.log; exit 1
       - name: look/do in Settings
         working-directory: native/ios/PokiCore
