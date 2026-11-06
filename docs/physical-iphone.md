@@ -8,13 +8,29 @@ Run `./bin/setup` first. It needs full Xcode and the Rust toolchain, and you do 
 
 1. Connect the iPhone to your Mac over USB, unlock the phone, and accept **Trust This Computer**.
 2. On the iPhone, enable **Developer Mode** and turn on **UI Automation** in Developer Settings. Complete all on-device prompts manually.
-3. Ensure developer services are mounted before capturing screens or injecting input. If compatible Apple-signed Developer Disk Image files already exist on your Mac under `/Library/Developer/DeveloperDiskImages/iOS_DDI/Restore`, run:
+3. Install the developer disk image (DDI) before capturing screens or injecting input:
 
 ```sh
 node bin/prepare-device.mjs YOUR_DEVICE_ID
 ```
 
-*(If exactly one device is connected, `YOUR_DEVICE_ID` can be omitted.)* This helper checks device services and mounts the local image when needed; it does not download Apple files, alter security settings, or reboot the device.
+*(If exactly one device is connected, `YOUR_DEVICE_ID` can be omitted.)* The helper first asks the phone whether it already offers `displayservice`, and stops if it does. Otherwise it finds a DDI, has Apple's signing server personalize it for this phone, installs it through `cryptexd`, and checks `displayservice` again on a new connection. It does not alter security settings or reboot the device.
+
+The DDI comes from the first of these that applies:
+
+| Source | When |
+| --- | --- |
+| `POKI_DDI_DIR` | Set to an unpacked Cryptex1 DDI `Restore` directory, such as a copy of Xcode's. Used as given, never downloaded. |
+| Xcode's `/Library/Developer/DeveloperDiskImages/iOS_DDI/Restore` | On macOS, when it exists. |
+| A downloaded copy | Otherwise, including on Linux. The helper downloads Apple's DDI once from the [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) mirror (`PersonalizedImages/Xcode_iOS_DDI_Cryptex`, about 16 MB, the files pymobiledevice3 uses) into `ddi/Xcode_iOS_DDI_Cryptex` under the state directory (`POKI_MCP_STATE_DIR`), and reuses it later. |
+
+Every payload is checked against the SHA-384 digest in the DDI's `BuildManifest.plist` before anything is sent to the phone, and a damaged downloaded copy is fetched again. The phone also verifies Apple's signature. Personalization needs the host to reach Apple's signing server (`gs.apple.com`) over HTTP.
+
+The Cryptex1 image is used because phones of the iPhone 18 series have no build identity for the older image mounter route in Apple's DDI. It works on any phone with iOS 17.4 or later.
+
+To prepare a phone reached over the network with `POKI_DEVICE_HOST` and `POKI_RP_PAIRING_FILE` (see [configuration](configuration.md)), run the same command without a device ID. The `build/poki-native` bridge then does the status check and the install inside the remote pairing tunnel (`ddi_status` and `install_ddi` in [NATIVE.md](../native/NATIVE.md)), because `idevice-tools` cannot reach such a phone. A USB or usbmuxd device still uses `idevice-tools cryptexd install-ddi`.
+
+The DDI stays installed until the phone restarts. Run the helper again after a restart.
 
 ## Before a test session
 
