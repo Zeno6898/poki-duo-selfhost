@@ -106,15 +106,24 @@ final class Computer: @unchecked Sendable {
 
     func look(full: Bool) async -> ToolResult {
         let until = now() + config.toolDeadline
-        if let blocked = runnerBlocked() { return blocked }
+        if let blocked = await waitForRunner(until: until) { return blocked }
         return await readAndReply(until: until, full: full)
     }
 
-    /// The runner is being started or has failed: answer at once instead of waiting on it.
-    func runnerBlocked() -> ToolResult? {
-        let state = host.runnerState()
+    /// The app stops the runner when no agent is using the phone, and asking for its state wakes it.
+    /// While it is starting, the call waits for it (every 250 ms, at most `runnerWait`, within the
+    /// call's deadline) and then goes on; a failed runner is answered at once, with its fix.
+    func waitForRunner(until: Double) async -> ToolResult? {
+        var state = host.runnerState()
+        let waitUntil = min(now() + config.runnerWait, until - config.readTimeout - 1)
+        while case .starting = state, now() < waitUntil {
+            await sleep(seconds: 0.25)
+            state = host.runnerState()
+        }
         guard !state.isRunning else { return nil }
-        return ToolResult(text: "runner: \(state.describe)\nNothing was sent. Call look again in a few seconds; the launcher restarts the runner by itself.", jpeg: nil, isError: true)
+        let next: String
+        if case .failed = state { next = "Fix it on the phone, then call look again." } else { next = "Call look again in a few seconds; it is still starting." }
+        return ToolResult(text: "runner: \(state.describe)\nNothing was sent. \(next)", jpeg: nil, isError: true)
     }
 
     // MARK: do
@@ -122,7 +131,7 @@ final class Computer: @unchecked Sendable {
     func act(actions: [JSON], full: Bool) async -> ToolResult {
         let started = now()
         let until = started + config.toolDeadline
-        if let blocked = runnerBlocked() { return blocked }
+        if let blocked = await waitForRunner(until: until) { return blocked }
 
         // A number that is not in the latest read is refused before anything is sent.
         let stale = Set(actions.flatMap(Self.refs(in:))).filter { refs[$0] == nil }.sorted()

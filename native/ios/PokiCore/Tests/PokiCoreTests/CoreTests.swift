@@ -63,12 +63,35 @@ final class ToolTests: XCTestCase {
         XCTAssertTrue(result.text.contains("read: failed"), result.text)
         XCTAssertLessThan(Date().timeIntervalSince(started), 3)
         XCTAssertGreaterThanOrEqual(host.restarts.value, 1)
-        // While the launcher restarts it, calls answer at once and send nothing.
-        host.state.value = .starting("launching the runner")
+        // A failed runner is answered at once, with its fix, and nothing is sent.
+        host.state.value = .failed("Poki Runner is not installed", fix: "Install it")
         let count = wda.sent.count
+        let quick = Date()
         let next = await core.call("do", ["actions": [["tap": [10, 10]]]])
-        XCTAssertTrue(next.text.contains("runner: starting"), next.text)
+        XCTAssertTrue(next.text.contains("runner: failed: Poki Runner is not installed. Fix on the phone: Install it"), next.text)
+        XCTAssertLessThan(Date().timeIntervalSince(quick), 0.5)
         XCTAssertEqual(wda.sent.count, count)
+    }
+
+    func testACallWaitsForARunnerThatIsStartingThenGoesOn() async {
+        let (core, wda, host) = makeCore()
+        host.state.value = .starting("launching the runner")
+        Task { try? await Task.sleep(nanoseconds: 600_000_000); host.state.value = .running }
+        let started = Date()
+        let result = await core.call("look", [:])
+        XCTAssertFalse(result.isError, result.text)
+        XCTAssertGreaterThan(Date().timeIntervalSince(started), 0.5)
+        XCTAssertFalse(wda.sent.isEmpty)
+    }
+
+    func testARunnerThatNeverStartsIsAnsweredWithinTheCap() async {
+        let (core, wda, host) = makeCore { $0.runnerWait = 0.5 }
+        host.state.value = .starting("mounting the developer disk image")
+        let started = Date()
+        let result = await core.call("do", ["actions": [["tap": [10, 10]]]])
+        XCTAssertTrue(result.text.contains("still starting"), result.text)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
+        XCTAssertTrue(wda.sent.isEmpty)
     }
 
     func testTapByNumberHitsTheCentre() async {

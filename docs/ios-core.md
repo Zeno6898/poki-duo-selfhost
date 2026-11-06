@@ -170,8 +170,9 @@ Each answer is facts only: the app in front, numbered elements, `+` for new, wha
 - At the deadline the tool answers anyway, saying which step did not finish and whether it may
   have been delivered, plus the last good read if any. A late runner answer is dropped.
 - Two runner timeouts in a row, or a refused connection, mark the runner unhealthy: PokiCore calls
-  `host.restartRunner()`, answers at once with `runner restarting` instead of waiting, and the next call
-  sees the new runner.
+  `host.restartRunner()`. A call that finds the runner `.starting` (restarting, or woken from idle by
+  the app) waits for it, checking every 250 ms for up to `runnerWait` (15 s) within its deadline, then
+  goes on; a `.failed` runner is answered at once with its fix.
 - One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what
   the first is doing.
 
