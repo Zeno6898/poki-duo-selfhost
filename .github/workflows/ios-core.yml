@@ -13,7 +13,9 @@ permissions:
 
 concurrency:
   group: ios-core-${{ github.ref }}
-  cancel-in-progress: true
+  # A run in progress finishes (the simulator job takes ~15 min and pushes come often); a newer push
+  # replaces only the run still waiting.
+  cancel-in-progress: false
 
 env:
   IDEVICE_COMMIT: 89702099f4d7552f704f93b4526756abda319ceb
