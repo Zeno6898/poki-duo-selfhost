@@ -19,23 +19,32 @@ struct PokiApp: App {
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
-    @State private var tab = Tabs.home
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var tab = RootView.launchTab
 
-    enum Tabs: Hashable { case home, setup, connect, debug }
+    enum Tabs: String, Hashable { case home, setup, connect, debug, activity }
+
+    /// `-pokiScreen setup` (and so on) opens that screen at launch, for the build's screenshots.
+    static var launchTab: Tabs {
+        UserDefaults.standard.string(forKey: "pokiScreen").flatMap(Tabs.init(rawValue:)) ?? .home
+    }
 
     var body: some View {
         TabView(selection: $tab) {
             Tab("Poki", systemImage: "pawprint.fill", value: Tabs.home) { HomeView(openSetup: { tab = .setup }) }
             Tab("Setup", systemImage: "checklist", value: Tabs.setup) { SetupView() }
-                .badge(model.setup.isComplete ? 0 : 1)
+                .badge(model.setupComplete ? 0 : SetupStep.allCases.filter { !model.isDone($0) }.count)
             Tab("Connect", systemImage: "qrcode", value: Tabs.connect) { ConnectView() }
             Tab("Debug", systemImage: "stethoscope", value: Tabs.debug) { ProbeView() }
+            if tab == .activity {
+                Tab("Live Activity", systemImage: "rectangle.inset.filled", value: Tabs.activity) { NavigationStack { ActivityPreview() } }
+            }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .tint(Brand.blue)
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if phase == .active { model.becameActive() } else if phase == .background { model.wentToBackground() }
+        }
+        .onOpenURL { _ in tab = .home }
     }
-}
-
-enum Brand {
-    static let blue = Color(red: 0x20 / 255, green: 0x84 / 255, blue: 0xFD / 255)
 }

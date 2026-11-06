@@ -6,7 +6,7 @@ import Foundation
 /// the app writes it to the App Group container and the state carries only its version.
 struct PokiActivityAttributes: ActivityAttributes {
     struct ContentState: Codable, Hashable {
-        enum Phase: String, Codable, Hashable { case idle, working, approval, pairing, problem }
+        enum Phase: String, Codable, Hashable { case idle, working, approval, pairing, setup, problem }
         var phase: Phase
         /// What the agent is doing, in a few words ("Reading Settings").
         var headline: String
@@ -23,6 +23,22 @@ struct PokiActivityAttributes: ActivityAttributes {
         /// The runner is stopped while no agent uses the phone (no automation banner); the next
         /// request starts it again.
         var runnerPaused = false
+        /// The agent's latest actions, newest last (at most three, each short), so the Live Activity
+        /// shows the steps and not only the last one.
+        var steps: [Step] = []
+        /// During setup: which step the person is on ("2 of 6") and what to do in Settings.
+        var guide: Guide?
+    }
+    struct Step: Codable, Hashable {
+        var text: String
+        var ok: Bool
+    }
+    struct Guide: Codable, Hashable {
+        var number: Int
+        var count: Int
+        var title: String
+        /// Where to go and what to tap, one line.
+        var hint: String
     }
     var deviceName: String
 }

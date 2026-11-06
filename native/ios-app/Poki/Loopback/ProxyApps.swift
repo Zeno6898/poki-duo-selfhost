@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-/// The proxy apps that can provide the 10.7.0.1 loopback instead of Poki's built-in tunnel, so users
+/// The proxy apps that can provide the 10.7.0.1 loopback, so users
 /// keep their own VPN. Detected with canOpenURL (their schemes are listed in LSApplicationQueriesSchemes).
 /// The module files live in deploy/proxy-modules/.
 struct ProxyApp: Identifiable, Hashable {

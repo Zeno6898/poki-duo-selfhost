@@ -1,178 +1,369 @@
+import ActivityKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Setup, in the order a new user does it. Each step can be revisited; nothing here needs a computer.
+/// Setup, one page in the order a new user goes: each step says what it is for, checks itself where
+/// the phone can tell (loopback, pairing, permissions), and opens the right place. Steps that send
+/// the person to Settings put the step and what to tap in the Live Activity, so it stays in view.
 struct SetupView: View {
     @Environment(AppModel.self) private var model
+    @State private var open: SetupStep?
 
     var body: some View {
         NavigationStack {
             List {
+                Section { progress }
+                ForEach(Array(SetupStep.allCases.enumerated()), id: \.element) { index, step in
+                    Section {
+                        StepHeader(number: index + 1, step: step, done: model.isDone(step), expanded: isOpen(step)) {
+                            withAnimation(.snappy) { open = isOpen(step) ? .none : step }
+                        }
+                        if isOpen(step) { content(step) }
+                    }
+                }
                 Section {
-                    step(1, "Turn on Developer Mode", done: model.setup.developerMode) { DeveloperModeStep() }
-                    step(2, "Pair this iPhone with Poki", done: model.setup.pairingFile != nil) { PairingStep() }
-                    step(3, "Allow UI Automation", done: model.setup.uiAutomation) { UIAutomationStep() }
-                    step(4, "Set up the loopback", done: model.setup.loopbackChosen) { LoopbackStep() }
-                    step(5, "First session: enter your passcode", done: model.setup.passcodeNoted) { PasscodeStep() }
-                } footer: {
-                    Text("Poki controls this iPhone through Apple's own developer services, on the phone itself. Your pairing file and keys never leave it.")
+                    Label {
+                        Text("The first time Poki Runner starts after the iPhone restarts, iOS asks for your passcode to allow automation. Enter it once; Poki never sees it.")
+                    } icon: { Image(systemName: "lock.fill").foregroundStyle(.secondary) }
+                    .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            .listSectionSpacing(.compact)
             .navigationTitle("Setup")
         }
     }
 
-    private func step<Destination: View>(_ number: Int, _ title: String, done: Bool, @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink(destination: destination) {
-            HStack(spacing: 14) {
-                Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle")
-                    .font(.title2).foregroundStyle(done ? .green : Brand.blue)
-                Text(title)
+    /// The first step not done is open unless the person opened another.
+    private func isOpen(_ step: SetupStep) -> Bool {
+        if let open { return open == step }
+        return SetupStep.allCases.first { !model.isDone($0) } == step
+    }
+
+    private var progress: some View {
+        let done = SetupStep.allCases.filter(model.isDone).count
+        let total = SetupStep.allCases.count
+        return HStack(spacing: 16) {
+            Gauge(value: Double(done), in: 0...Double(total)) {
+                EmptyView()
+            } currentValueLabel: {
+                Text("\(done)/\(total)").font(.caption.monospacedDigit().weight(.semibold))
             }
+            .gaugeStyle(.accessoryCircularCapacity).tint(done == total ? .green : Brand.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(done == total ? "Poki is ready" : "Set up Poki").font(.headline)
+                Text(done == total ? "Turn Poki on from the Poki tab." : "About five minutes. Everything happens on this iPhone.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder private func content(_ step: SetupStep) -> some View {
+        switch step {
+        case .runner: RunnerContent()
+        case .developerMode: DeveloperModeContent()
+        case .loopback: LoopbackContent()
+        case .pairing: PairingContent()
+        case .automation: AutomationContent()
+        case .background: BackgroundContent()
         }
     }
 }
 
-/// Shared layout for a step: a short explanation, numbered instructions, and the actions.
-struct StepPage<Actions: View>: View {
-    var title: String
-    var symbol: String
-    var intro: String
-    var steps: [String]
-    @ViewBuilder var actions: Actions
+struct StepHeader: View {
+    var number: Int
+    var step: SetupStep
+    var done: Bool
+    var expanded: Bool
+    var toggle: () -> Void
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Image(systemName: symbol).font(.system(size: 44)).foregroundStyle(Brand.blue)
-                    .frame(width: 88, height: 88).glassEffect(.regular.tint(Brand.blue.opacity(0.2)), in: .circle)
-                    .frame(maxWidth: .infinity)
-                Text(intro).font(.body)
-                if !steps.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(Array(steps.enumerated()), id: \.offset) { i, text in
-                        HStack(alignment: .firstTextBaseline, spacing: 12) {
-                            Text("\(i + 1)").font(.headline.monospacedDigit()).frame(width: 24)
-                            Text(.init(text))
-                        }
+        Button(action: toggle) {
+            HStack(alignment: .center, spacing: 14) {
+                ZStack {
+                    Circle().fill(done ? Color.green.opacity(0.18) : Brand.blue.opacity(0.14))
+                    if done {
+                        Image(systemName: "checkmark").font(.subheadline.weight(.bold)).foregroundStyle(.green)
+                    } else {
+                        Text("\(number)").font(.subheadline.weight(.semibold).monospacedDigit()).foregroundStyle(Brand.blue)
                     }
                 }
-                .padding().frame(maxWidth: .infinity, alignment: .leading)
-                .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                .frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(step.title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                    Text(step.summary).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                actions
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.down").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(expanded ? 0 : -90))
             }
-            .padding()
+            .contentShape(.rect)
         }
-        .navigationTitle(title)
-        .navigationBarTitleDisplayMode(.inline)
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(step.title), \(done ? "done" : "not done")")
     }
 }
 
-struct DeveloperModeStep: View {
+/// Numbered instructions, aligned on the number column.
+struct Instructions: View {
+    var lines: [String]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("\(i + 1).").font(.subheadline.monospacedDigit()).foregroundStyle(.secondary).frame(width: 20, alignment: .trailing)
+                    Text(.init(line)).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+/// Opens Settings with the step in the Live Activity.
+struct SettingsButton: View {
+    @Environment(AppModel.self) private var model
+    var step: SetupStep
+    var body: some View {
+        Button {
+            model.guide(step)
+            if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+        } label: {
+            Label("Open Settings", systemImage: "gear")
+        }
+    }
+}
+
+/// A row that marks a step the phone cannot check by itself.
+struct ConfirmRow: View {
+    var title: String
+    @Binding var isOn: Bool
+    var body: some View {
+        Toggle(title, isOn: $isOn).tint(.green)
+    }
+}
+
+struct StatusLine: View {
+    var text: String
+    var symbol: String
+    var color: Color
+    var body: some View {
+        Label { Text(text).font(.subheadline) } icon: { Image(systemName: symbol).foregroundStyle(color) }
+    }
+}
+
+struct RunnerContent: View {
     @Environment(AppModel.self) private var model
     var body: some View {
-        StepPage(title: "Developer Mode", symbol: "hammer.fill",
-                 intro: "Developer Mode lets the phone run Poki's runner, the part that taps and types for your agent.",
-                 steps: ["Open **Settings > Privacy & Security > Developer Mode**.",
-                         "Turn **Developer Mode** on and tap **Restart**.",
-                         "After the restart, unlock the phone and tap **Turn On** when asked.",
-                         "If Developer Mode is not listed, install the Poki Runner app first (it makes the option appear), then come back."]) {
-            Button("Open Settings", systemImage: "gear") { open(UIApplication.openSettingsURLString) }.buttonStyle(.glass)
-            DoneToggle(title: "Developer Mode is on", isOn: Binding(get: { model.setup.developerMode }, set: { model.setup.developerMode = $0 }))
+        @Bindable var model = model
+        Instructions(lines: [
+            "Install **Poki Runner** (poki-runner-unsigned.ipa) with the same tool and Apple ID you used for Poki.",
+            "Open **Settings > General > VPN & Device Management**, tap your Apple ID and tap **Trust**.",
+            "Don't open Poki Runner yourself. Poki starts it when an agent needs the phone.",
+        ])
+        SettingsButton(step: .runner)
+        ConfirmRow(title: "Poki Runner is installed and trusted", isOn: $model.setup.runnerInstalled)
+    }
+}
+
+struct DeveloperModeContent: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var model = model
+        Instructions(lines: [
+            "Open **Settings > Privacy & Security > Developer Mode**. It shows up once Poki Runner is installed.",
+            "Turn it on and tap **Restart**.",
+            "After the restart, unlock the iPhone and tap **Turn On**.",
+        ])
+        SettingsButton(step: .developerMode)
+        ConfirmRow(title: "Developer Mode is on", isOn: $model.setup.developerMode)
+    }
+}
+
+struct AutomationContent: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var model = model
+        Instructions(lines: [
+            "Open **Settings > Developer**. It appears after Developer Mode is on.",
+            "Turn on **Enable UI Automation**.",
+        ])
+        SettingsButton(step: .automation)
+        ConfirmRow(title: "UI Automation is on", isOn: $model.setup.uiAutomation)
+    }
+}
+
+struct BackgroundContent: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        if model.background.allowed {
+            StatusLine(text: "Location allowed. Poki stays on in the background and never records where you are.", symbol: "checkmark.circle.fill", color: .green)
+        } else if model.background.denied {
+            StatusLine(text: "Location is off for Poki, so iOS stops it soon after you leave the app.", symbol: "exclamationmark.triangle.fill", color: .orange)
+            SettingsButton(step: .background)
+        } else {
+            Text("iOS only keeps an app running in the background for a reason. Poki uses location, at the lowest accuracy, and shows the location pill while it is on.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            Button("Allow location", systemImage: "location") { model.background.requestPermission() }
+        }
+        if ActivityStatus.enabled {
+            StatusLine(text: "Live Activities are on. Poki shows its steps, pairing codes and approvals on the Lock Screen.", symbol: "checkmark.circle.fill", color: .green)
+        } else {
+            StatusLine(text: "Live Activities are off for Poki. Turn them on to see what the agent does and to approve sensitive actions.", symbol: "exclamationmark.triangle.fill", color: .orange)
+            SettingsButton(step: .background)
         }
     }
 }
 
-struct PairingStep: View {
+struct PairingContent: View {
     @Environment(AppModel.self) private var model
     @State private var importing = false
     @State private var importError: String?
 
     var body: some View {
-        StepPage(title: "Pair", symbol: "link",
-                 intro: "Pairing gives Poki a key to this phone's developer services. It is made on the phone, kept on the phone, and works without a computer (iOS 27 or later).",
-                 steps: ["Tap **Start pairing** below and allow Local Network access.",
-                         "Open **Settings > Privacy & Security > Developer Mode**, scroll down, and tap **Pair with Poki**.",
-                         "Enter the PIN shown in Poki's Live Activity at the top of the screen.",
-                         "Come back to Poki. The step is ticked once the pairing is saved."]) {
-            pairingStatus
-            diskImageStatus
-            HStack {
-                Button("Start pairing", systemImage: "dot.radiowaves.left.and.right") { model.startPairing() }.buttonStyle(.glassProminent)
-                if model.pairing != nil { Button("Cancel") { model.cancelPairing() }.buttonStyle(.glass) }
-            }
-            Divider()
-            Text("Already have a pairing file (from StikDebug, SideStore or a Mac)?").font(.footnote).foregroundStyle(.secondary)
-            Button("Import a pairing file", systemImage: "square.and.arrow.down") { importing = true }.buttonStyle(.glass)
-            if let importError { Text(importError).font(.footnote).foregroundStyle(.red) }
-        }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .xml, .data]) { result in
-            do { try model.importPairingFile(from: result.get()); importError = nil }
-            catch { importError = "That file is not a pairing file: \(error.localizedDescription)" }
-        }
-    }
-
-    @ViewBuilder private var diskImageStatus: some View {
-        switch model.diskImage.state {
-        case .ready(let build): Label("Developer disk image ready (\(build))", systemImage: "checkmark.circle").font(.footnote).foregroundStyle(.secondary)
-        case .downloading(let step): ProgressView { Text("Developer disk image: \(step)").font(.footnote) }
-        case .missing: Button("Download the developer disk image", systemImage: "arrow.down.circle") { Task { await model.diskImage.download() } }.buttonStyle(.glass)
-        case .failed(let why):
-            VStack(alignment: .leading) {
-                Label("Developer disk image: \(why)", systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
-                Button("Try again") { Task { await model.diskImage.download() } }.buttonStyle(.glass)
-            }
-        }
-    }
-
-    @ViewBuilder private var pairingStatus: some View {
         switch model.pairing {
-        case .none:
-            if model.setup.pairingFile != nil { Label("Paired", systemImage: "checkmark.seal.fill").foregroundStyle(.green) }
-        case .advertising?: Label("Waiting for Settings: tap Pair with Poki", systemImage: "hourglass")
-        case .pin(let pin)?: Text(pin).font(.system(size: 44, weight: .bold, design: .rounded).monospacedDigit()).frame(maxWidth: .infinity)
-        case .paired?: Label("Paired", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
-        case .failed(let why)?: Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .pin(let pin)?:
+            VStack(spacing: 6) {
+                Text(pin.map(String.init).joined(separator: " "))
+                    .font(.system(size: 40, weight: .bold, design: .rounded).monospacedDigit())
+                    .contentTransition(.numericText())
+                Text("Type this code in Settings. It is on the Lock Screen too.").font(.footnote).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 8)
+            Button("Cancel pairing", role: .cancel) { model.cancelPairing() }
+        case .advertising?:
+            StatusLine(text: "Waiting for Settings. Tap Pair with Poki there.", symbol: "dot.radiowaves.left.and.right", color: Brand.blue)
+            Instructions(lines: [
+                "Open **Settings > Privacy & Security > Developer Mode**.",
+                "Tap **Pair with Poki** and type the code that appears here and on the Lock Screen.",
+            ])
+            SettingsButton(step: .pairing)
+            Button("Cancel pairing", role: .cancel) { model.cancelPairing() }
+        case .failed(let why)?:
+            StatusLine(text: why, symbol: "exclamationmark.triangle.fill", color: .orange)
+            Button("Try again", systemImage: "arrow.clockwise") { model.startPairing() }
+        default:
+            if model.setup.pairingFile != nil {
+                StatusLine(text: "Paired. The key stays on this iPhone.", symbol: "checkmark.seal.fill", color: .green)
+            } else {
+                Instructions(lines: [
+                    "Connect to Wi-Fi and tap **Start pairing**. Allow local network access when asked.",
+                    "Poki opens Settings. Go to **Privacy & Security > Developer Mode** and tap **Pair with Poki**.",
+                    "Type the code shown here and on the Lock Screen.",
+                ])
+                Button("Start pairing", systemImage: "link") {
+                    model.startPairing()
+                    model.guide(.pairing)
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+                .bold()
+            }
+        }
+        diskImage
+        Button("Import a pairing file", systemImage: "square.and.arrow.down") { importing = true }
+            .font(.subheadline)
+            .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .xml, .data]) { result in
+                do { try model.importPairingFile(from: result.get()); importError = nil }
+                catch { importError = "That is not a pairing file: \(error.localizedDescription)" }
+            }
+        if let importError { Text(importError).font(.footnote).foregroundStyle(.red) }
+    }
+
+    @ViewBuilder private var diskImage: some View {
+        switch model.diskImage.state {
+        case .ready: StatusLine(text: "Developer disk image ready", symbol: "checkmark.circle.fill", color: .green)
+        case .downloading(let step):
+            HStack(spacing: 10) { ProgressView(); Text("Downloading the developer disk image: \(step)").font(.subheadline) }
+        case .missing:
+            Button("Download the developer disk image", systemImage: "arrow.down.circle") { Task { await model.diskImage.download() } }
+        case .failed(let why):
+            StatusLine(text: "Developer disk image: \(why)", symbol: "exclamationmark.triangle.fill", color: .orange)
+            Button("Download again", systemImage: "arrow.clockwise") { Task { await model.diskImage.download() } }
         }
     }
 }
 
-struct UIAutomationStep: View {
+/// The loopback, checked live: a connect to 10.7.0.1 every few seconds while this is on screen.
+struct LoopbackContent: View {
     @Environment(AppModel.self) private var model
+    @State private var copied = false
+
     var body: some View {
-        StepPage(title: "UI Automation", symbol: "hand.tap.fill",
-                 intro: "UI Automation lets the runner tap, swipe and type in other apps. It appears once Developer Mode is on.",
-                 steps: ["Open **Settings > Developer**.",
-                         "Turn on **Enable UI Automation**.",
-                         "If **Developer** is missing from Settings, finish Developer Mode and pairing first, then start a session once."]) {
-            Button("Open Settings", systemImage: "gear") { open(UIApplication.openSettingsURLString) }.buttonStyle(.glass)
-            DoneToggle(title: "UI Automation is on", isOn: Binding(get: { model.setup.uiAutomation }, set: { model.setup.uiAutomation = $0 }))
+        let monitor = model.loopback
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: monitor.isWorking ? "checkmark.circle.fill" : monitor.state == .checking ? "circle.dotted" : "xmark.circle.fill")
+                .foregroundStyle(monitor.isWorking ? .green : monitor.state == .checking ? .secondary : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Loopback: \(monitor.text)").font(.subheadline.weight(.semibold))
+                Text(monitor.detail).font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if let at = monitor.checkedAt {
+                Text(at, style: .relative).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+            }
+        }
+        .onAppear { monitor.resume() }
+        ForEach(ProxyApps.all) { app in proxyRow(app) }
+        localDevVPN
+    }
+
+    private func proxyRow(_ app: ProxyApp) -> some View {
+        let chosen = model.setup.proxyApp == app.id
+        return DisclosureGroup {
+            Instructions(lines: app.steps)
+            switch app.install {
+            case .url(let url):
+                Button(app.id == "surge" ? "Install the Poki module" : "Install the Poki plugin", systemImage: "plus.circle") {
+                    choose(app); UIApplication.shared.open(url)
+                }
+            case .toggle:
+                Button("Open \(app.name)", systemImage: "arrow.up.forward.app") {
+                    choose(app); if let url = URL(string: "\(app.scheme)://") { UIApplication.shared.open(url) }
+                }
+            case .snippet(let line):
+                Text(line).font(.footnote.monospaced()).textSelection(.enabled)
+                Button(copied ? "Copied" : "Copy the line", systemImage: copied ? "checkmark" : "doc.on.doc") {
+                    choose(app); UIPasteboard.general.string = line; copied = true
+                }
+            }
+        } label: {
+            HStack {
+                Text(app.name)
+                if !app.minimumVersion.isEmpty { Text("\(app.minimumVersion) or later").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                if chosen { Text("In use").font(.caption.weight(.semibold)).foregroundStyle(.green) }
+                else if app.isInstalled { Text("Installed").font(.caption).foregroundStyle(.secondary) }
+            }
         }
     }
-}
 
-struct PasscodeStep: View {
-    @Environment(AppModel.self) private var model
-    var body: some View {
-        StepPage(title: "First session", symbol: "lock.open.fill",
-                 intro: "The first time the runner starts after setup (and after each restart of the phone), iOS asks for your passcode to allow automation. Poki cannot enter it for you, by design.",
-                 steps: ["Keep the phone unlocked and in hand when you tap **Start** for the first time.",
-                         "When iOS asks for the passcode, enter it.",
-                         "After that, sessions start without asking until the phone restarts."]) {
-            DoneToggle(title: "Got it", isOn: Binding(get: { model.setup.passcodeNoted }, set: { model.setup.passcodeNoted = $0 }))
+    private var localDevVPN: some View {
+        DisclosureGroup {
+            Instructions(lines: [
+                "No proxy app? Install **LocalDevVPN**, a free loopback app made for this.",
+                "Open it and tap **Connect**. It uses the VPN slot, so it replaces any other VPN while it is on.",
+            ])
+            Link(destination: URL(string: "https://apps.apple.com/app/id6755608044")!) {
+                Label("Get LocalDevVPN on the App Store", systemImage: "arrow.down.app")
+            }
+            .simultaneousGesture(TapGesture().onEnded { model.setup.loopback = .proxy; model.setup.proxyApp = "localdevvpn" })
+        } label: {
+            HStack {
+                Text("LocalDevVPN")
+                Text("Free, App Store").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if model.setup.proxyApp == "localdevvpn" { Text("In use").font(.caption.weight(.semibold)).foregroundStyle(.green) }
+            }
         }
     }
-}
 
-struct DoneToggle: View {
-    var title: String
-    @Binding var isOn: Bool
-    var body: some View {
-        Toggle(title, isOn: $isOn).padding().glassEffect(.regular, in: .rect(cornerRadius: 16))
+    private func choose(_ app: ProxyApp) {
+        model.setup.loopback = .proxy
+        model.setup.proxyApp = app.id
+        model.guide(.loopback)
     }
 }
 
-@MainActor func open(_ string: String) {
-    if let url = URL(string: string) { UIApplication.shared.open(url) }
+enum ActivityStatus {
+    static var enabled: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
 }

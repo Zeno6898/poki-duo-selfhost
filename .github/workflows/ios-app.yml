@@ -1,6 +1,6 @@
-# Builds the Poki iPhone app (native/ios-app) as an unsigned IPA with its two extensions (the loopback
-# packet tunnel and the Live Activity widget). It is signed when it is installed, with the user's own
-# team for the Network Extension entitlement (see native/ios-app/README.md).
+# Builds the Poki iPhone app (native/ios-app) as an unsigned IPA with its Live Activity widget, runs it
+# on the iOS Simulator, and takes a screenshot of every screen in light and dark mode. It is signed when
+# it is installed (see native/ios-app/README.md).
 name: iOS app
 
 on:
@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           APP=build/app/Build/Products/Release-iphoneos/Poki.app
-          test -d "$APP/PlugIns/PokiTunnel.appex"
+          test ! -e "$APP/PlugIns/PokiTunnel.appex"
           test -d "$APP/PlugIns/PokiWidgets.appex"
           rm -rf Payload out && mkdir -p Payload out
           ditto "$APP" Payload/Poki.app
@@ -118,6 +118,18 @@ jobs:
             exit 1
           fi
           echo "Poki ran on the simulator for 60 s"
+          # Every screen, light and dark, for the UI check.
+          mkdir -p shots
+          for look in light dark; do
+            xcrun simctl ui "$UDID" appearance "$look"
+            for screen in home setup connect debug activity; do
+              xcrun simctl terminate "$UDID" nz.zheha.poki || true
+              xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen "$screen" > /dev/null
+              sleep 4
+              xcrun simctl io "$UDID" screenshot "shots/$screen-$look.png" > /dev/null
+            done
+          done
+          ls shots
 
       - uses: actions/upload-artifact@v4
         with:
@@ -129,7 +141,9 @@ jobs:
         if: always()
         with:
           name: simulator-smoke
-          path: out/simulator/
+          path: |
+            out/simulator/
+            shots/
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4

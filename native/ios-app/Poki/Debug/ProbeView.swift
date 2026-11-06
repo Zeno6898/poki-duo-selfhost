@@ -9,6 +9,9 @@ struct ProbeView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    NavigationLink("Live Activity preview") { ActivityPreview() }
+                }
                 Section("Proxy loopback interface") {
                     if let loop = loopbackInterface(addresses) {
                         Text("\(loop.interface)  \(loop.address)").font(.headline.monospaced())

@@ -45,6 +45,7 @@ struct RunnerStatus: Sendable, Equatable, Decodable {
     var title: String {
         switch state {
         case "idle": "Not started"
+        case "standby": "Standing by"
         case "connecting": "Connecting to the phone"
         case "pairing": "Verifying pairing"
         case "tunnel": "Opening the developer tunnel"

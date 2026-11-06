@@ -8,7 +8,8 @@ import UIKit
 final class AppModel {
     var setup = SetupState.load() { didSet { setup.save() } }
     let identity = RelayIdentity()
-    let tunnel = TunnelController()
+    let loopback = LoopbackMonitor()
+    let background = BackgroundKeeper()
     let diskImage = DiskImageStore()
     private(set) var runner = RunnerStatus.idle
     private(set) var relayStatus = RelayStatus.off
@@ -18,12 +19,21 @@ final class AppModel {
     private(set) var approvals: [PendingApproval] = []
     private(set) var pairing: PairingEvent?
     private(set) var problem: String?
+    /// The agent's recent actions, newest last, for the home screen.
+    private(set) var recentSteps: [RecentStep] = []
     /// The runner is stopped until the next agent request (idle, or the owner tapped Stop runner).
     private(set) var runnerPaused = false
     /// Stop the runner after this long without agent activity; 0 never stops it.
-    var idleStopSeconds: Int = UserDefaults.standard.object(forKey: "idleStopSeconds") as? Int ?? 120 {
-        didSet { UserDefaults.standard.set(idleStopSeconds, forKey: "idleStopSeconds") }
+    var idleStopSeconds: Int = UserDefaults.standard.object(forKey: "idleStopSeconds.v2") as? Int ?? 60 {
+        didSet { UserDefaults.standard.set(idleStopSeconds, forKey: "idleStopSeconds.v2") }
     }
+    /// Poki was on when it last ran; it turns itself on again at launch.
+    private var wantsOn: Bool {
+        get { UserDefaults.standard.bool(forKey: "wantsOn") }
+        set { UserDefaults.standard.set(newValue, forKey: "wantsOn") }
+    }
+    /// The setup step the Live Activity is guiding, if any.
+    private(set) var guiding: SetupStep?
     private var lastAgentActivity = Date()
     private var idleTimer: Timer?
     private var launcherConfig: LauncherConfig?
@@ -33,7 +43,6 @@ final class AppModel {
     private let launcher: RunnerLauncher
     private let pairer: DevicePairing
     private let activity = ActivityController()
-    private let keepAlive = KeepAlive()
     private var eventsTask: Task<Void, Never>?
 
     init() {
@@ -42,11 +51,38 @@ final class AppModel {
         self.launcher = launcher
         pairer = RustPairing()
         host.update(key: identity.signingKey, hashes: identity.accessHashes)
-        host.onRestart { launcher.restart() }
+        // PokiCore asks for a restart after two silent requests in a row. A slow gesture can be one of
+        // them while the runner is fine, so the runner is asked first; only a runner that does not
+        // answer is started again (each restart costs seconds and flashes the automation banner).
+        host.onRestart {
+            Task.detached {
+                if !(await RunnerProbe.answers()) { launcher.restart() }
+            }
+        }
         host.onWake { [weak self] in Task { @MainActor in self?.wakeRunner() } }
         listenForApprovals()
-        Task { await tunnel.load() }
         if !diskImage.isReady { Task { await diskImage.download() } }
+        NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.appWillTerminate() }
+        }
+    }
+
+    /// Poki came to the front: turn on again if it was on, check the loopback live, and finish a
+    /// setup step the person just did in Settings.
+    func becameActive() {
+        loopback.resume()
+        if wantsOn, !sessionOn, setup.pairingFile != nil, diskImage.isReady { startSession() }
+        if let step = guiding, isDone(step) { stopGuide() }
+    }
+
+    func wentToBackground() { loopback.pause() }
+
+    /// Poki is being closed: end the runner now (the launcher kills its process) instead of leaving
+    /// iOS's automation banner up for half a minute. iOS gives a few seconds for this.
+    private func appWillTerminate() {
+        guard sessionOn else { return }
+        launcher.stop()
+        Thread.sleep(forTimeInterval: 2.5)
     }
 
     var deviceName: String { UIDevice.current.name }
@@ -62,15 +98,17 @@ final class AppModel {
             Task { await diskImage.download() }
             return
         }
-        do { try keepAlive.start() } catch { problem = "Could not keep Poki running in the background: \(error.localizedDescription)" }
+        background.start()
+        stopGuide()
         activity.start(deviceName: deviceName)
-        activity.update { $0.phase = .idle; $0.headline = "Starting" }
         sessionOn = true
+        wantsOn = true
         launcherConfig = LauncherConfig(pairing_file: pairing, ddi_dir: AppFiles.ddiDirectory.path)
         lastAgentActivity = Date()
-        launchRunner()
+        // The runner (and with it iOS's automation banner) starts only when an agent asks.
+        standBy(reason: nil)
         core.start()
-        idleTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in Task { @MainActor in self?.checkIdle() } }
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in Task { @MainActor in self?.checkIdle() } }
         eventsTask = Task { [weak self, core] in
             for await event in core.events { self?.handle(event) }
         }
@@ -78,12 +116,13 @@ final class AppModel {
 
     func stopSession() {
         guard sessionOn else { return }
+        wantsOn = false
         core.stop()
         launcher.stop()
         idleTimer?.invalidate(); idleTimer = nil
         runnerPaused = false; host.setPaused(false)
         eventsTask?.cancel(); eventsTask = nil
-        keepAlive.stop()
+        background.stop()
         activity.end()
         sessionOn = false
         runner = .idle
@@ -105,11 +144,17 @@ final class AppModel {
     func pauseRunner(reason: String = "Stopped") {
         guard sessionOn, !runnerPaused, approvals.isEmpty else { return }
         launcher.stop()
+        standBy(reason: reason)
+    }
+
+    /// The runner is off and starts on the next agent request.
+    private func standBy(reason: String?) {
         runnerPaused = true
-        runner = RunnerStatus(state: "idle", detail: "\(reason). It starts again on the next agent request.")
-        host.update(runner: .starting("stopped while idle"))
+        runner = RunnerStatus(state: "standby", detail: reason.map { "\($0). It starts again when an agent asks." } ?? "It starts when an agent asks.")
+        host.update(runner: .starting("starting the runner"))
         host.setPaused(true)
-        activity.update { $0.runnerPaused = true; $0.phase = .idle; $0.headline = "Runner stopped. Starts on the next request." }
+        activityText = "Idle"
+        activity.update { $0.runnerPaused = true; $0.phase = .idle; $0.headline = "On. Waiting for an agent" }
     }
 
     /// Starts a paused runner again (the next agent request, or the owner).
@@ -118,7 +163,7 @@ final class AppModel {
         runnerPaused = false
         host.setPaused(false)
         lastAgentActivity = Date()
-        activity.update { $0.runnerPaused = false; $0.headline = "Starting the runner" }
+        activity.update { $0.runnerPaused = false; $0.phase = .working; $0.headline = "Starting the runner" }
         launchRunner()
     }
 
@@ -138,8 +183,8 @@ final class AppModel {
             activity.update { $0.phase = .problem; $0.headline = status.fix ?? status.detail ?? "The runner stopped" }
         } else if !status.isRunning {
             activity.update { $0.phase = .idle; $0.headline = status.title }
-        } else if activity.state.phase == .problem || activity.state.phase == .idle {
-            activity.update { $0.phase = .idle; $0.headline = "Ready" }
+        } else if activity.state.phase == .problem || activity.state.phase == .idle || activity.state.headline == "Starting the runner" {
+            activity.update { $0.phase = .idle; $0.headline = "Ready for the agent" }
         }
     }
 
@@ -155,6 +200,10 @@ final class AppModel {
             lastAgentActivity = Date()
             lastAction = "\(summary) · \(delivery)"
             activityText = "Idle"
+            let failed = delivery.hasPrefix("failed")
+            recentSteps.append(RecentStep(text: summary, detail: delivery, ok: !failed, at: Date()))
+            if recentSteps.count > 20 { recentSteps.removeFirst(recentSteps.count - 20) }
+            activity.record(step: summary, ok: !failed)
             activity.update { state in
                 state.lastAction = "\(summary) · \(delivery)"
                 state.app = app ?? state.app
@@ -214,6 +263,10 @@ final class AppModel {
 
     func startPairing() {
         pairing = .advertising
+        // Started now, while Poki is in front: the PIN arrives while the person is in Settings, when
+        // iOS no longer lets Poki start a Live Activity.
+        activity.start(deviceName: deviceName)
+        activity.update { $0.phase = .pairing; $0.pin = nil; $0.headline = "Pair in Settings" }
         do {
             try pairer.start(hostName: "Poki", saveTo: AppFiles.pairingFile) { [weak self] event in
                 Task { @MainActor in self?.pairingChanged(event) }
@@ -229,18 +282,56 @@ final class AppModel {
         case .pin(let pin):
             // The PIN goes in the Live Activity, so it is visible while the user is in Settings.
             activity.start(deviceName: deviceName)
-            activity.update { $0.phase = .pairing; $0.pin = pin; $0.headline = "Enter this PIN in Settings" }
+            activity.update { $0.phase = .pairing; $0.pin = pin; $0.headline = "Pairing code" }
         case .paired(let url):
             try? (url as NSURL).setResourceValue(URLFileProtection.completeUntilFirstUserAuthentication, forKey: .fileProtectionKey)
             setup.pairingFile = url.path
             activity.update { $0.phase = .idle; $0.pin = nil; $0.headline = "Paired" }
-            if !sessionOn { activity.end() }
-        case .failed:
-            activity.update { $0.pin = nil }
-            if !sessionOn { activity.end() }
+            if !sessionOn { Task { try? await Task.sleep(for: .seconds(4)); if !self.sessionOn { self.activity.end() } } }
+        case .failed(let why):
+            activity.update { $0.phase = .problem; $0.pin = nil; $0.headline = "Pairing failed: \(why)" }
+            if !sessionOn { Task { try? await Task.sleep(for: .seconds(8)); if !self.sessionOn { self.activity.end() } } }
         case .advertising: break
         }
     }
+
+    // MARK: Setup guide
+
+    /// The person is going to Settings for a setup step: the Live Activity shows the step and what to
+    /// tap, so it stays in view there. Ended when they come back and the step is done.
+    func guide(_ step: SetupStep) {
+        guiding = step
+        guard !sessionOn else { return }
+        activity.start(deviceName: deviceName)
+        let steps = SetupStep.allCases
+        activity.update {
+            $0.phase = .setup
+            $0.headline = "Setting up Poki"
+            $0.guide = .init(number: (steps.firstIndex(of: step) ?? 0) + 1, count: steps.count, title: step.title, hint: step.hint)
+        }
+    }
+
+    func stopGuide() {
+        guard guiding != nil else { return }
+        guiding = nil
+        activity.update { $0.guide = nil }
+        if !sessionOn, activity.state.phase == .setup { activity.end() }
+    }
+
+    func isDone(_ step: SetupStep) -> Bool {
+        switch step {
+        case .runner: setup.runnerInstalled
+        case .developerMode: setup.developerMode
+        case .loopback: loopback.isWorking || setup.loopbackChosen
+        case .pairing: setup.pairingFile != nil && diskImage.isReady
+        case .automation: setup.uiAutomation
+        case .background: background.allowed && activity.enabled
+        }
+    }
+
+    var setupComplete: Bool { SetupStep.allCases.allSatisfy(isDone) }
+
+    var activityProblem: String? { activity.lastError }
 
     // MARK: Connectors
 
@@ -253,5 +344,17 @@ final class AppModel {
     private func accessChanged() {
         host.update(key: identity.signingKey, hashes: identity.accessHashes)
         core.accessChanged()
+    }
+}
+
+/// Whether WebDriverAgent answers /status right now (2 s at most).
+enum RunnerProbe {
+    static func answers() async -> Bool {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8100/status")!, timeoutInterval: 2)
+        request.httpMethod = "GET"
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [:]
+        guard let (_, response) = try? await URLSession(configuration: configuration).data(for: request) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
     }
 }

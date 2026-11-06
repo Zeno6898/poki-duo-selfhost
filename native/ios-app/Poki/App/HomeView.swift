@@ -1,152 +1,180 @@
 import SwiftUI
 
+/// The Poki tab: whether Poki is on, what it is doing, and the controls an owner needs: on/off, stop
+/// the runner, approvals, and the agent's recent steps.
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     var openSetup: () -> Void
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    header
-                    if !model.setup.isComplete { setupCard }
-                    GlassEffectContainer(spacing: 16) {
-                        VStack(spacing: 12) {
-                            StatusRow(title: "Runner", value: model.runner.title, symbol: "cpu", good: model.runner.isRunning, detail: model.runner.fix ?? model.runner.detail)
-                            StatusRow(title: "Relay", value: model.relayStatus.text, symbol: "antenna.radiowaves.left.and.right", good: model.relayStatus == .ready, detail: nil)
-                            StatusRow(title: "Loopback", value: loopbackText, symbol: "arrow.triangle.2.circlepath", good: loopbackGood, detail: nil)
+            List {
+                Section { header }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                if !model.setupComplete {
+                    Section {
+                        Button(action: openSetup) {
+                            HStack(spacing: 14) {
+                                Image(systemName: "checklist").font(.title3).foregroundStyle(Brand.blue).frame(width: 28)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Finish setup").font(.body.weight(.semibold)).foregroundStyle(.primary)
+                                    Text("\(SetupStep.allCases.filter { !model.isDone($0) }.count) steps left before agents can use this iPhone.")
+                                        .font(.subheadline).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                            }
                         }
                     }
-                    if model.sessionOn { runnerControls }
-                    if !model.approvals.isEmpty { approvalsCard }
-                    activityCard
-                    if let problem = model.problem {
-                        Text(problem).font(.callout).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .leading)
-                            .padding().glassEffect(.regular.tint(.red.opacity(0.15)), in: .rect(cornerRadius: 20))
-                    }
                 }
-                .padding()
+                if !model.approvals.isEmpty { approvals }
+                Section("Status") {
+                    StatusRow(title: "Agents", value: model.sessionOn ? model.relayStatus.text : "Off", symbol: "antenna.radiowaves.left.and.right",
+                              state: !model.sessionOn ? .off : model.relayStatus == .ready ? .good : .waiting)
+                    StatusRow(title: "Runner", value: model.sessionOn ? model.runner.title : "Off", symbol: "hand.tap",
+                              state: !model.sessionOn ? .off : model.runner.isRunning ? .good : model.runner.state == "failed" ? .bad : .waiting,
+                              detail: model.sessionOn ? (model.runner.fix ?? model.runner.detail) : nil)
+                    StatusRow(title: "Loopback", value: model.loopback.text, symbol: "arrow.triangle.2.circlepath",
+                              state: model.loopback.isWorking ? .good : model.loopback.state == .checking ? .waiting : .bad,
+                              detail: model.loopback.isWorking ? nil : model.loopback.detail)
+                }
+                if model.sessionOn { runnerSection }
+                stepsSection
+                if let problem = model.problem ?? model.activityProblem {
+                    Section { Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.subheadline) }
+                }
             }
             .navigationTitle("Poki")
-            .safeAreaInset(edge: .bottom) { sessionButton.padding() }
+            .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .bottom) { powerButton.padding(.horizontal).padding(.bottom, 8) }
         }
     }
 
     private var header: some View {
-        VStack(spacing: 8) {
-            Image("Bear").resizable().scaledToFit().frame(width: 112, height: 112)
-                .clipShape(.rect(cornerRadius: 26, style: .continuous))
-                .shadow(color: Brand.blue.opacity(0.3), radius: 16, y: 6)
-            Text(model.sessionOn ? model.activityText : "Your iPhone, for your agents")
-                .font(.headline).foregroundStyle(.secondary)
+        VStack(spacing: 10) {
+            Image("Bear").resizable().scaledToFit().frame(width: 96, height: 96)
+                .clipShape(.rect(cornerRadius: 22, style: .continuous))
+                .shadow(color: Brand.blue.opacity(0.25), radius: 14, y: 6)
+            Text(model.sessionOn ? "Poki is on" : "Poki is off").font(.title2.weight(.bold))
+            Text(subtitle).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
-        .padding(.top, 8)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
     }
 
-    private var setupCard: some View {
-        Button(action: openSetup) {
-            Label("Finish setup to let agents use this iPhone", systemImage: "arrow.right.circle.fill")
-                .frame(maxWidth: .infinity, alignment: .leading).padding()
-        }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.tint(Brand.blue.opacity(0.2)).interactive(), in: .rect(cornerRadius: 20))
+    private var subtitle: String {
+        guard model.sessionOn else { return "Turn Poki on so your agents can use this iPhone." }
+        if model.activityText != "Idle" { return model.activityText }
+        return model.runnerPaused ? "Waiting for an agent. The runner starts when one asks." : "Ready for the agent."
     }
 
-    /// Stop the runner (and iOS's automation banner) without ending the session; agents' next request
-    /// starts it again. And how long the phone may sit idle before that happens by itself.
-    private var runnerControls: some View {
-        @Bindable var model = model
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                if model.runnerPaused {
-                    Button("Start runner", systemImage: "play.circle") { model.wakeRunner() }.buttonStyle(.glass)
-                } else {
-                    Button("Stop runner", systemImage: "pause.circle") { model.pauseRunner() }.buttonStyle(.glass)
-                        .disabled(!model.approvals.isEmpty)
+    private var approvals: some View {
+        Section {
+            ForEach(model.approvals, id: \.id) { approval in
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(approval.summary).font(.body.weight(.semibold))
+                    Text("\(approval.app) · expires \(approval.expires, style: .relative)").font(.footnote).foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        Button(role: .destructive) { model.resolve(approval, approved: false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                            .buttonStyle(.bordered)
+                        Button { model.resolve(approval, approved: true) } label: { Text("Approve").frame(maxWidth: .infinity) }
+                            .buttonStyle(.borderedProminent).tint(.green)
+                    }
+                    .controlSize(.large)
                 }
-                Spacer()
+                .padding(.vertical, 4)
+            }
+        } header: {
+            Label("Needs your approval", systemImage: "hand.raised.fill").foregroundStyle(.orange)
+        }
+    }
+
+    private var runnerSection: some View {
+        @Bindable var model = model
+        return Section {
+            if model.runnerPaused {
+                Button("Start the runner now", systemImage: "play.circle") { model.wakeRunner() }
+            } else {
+                Button("Stop the runner", systemImage: "stop.circle") { model.pauseRunner() }
+                    .disabled(!model.approvals.isEmpty)
             }
             Picker("Stop when idle for", selection: $model.idleStopSeconds) {
+                Text("30 seconds").tag(30)
                 Text("1 minute").tag(60)
                 Text("2 minutes").tag(120)
                 Text("5 minutes").tag(300)
-                Text("15 minutes").tag(900)
                 Text("Never").tag(0)
             }
-            Text("A stopped runner removes the automation banner. The next request from an agent starts it again, which takes a few seconds.")
-                .font(.caption).foregroundStyle(.secondary)
+        } header: {
+            Text("Runner")
+        } footer: {
+            Text("iOS shows the automation banner only while the runner is on. Poki starts it when an agent asks and stops it when the agent goes quiet.")
         }
-        .frame(maxWidth: .infinity, alignment: .leading).padding()
-        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
-    private var approvalsCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("Waiting for your approval", systemImage: "hand.raised.fill").font(.headline)
-            ForEach(model.approvals, id: \.id) { approval in
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(approval.summary).font(.body)
-                    Text("\(approval.app) · expires \(approval.expires, style: .relative)").font(.caption).foregroundStyle(.secondary)
-                    HStack {
-                        Button("Deny", role: .destructive) { model.resolve(approval, approved: false) }.buttonStyle(.glass)
-                        Button("Approve") { model.resolve(approval, approved: true) }.buttonStyle(.glassProminent)
+    private var stepsSection: some View {
+        Section("Recent steps") {
+            if model.recentSteps.isEmpty {
+                Text("Nothing yet. Steps from your agent show up here and on the Lock Screen.").font(.subheadline).foregroundStyle(.secondary)
+            } else {
+                ForEach(model.recentSteps.suffix(8).reversed()) { step in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Image(systemName: step.ok ? "checkmark.circle.fill" : "xmark.circle.fill").foregroundStyle(step.ok ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(step.text).font(.subheadline).lineLimit(2)
+                            Text(step.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        Text(step.at, style: .time).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                     }
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading).padding()
-        .glassEffect(.regular.tint(.orange.opacity(0.2)), in: .rect(cornerRadius: 20))
     }
 
-    private var activityCard: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Last action").font(.caption).foregroundStyle(.secondary)
-            Text(model.lastAction ?? "Nothing yet").font(.body.monospaced())
-        }
-        .frame(maxWidth: .infinity, alignment: .leading).padding()
-        .glassEffect(.regular, in: .rect(cornerRadius: 20))
-    }
-
-    private var sessionButton: some View {
+    private var powerButton: some View {
         Button {
             model.sessionOn ? model.stopSession() : model.startSession()
         } label: {
-            Label(model.sessionOn ? "Stop" : "Start", systemImage: model.sessionOn ? "stop.fill" : "play.fill")
+            Label(model.sessionOn ? "Turn off" : "Turn on", systemImage: "power")
                 .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 6)
         }
         .buttonStyle(.glassProminent).controlSize(.large)
         .tint(model.sessionOn ? .red : Brand.blue)
+        .disabled(!model.sessionOn && model.setup.pairingFile == nil)
     }
-
-    private var loopbackText: String {
-        switch model.setup.loopback {
-        case .none: "Not chosen"
-        case .builtIn: "Built-in: \(model.tunnel.statusText)"
-        case .proxy: ProxyApps.all.first { $0.id == model.setup.proxyApp }?.name ?? "Proxy app"
-        }
-    }
-    private var loopbackGood: Bool { model.setup.loopback == .builtIn ? model.tunnel.isConnected : model.setup.loopback == .proxy }
 }
 
 struct StatusRow: View {
+    enum Health { case good, waiting, bad, off }
     var title: String
     var value: String
     var symbol: String
-    var good: Bool
-    var detail: String?
+    var state: Health
+    var detail: String? = nil
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: symbol).font(.title3).frame(width: 28).foregroundStyle(good ? Brand.blue : .secondary)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: symbol).foregroundStyle(Brand.blue).frame(width: 24)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.caption).foregroundStyle(.secondary)
-                Text(value).font(.body)
-                if let detail, !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                HStack {
+                    Text(title)
+                    Spacer()
+                    Text(value).foregroundStyle(.secondary).lineLimit(1)
+                    Circle().fill(color).frame(width: 8, height: 8)
+                }
+                if let detail, !detail.isEmpty { Text(detail).font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             }
-            Spacer()
-            Circle().fill(good ? Color.green : Color.secondary.opacity(0.4)).frame(width: 10, height: 10).padding(.top, 6)
         }
-        .padding()
-        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+    }
+
+    private var color: Color {
+        switch state {
+        case .good: .green
+        case .waiting: .yellow
+        case .bad: .orange
+        case .off: Color.secondary.opacity(0.4)
+        }
     }
 }

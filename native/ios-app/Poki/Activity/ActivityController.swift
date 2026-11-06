@@ -14,18 +14,41 @@ final class ActivityController {
 
     var enabled: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
 
+    var isRunning: Bool { activity != nil }
+
+    /// Starts the Live Activity if it is not running. iOS only allows this while Poki is in front, so
+    /// it is called when the person taps something (Start, Start pairing, a setup step), never later
+    /// from the background.
     func start(deviceName: String) {
-        guard activity == nil, enabled else { return }
+        guard activity == nil else { return }
+        guard enabled else { lastError = "Live Activities are off for Poki (Settings > Poki > Live Activities)."; return }
         // A Live Activity left from an earlier run of the app is replaced.
         for old in Activity<PokiActivityAttributes>.activities { Task { await old.end(nil, dismissalPolicy: .immediate) } }
         do {
-            activity = try Activity.request(attributes: PokiActivityAttributes(deviceName: deviceName), content: content(), pushType: nil)
-        } catch { lastError = "\(error)" }
+            let started = try Activity.request(attributes: PokiActivityAttributes(deviceName: deviceName), content: content(), pushType: nil)
+            activity = started
+            lastError = nil
+            // Dismissed by the person (swiped away) or ended by iOS: start again next time.
+            Task { [weak self] in
+                for await state in started.activityStateUpdates where state == .dismissed || state == .ended {
+                    await MainActor.run { if self?.activity?.id == started.id { self?.activity = nil } }
+                }
+            }
+        } catch { lastError = "The Live Activity did not start: \(error.localizedDescription)" }
+    }
+
+    /// Adds an action to the recent steps (three at most, each kept short for the 4 KB limit).
+    func record(step text: String, ok: Bool) {
+        update { state in
+            state.steps.append(.init(text: String(text.prefix(80)), ok: ok))
+            if state.steps.count > 3 { state.steps.removeFirst(state.steps.count - 3) }
+        }
     }
 
     func end() {
         guard let activity else { return }
         self.activity = nil
+        state.steps = []; state.guide = nil; state.pin = nil
         Task { await activity.end(nil, dismissalPolicy: .immediate) }
     }
 
