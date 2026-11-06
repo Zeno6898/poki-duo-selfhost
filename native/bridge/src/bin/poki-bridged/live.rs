@@ -58,6 +58,7 @@ pub fn is_live_op(op: &str) -> bool {
 async fn live(state: &State, timings: &mut Timings) -> Result<Live> {
     let mut session = state.session.lock().await;
     session.last_used = Instant::now();
+    session.restart_media_if_asked().await;
     if let Err(error) = Box::pin(session.prepare_input_or_retry(false, timings)).await {
         session.reset().await;
         return Err(error);
@@ -416,6 +417,8 @@ async fn read_text(live: &Live, op: &str, object: &Map<String, Value>) -> Result
 pub struct Foreground {
     pub(crate) noted: Option<(Instant, Value)>,
     pub(crate) known: std::collections::HashMap<u64, Value>,
+    /// When the last input that may change the screen was sent.
+    pub(crate) last_input: Option<Instant>,
     wanted: Option<u64>,
     failed: Option<(u64, Instant)>,
 }
@@ -458,14 +461,9 @@ pub fn foreground_json(state: &State) -> Value {
         "via": "tree",
     });
     // Read before the last input: the foreground may have changed since (a fresh tree, e.g.
-    // the AX prefetch at each settle, brings it up to date).
-    let last_input = state
-        .session
-        .try_lock()
-        .ok()
-        .and_then(|session| session.input.as_ref().map(|input| input.frames.live()))
-        .and_then(|live| live.state(Duration::ZERO).last_input);
-    answer["stale"] = last_input.map(|input| at < input).into();
+    // the AX prefetch at each settle, brings it up to date). The same answer in ping and
+    // latest_frame: the input time is kept here, not read from the session.
+    answer["stale"] = f.last_input.is_some_and(|input| at < input).into();
     if let Some(pid) = pid {
         if let Some(known) = f.known.get(&pid) {
             if answer["bundle_id"].is_null() {
@@ -993,6 +991,16 @@ pub fn tree_summary(prefetch: &Prefetcher, live: &Live) -> Value {
     })
 }
 
+/// The newest accessibility read after settle failed (and none succeeded since).
+pub fn ax_unavailable(prefetch: &Prefetcher) -> bool {
+    let p = prefetch.borrow();
+    p.failed.is_some_and(|failed| {
+        p.ready
+            .as_ref()
+            .is_none_or(|ready| ready.requested < failed)
+    })
+}
+
 /// The prefetch's state for latest_frame and ping.
 pub fn prefetch_json(prefetch: &Prefetcher, live: &Live) -> Value {
     let p = prefetch.borrow();
@@ -1181,7 +1189,9 @@ async fn read_ahead(
         }
         Ok(_) => p.dropped += 1,
         Err(error) => {
+            // A failed read says the screen is unknown: the tree before it is not served.
             p.failed = Some(requested);
+            p.ready = None;
             log(&format!("accessibility read after settle failed: {error}"));
         }
     }
