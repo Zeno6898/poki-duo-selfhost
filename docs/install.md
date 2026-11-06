@@ -37,7 +37,7 @@ Setup does **not** install Xcode, developer disk images, device profiles, or sig
 Keep `npm start` running while using an MCP client:
 
 - The daemon listens only on `127.0.0.1:47825` (not exposed to external networks, and not registered as a login item).
-- Its endpoint and bearer token are written to `~/Library/Application Support/PokiMCP/mcp.json` (`0600`) and removed on normal shutdown.
+- Its endpoint and bearer token are written to `~/Library/Application Support/PokiMCP/mcp.json` (`0600`) and removed on normal shutdown. On Linux the state directory is `$XDG_STATE_HOME/poki`, or `~/.local/state/poki`; `POKI_MCP_STATE_DIR` overrides it on any host.
 - The stdio wrapper (`src/stdio.mjs`) connects to this running daemon; it does not auto-start the service.
 
 ## 2. Connect an MCP Client

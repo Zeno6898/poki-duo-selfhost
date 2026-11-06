@@ -16,6 +16,7 @@
     "@modelcontextprotocol/client": "2.4.0",
     "@modelcontextprotocol/node": "2.1.2",
     "@modelcontextprotocol/server": "2.4.0",
+    "plist": "5.0.0",
     "sharp": "0.34.5",
     "zod": "^4.2.0"
   },

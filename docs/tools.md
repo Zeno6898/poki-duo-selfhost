@@ -118,7 +118,7 @@ Installing apps, opening URLs, and reading the clipboard trigger a macOS approva
 | System | `set_location` | Start a simulated latitude/longitude for the selected device. |
 | System | `clear_location` | Stop the location simulation owned by this service for the selected device. |
 | System | `handle_alert` | Choose a visible alert button by text or accept/dismiss action, waiting up to five seconds for it to appear. |
-| System | `request_human_action` | Show a macOS dialog asking the user to complete a step on the device. |
+| System | `request_human_action` | Ask the user to complete a step on the device: a dialog on macOS, an MCP elicitation on other hosts. |
 | Apps | `list_apps` | List installed applications, excluding system apps unless include_system=true. |
 | Apps | `launch_app` | Launch an application by bundle_id or unambiguous name. |
 | Apps | `terminate_app` | Stop an application identified by bundle_id on the selected device. |
@@ -190,7 +190,7 @@ Tool responses include `_meta.timing.stages` with queue, capture, AX, OCR, input
 
 ## Approval & Clipboard Behavior
 
-- **Local approval dialog**: Installing or uninstalling apps, building and running projects, opening URLs, downloading app containers, and reading or writing the clipboard trigger a local macOS approval dialog by default.
+- **Local approval dialog**: Installing or uninstalling apps, building and running projects, opening URLs, downloading app containers, and reading or writing the clipboard trigger a local macOS approval dialog by default. On other hosts the approval is asked through MCP elicitation when the client supports it; when nobody can be asked, the action is not run and the reply says so.
 - Setting `POKI_MCP_APPROVAL_MODE=allow` bypasses this local daemon prompt for preapproved workflows, but it **never** auto-completes iOS/macOS system authorization dialogs or makes `request_human_action` succeed automatically.
 - **Unicode paste & clipboard restoration**:
   - Unicode text entry may use the device clipboard. On physical devices, Poki MCP attempts to save and restore a complete clipboard snapshot; if full restoration is not possible, the response explicitly reports restoration as unavailable.

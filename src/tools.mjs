@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { version } from './build-info.mjs';
+import { humanChannel } from './human.mjs';
 
 const catalog = JSON.parse(readFileSync(new URL('./data/tools.json', import.meta.url), 'utf8'));
 const defaultTools = new Set([
@@ -41,7 +42,8 @@ export function createServer(call) {
   const server = new McpServer({ name: 'poki-mcp', version }, { instructions });
   for (const [name, description, inputSchema, readOnlyHint] of definitions) {
     server.registerTool(name, { description, inputSchema, annotations: { readOnlyHint } }, async (args, extra) => {
-      try { return await call(name, args, { signal: extra.mcpReq?.signal ?? extra.signal, requestId: extra.mcpReq?._meta?.['poki/request_id'] }); }
+      const elicit = extra.mcpReq?.elicitInput;
+      try { return await humanChannel.run({ elicit }, () => call(name, args, { signal: extra.mcpReq?.signal ?? extra.signal, requestId: extra.mcpReq?._meta?.['poki/request_id'] })); }
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
     });
   }
