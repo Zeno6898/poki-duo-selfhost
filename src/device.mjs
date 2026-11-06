@@ -19,6 +19,7 @@ import { routes as routesToBridgeDaemon, runThroughDaemon } from './bridge-daemo
 import { actAndObserve } from './act-and-observe.mjs';
 import { liveScreenFor, enabled as liveFramesEnabled } from './live-frames.mjs';
 import { World } from './world.mjs';
+import * as agentLoop from './agent-loop.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -317,6 +318,13 @@ export class Devices {
     const signature = JSON.stringify([front, ...elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; })]);
     return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, at: performance.now(), startedAt: started, observedAt, ...(served ? { served } : {}) };
   }
+  // Whether a read shows a screen that has stopped moving: the World saw it settle after the last
+  // input, nothing has changed since, and the read began after that frame. A target found in such a
+  // read needs no second read to prove it holds still.
+  screenSettled(seen) {
+    const world = this.worlds.get(this.resolved?.id), frame = world?.settledFrame;
+    return Boolean(frame && world.lastInput && frame.afterInput === world.lastInput.epoch && frame.epoch === world.epoch && Date.parse(seen.observedAt) >= frame.capturedMs);
+  }
   // A simulator's size only changes when it rotates. A physical device maps touches through its
   // current orientation, so it keeps taking a fresh frame.
   async screenSize() {
@@ -541,6 +549,9 @@ export class Devices {
         }
         // Without await, the finally below restores the device state while the first step is still looking up its device.
         case 'batch_commands': return await runBatch(this, args);
+        case 'observe': return await agentLoop.observe(this, args);
+        case 'act': return await agentLoop.act(this, args);
+        case 'run': return await agentLoop.run(this, args);
         default: {
           const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
           this.beforeInput = undefined; this.expectsForeground = false;
@@ -561,6 +572,8 @@ export class Devices {
           if (unchanged) result = { ...result, instruction: unchangedAdvice };
           // The input layers always answer false here. Only a touch is compared inside a batch; the batch ends with the screen.
           if (this.inBatch && result.screen_change_verified === false) { const { screen_change_verified, ...rest } = result; result = rest; }
+          // With the live screen, screen_change is the one verdict; the earlier two-field form would only repeat it.
+          if (liveFramesEnabled()) { const { screen_change_verified, screen_changed, ...rest } = result; result = rest; }
           // The user's answer is the result: a confirmed dialog is a success, and an unanswered one an ordinary failure for stop_on_error to decide.
           if (name === 'request_human_action') return { ...(result.completed ? {} : { isError: true, _meta: { stop_reason: 'error' } }), ...text(result) };
           if (result.stopped || result.isError) return { isError: true, ...text(result), _meta: { stop_reason: result.stop_reason ?? (result.stopped ? 'cancelled' : 'unknown') } };

@@ -98,7 +98,7 @@ async function locate(ctx, find, describe, mustHold) {
         seen = await readStructure(ctx, attempt === 0 ? justReadMs : 0);
         checkWork();
         let found = find(seen.elements);
-        const elapsed = performance.now() - started, quiet = performance.now() - ctx.lastInputAt > quietMs;
+        const elapsed = performance.now() - started, quiet = performance.now() - ctx.lastInputAt > quietMs || ctx.screenSettled?.(seen) === true;
         if (!found.length && (elapsed >= nextOcr || !seen.elements.length && quiet)) {
           nextOcr = elapsed + ocrEveryMs;
           seen = { ...seen, ...await ctx.recognize({ source: 'ocr', max_elements: Number.MAX_SAFE_INTEGER }) };

@@ -1345,6 +1345,194 @@
         },
         "required": []
       }
+    },
+    {
+      "name": "observe",
+      "description": "The device's screen now: a small image and `now`, the text read for that exact frame (never an older one), the app in front, and what changed since your last look. full=true adds elements with refs and frames, and a larger image. Call it once on an unfamiliar screen; act and run end with the same block, so there is no need to observe after them.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "full": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "act",
+      "description": "Send one action and wait, at device speed, for what it should produce. expect says what that is; the call returns as soon as it holds on a settled frame, when the screen settles without it (expectation missed), or when a system prompt appears (blocked). now.outcome is the one verdict on the action: as_expected, changed, unchanged (the settled screen after it is the same picture, app and tree as before), unknown (the screen did not settle) or unverified (no frame is proven newer than the action). Refs from an earlier screen are refused.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "action": {
+            "type": "object",
+            "properties": {
+              "tool": {
+                "type": "string",
+                "description": "A single-step tool: launch_app, tap, tap_text, fill, type_text, scroll, scroll_to, swipe, drag, press_key, press_button, go_back, hide_keyboard, handle_alert, or select_items {match: {role?, label?}, in?: {ref or label}, count}."
+              },
+              "arguments": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "tool"
+            ],
+            "additionalProperties": false
+          },
+          "expect": {
+            "type": "object",
+            "description": "What the action should produce. One of: {text, exact?} visible text appears; {gone} text disappears; {foreground} bundle id in front; {page_identity} 'new' or an id; {change} 'any' or a region [x, y, width, height] as screen fractions.",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "exact": {
+                "type": "boolean"
+              },
+              "gone": {
+                "type": "string"
+              },
+              "foreground": {
+                "type": "string"
+              },
+              "page_identity": {
+                "type": "string"
+              },
+              "change": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "any"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 4,
+                    "maxItems": 4
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 30000
+          },
+          "full": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "run",
+      "description": "Run known steps in order at device speed and come back only when it is done or a step needs you: an expectation missed, a system prompt, an error, or a checkpoint before a step whose target reads delete, remove, erase, send, pay, purchase, buy, confirm, sign out, log out, reset or discard that is not in allow. Each step is {tool, arguments, expect?, timeout_ms?} (3 s by default); wait_for {text, gone?, timeout_seconds} waits without input, and select_items {match: {role?, label?}, in?: {ref or label}, count} taps the first count matching elements in reading order. After a checkpoint, continue with {resume: run_id, allow: [label]}; put labels in allow up front when the user asked for that action.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tool": {
+                  "type": "string",
+                  "description": "A single-step tool: launch_app, tap, tap_text, fill, type_text, scroll, scroll_to, swipe, drag, press_key, press_button, go_back, hide_keyboard, handle_alert, or select_items {match: {role?, label?}, in?: {ref or label}, count}."
+                },
+                "arguments": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "expect": {
+                  "type": "object",
+                  "description": "What the action should produce. One of: {text, exact?} visible text appears; {gone} text disappears; {foreground} bundle id in front; {page_identity} 'new' or an id; {change} 'any' or a region [x, y, width, height] as screen fractions.",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "exact": {
+                      "type": "boolean"
+                    },
+                    "gone": {
+                      "type": "string"
+                    },
+                    "foreground": {
+                      "type": "string"
+                    },
+                    "page_identity": {
+                      "type": "string"
+                    },
+                    "change": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "enum": [
+                            "any"
+                          ]
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          },
+                          "minItems": 4,
+                          "maxItems": 4
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 30000
+                }
+              },
+              "required": [
+                "tool"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 40
+          },
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "resume": {
+            "type": "string"
+          },
+          "full": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
     }
   ]
 }

@@ -23,6 +23,14 @@ The default `tools/list` response contains the tools for phone tasks. Tool names
 
 The runtime default list is defined in `src/tools.mjs`. The complete catalog includes simulator management, app installation, recording, location, appearance, and device leases.
 
+### Agent profile
+
+`POKI_TOOL_PROFILE=agent` lists only `observe`, `act`, `run`, `list_apps`, `list_devices`, `select_device` and `poki_mcp_status`, with server instructions for driving a device in a loop. It is the default when `POKI_LIVE_FRAMES=1`; `POKI_TOOL_PROFILE=default` keeps the default list. Every other tool still answers when called by name.
+
+- `observe` returns the screen as `now`: a small JPEG and the text read for that exact frame, the app in front, and what changed since the session's last look. `full: true` adds elements with refs, which are valid until the screen changes.
+- `act {action: {tool, arguments}, expect?, timeout_ms?}` sends one single-step action and returns when `expect` (`{text}`, `{gone}`, `{foreground}`, `{page_identity}` or `{change}`) holds on a settled frame, when the screen settles without it, or when a system prompt appears. `now.outcome` is the verdict: `as_expected`, `changed`, `unchanged` (the settled picture, the app in front and the tree are what the input was sent to), `unknown` (the screen did not settle) or `unverified` (no frame is proven newer than the input).
+- `run {steps, allow?, resume?}` runs steps in order and stops on a missed expectation, a system prompt, an error, or a checkpoint before a step whose target reads delete, remove, erase, send, pay, purchase, buy, confirm, sign out, log out, reset or discard and is not in `allow`. `select_items {match: {role?, label?}, in?, count}` taps the first matching elements in reading order, and `wait_for` waits without input. `run {resume: run_id, allow}` continues after a checkpoint; runs are kept for ten minutes. An input whose delivery is unknown is never sent again.
+
 ### Complete catalog
 
 `POKI_MCP_TOOLS=all` makes `tools/list` return the complete catalog. Any other value, including an unset or empty value, selects the default list.

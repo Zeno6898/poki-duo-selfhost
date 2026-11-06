@@ -6,6 +6,15 @@
 // POKI_BRIDGE_DAEMON=1, see live-frames.mjs) the long-lived bridge decodes the screen video and
 // answers latest_frame and wait_settled in milliseconds; otherwise each frame is a developer-service
 // screenshot, and "settled" means two captures in a row look the same.
+//
+// A frame source is the only thing World needs from a screen, so it runs on any frame cache:
+//   frame()                      the newest frame: { image, capturedMs, startedMs?, width?, height?, bridgeEpoch? }
+//   settled({ timeoutMs })       the first frame after now that stopped changing, with settled: true,
+//                                or the newest one with settled: false when time ran out; a source that
+//                                watched the screen the whole time may add changedSinceInput
+//   screen.op({ op: 'ocr_region' }) optional: OCR of a box of the newest frame, kept warm by the source
+// A frame from before an input is never passed off as one after it: settle() marks each frame with
+// whether it is proven to show the screen after the last input (see `proven`).
 import { writeFile, unlink, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -45,7 +54,7 @@ class CaptureSource {
   async frame() {
     const f = await this.devices.capture();
     const at = Date.parse(f.capture_completed_at);
-    return { capturedMs: at, changedMs: at, image: f.data, width: f.width, height: f.height };
+    return { capturedMs: at, startedMs: Date.parse(f.capture_started_at ?? f.capture_completed_at), changedMs: at, image: f.data, width: f.width, height: f.height };
   }
   // Two captures that look alike; the first is the earliest the screen can have stopped changing.
   async settled({ timeoutMs }) {
@@ -75,7 +84,7 @@ function fromLive(picture) {
   if (!picture?.jpeg) throw new Error('The live screen returned no picture.');
   const capturedMs = Date.parse(picture.capturedAt);
   return { capturedMs, changedMs: capturedMs, capturedAt: picture.capturedAt, image: picture.jpeg, settled: picture.settled, quietMs: picture.quietMs ?? undefined,
-    changedSinceInput: picture.changedSinceInput, lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
+    changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
 async function withThumb(frame) { return frame.thumb ? frame : { ...frame, thumb: await thumb(frame.image) }; }
@@ -86,6 +95,8 @@ const lineOf = e => {
   const parts = [label, value].filter(part => typeof part === 'string' && part.trim());
   return parts.length ? `${e.type ?? e.role ?? 'Text'}: ${parts.join(' = ')}` : undefined;
 };
+const treeKey = (elements, foreground) => JSON.stringify([foreground?.pid ?? null, elements.map(e => { const f = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, Boolean(e.selected), f.x, f.y, f.width, f.height]; })]);
+const treeLagMs = 2500;
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
 const inside = (box, [x, y, w, h], size) => {
   const f = box.frame ?? box, cx = (f.x + f.width / 2) / size.width, cy = (f.y + f.height / 2) / size.height;
@@ -113,10 +124,21 @@ export class World {
   async settle(timeoutMs = 3000, settleMs, maxWidth) {
     const started = performance.now();
     const frame = await this.stamp(await this.source.settled({ timeoutMs, settleMs, maxWidth }));
-    const settled = { ...frame, settleMs: Math.round(performance.now() - started), afterInput: this.lastInput?.epoch };
+    const settled = { ...frame, settleMs: Math.round(performance.now() - started), afterInput: this.lastInput?.epoch, proven: this.proven(frame) };
     this.lastSettle = settled;
     if (settled.settled) this.settledFrame = settled;
     return settled;
+  }
+  // Whether a frame is known to show the screen after the last input: it was captured after the input
+  // was sent, or the source watched the screen since the input and saw it settle without a change.
+  // A frame that is neither may be the screen the input was sent to, so it proves nothing about it.
+  proven(frame) {
+    const input = this.lastInput;
+    if (!input) return true;
+    // A source that numbers its frames says itself whether one is newer than the input (upstream's rule).
+    if (frame.observation) return frame.observation !== 'unverified';
+    if ((frame.startedMs ?? frame.capturedMs) >= input.sentMs || frame.pictureAfterInput === true) return true;
+    return frame.settled === true && frame.changedSinceInput === false;
   }
   // Whether this frame is the same picture as one seen earlier (same epoch, or no pixel change).
   same(a, b) { return Boolean(a && b) && (a.epoch === b.epoch || !compare(a.thumb, b.thumb).changed); }
@@ -131,7 +153,12 @@ export class World {
     const startedMs = Date.now(), epoch = frame.epoch;
     const reading = this.devices.structure(0).then(seen => {
       // Read after the frame's last change, and nothing has changed since: it describes this frame.
-      if (seen?.elements.length && startedMs >= frame.changedMs && this.epoch === epoch) this.tree = { elements: seen.elements.filter(visible), foreground: seen.foreground, epoch, thumb: frame.thumb };
+      // A tree identical to the last one although the pixels moved is the tree lagging the screen, until
+      // treeLagMs after the input: only then are the same words on a new picture believed (an image or
+      // canvas can change without the tree changing).
+      const elements = seen?.elements.filter(visible) ?? [], key = treeKey(elements, seen?.foreground);
+      const lagging = this.tree && this.tree.epoch !== epoch && this.tree.key === key && compare(this.tree.thumb, frame.thumb)?.changed && startedMs - (this.lastInput?.sentMs ?? 0) < treeLagMs;
+      if (elements.length && !lagging && startedMs >= frame.changedMs && this.epoch === epoch) this.tree = { elements, foreground: seen.foreground, epoch, thumb: frame.thumb, key };
       return this.tree?.epoch === epoch ? this.tree : undefined;
     }, error => { if (stopped(error)) throw error; });
     const timer = Number.isFinite(waitMs) ? new Promise(done => setTimeout(done, waitMs, 'late')) : undefined;
@@ -148,9 +175,11 @@ export class World {
     // The bridge keeps an OCR worker warm on the live frames; otherwise the helper reads a cropped PNG.
     if (this.live) {
       try {
-        const answer = await this.source.screen.op({ op: 'ocr_region', epoch: frame.bridgeEpoch, box: region ?? [0, 0, 1, 1] }, 5000);
-        const found = Array.isArray(answer) ? answer : answer?.elements;
-        if (Array.isArray(found)) return found.map(e => ({ label: e.text, text: e.text, type: 'StaticText', frame: { x: e.x, y: e.y, width: e.width, height: e.height }, ocr: true }));
+        // Boxes come back as fractions of the screen; text read from a later picture than this frame is not used.
+        const request = region ? { op: 'ocr_region', box: region } : { op: 'ocr_frame' };
+        const answer = await this.source.screen.op({ ...request, ...(Number.isInteger(frame.bridgeEpoch) ? { epoch: frame.bridgeEpoch } : {}) }, 5000);
+        const point = e => { const [x, y, w, h] = e.region ?? [e.x, e.y, e.width, e.height]; return { x: x * size.width, y: y * size.height, width: w * size.width, height: h * size.height }; };
+        if (Array.isArray(answer?.elements) && answer.epoch_matches !== false) return answer.elements.map(e => ({ label: e.text, text: e.text, type: 'StaticText', frame: point(e), ocr: true }));
       } catch (error) { if (stopped(error)) throw error; }
     }
     if (!(await ocrStatus()).available) return [];

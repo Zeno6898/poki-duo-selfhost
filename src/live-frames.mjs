@@ -25,6 +25,11 @@ export async function frameFromAnswer(answer, { rgb = false } = {}) {
     quietMs: answer.quiet_ms ?? null, lastChange: answer.last_change ?? null,
     changedSinceInput: answer.changed_since_input ?? null, pictureAfterInput: answer.picture_after_input ?? null,
     ...(answer.waited_ms !== undefined ? { waitedMs: answer.waited_ms } : {}),
+    // Upstream's frame identity, and whether the frame is newer than the last input (after_input,
+    // unverified or no_input), when the bridge sends them.
+    ...(answer.frame ? { identity: answer.frame } : {}),
+    ...(Number.isInteger(answer.frame?.seq ?? answer.epoch) ? { epoch: answer.frame?.seq ?? answer.epoch } : {}),
+    ...(answer.observation ? { observation: answer.observation } : {}),
   };
   if (rgb && jpeg) frame.rgb = await sharp(jpeg).removeAlpha().raw().toBuffer();
   return frame;
