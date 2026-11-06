@@ -114,3 +114,10 @@ test('a different app in front counts as a change even when its tree has not arr
  const receipt=value(await f.call('tap',{x:10,y:10}));
  assert.equal(receipt.screen_change,'changed',JSON.stringify(receipt));
 });
+
+test('a screen says when its read began and how old it is', { timeout: 30000 }, async t => {
+ const f=await fixture(t);
+ const receipt=value(await f.call('tap',{x:10,y:10}));
+ assert.ok(!Number.isNaN(Date.parse(receipt.screen.observed_at)),JSON.stringify(receipt.screen));
+ assert.ok(receipt.screen.tree_age_ms>=0);
+});

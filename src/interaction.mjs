@@ -144,6 +144,9 @@ export function describeScreen(seen, elements = seen.elements, source = 'accessi
   const text = [...new Set(elements.filter(visible).map(describeElement).filter(Boolean))];
   const warning = promptWarning(elements);
   return {
+    // When the read behind this text began, and how old it is now.
+    ...(seen.observedAt ? { observed_at: seen.observedAt, tree_age_ms: Math.round(performance.now() - seen.startedAt) } : {}),
+    ...(seen.served ? { served: seen.served } : {}),
     foreground: seen.foreground?.bundle_id ?? seen.foreground?.name ?? null,
     source,
     page_identity: screenIdentity({ foreground: seen.foreground, elements, prompt: warning }),
@@ -164,6 +167,8 @@ export async function readScreen(ctx, { before, confirmation } = {}) {
   const cost = () => ctx.readCost?.() ?? 0;
   // A batch that ends on a touch has just read the screen to see whether it changed.
   let seen = await readStructure(ctx, justReadMs), stable = false;
+  // A read that began before the last input shows the screen the input was sent to, never the current one.
+  if (seen.startedAt < ctx.lastInputAt) seen = await readStructure(ctx, 0);
   const window = Math.max(stableWithinMs, 2 * cost() + pollMs);
   while (performance.now() - started < window) {
     if (remaining() < cost() + pollMs) break;

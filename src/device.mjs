@@ -1,4 +1,4 @@
-import { execute, checkWork, deadline, pause, phase, stopped, stoppingReason } from './work.mjs';
+import { execute, checkWork, deadline, pause, phase, stopped, stoppingReason, timingCount, timingsSince } from './work.mjs';
 import { Coordination, managementTools } from './coordination.mjs';
 import { runBatch } from './batch.mjs';
 import { mkdir, readFile, writeFile, unlink, stat } from 'node:fs/promises';
@@ -251,16 +251,18 @@ export class Devices {
   async structure(maxAge = 0) {
     const target = await this.target();
     if (this.seen?.device === target.id && performance.now() - this.seen.at <= maxAge) return this.seen;
-    const started = performance.now();
+    const started = performance.now(), observedAt = new Date().toISOString(), timings = timingCount();
     const tree = await phase('accessibility', () => this.bridge({ op: 'ax', include_offscreen: false }));
     this.readCosts.set(target.id, performance.now() - started);
+    // A long-lived bridge says whether it answered from a held subscription (see bridge-daemon.mjs).
+    const served = timingsSince(timings).findLast(entry => typeof entry.ax === 'string')?.ax;
     if (tree.foreground?.pid) this.lastForeground = { device: target.id, pid: tree.foreground.pid };
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     // The app in front is part of the screen: a switch counts as a change even before its tree arrives.
     const front = [tree.foreground?.pid ?? null, tree.foreground?.bundle_id ?? null];
     const signature = JSON.stringify([front, ...elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; })]);
-    return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, at: performance.now() };
+    return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, at: performance.now(), startedAt: started, observedAt, ...(served ? { served } : {}) };
   }
   // A simulator's size only changes when it rotates. A physical device maps touches through its
   // current orientation, so it keeps taking a fresh frame.
@@ -302,7 +304,7 @@ export class Devices {
       const seen = this.seen?.device === this.resolved?.id && this.seen.elements.length ? this.seen : undefined;
       if (!seen) return { ...screenChange(), screen: { unavailable: error.message } };
       // One read that differs settles a change; a matching one needed a second read to confirm it.
-      return { ...screenChange(before, before !== undefined && seen.signature !== before ? seen.signature : undefined), screen: { ...describeScreen(seen), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
+      return { ...screenChange(before, before !== undefined && seen.signature !== before ? seen.signature : undefined), screen: { ...describeScreen(seen), ...(seen.startedAt < this.lastInputAt ? { stale: true } : {}), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
     }
   }
   // The action does not depend on this read, so a slow read only costs the comparison.
