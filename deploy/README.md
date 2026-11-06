@@ -186,6 +186,25 @@ must answer `401` with a `WWW-Authenticate: Bearer resource_metadata="..."` head
 Local access is only for clients on this machine` means the front rewrote `Host` to localhost;
 make it pass the public hostname.
 
+## Approvals on a server
+
+On macOS the daemon asks for approval in a local dialog before sensitive tools run (install or
+uninstall apps, open URLs, read or write the clipboard, download app containers, build and run).
+A Linux server has no such dialog, so with the default settings those tools fail closed and are
+refused. `POKI_MCP_APPROVAL_MODE=allow` preapproves them for the whole daemon. It never taps iOS
+system permission dialogs and never makes `request_human_action` succeed. Whether to set it on
+a remote deployment is the operator's decision; the example environment leaves it unset.
+
+## Known limitations
+
+- **No MCP elicitation for remote clients.** For each POST the daemon builds a new stateless MCP
+  server with JSON responses (`enableJsonResponse`). It therefore cannot send a request back to the
+  client mid-call, so `request_human_action` and approval prompts that use elicitation do not
+  reach remote clients. Supporting them needs stateful sessions or an SSE stream on the OAuth path,
+  a later change that would be off by default.
+- **One daemon per phone.** The input lock lives in one process.
+- **Revocation from the CLI needs a restart.** The daemon caches grants in memory.
+
 ## 5. Connect clients
 
 - **claude.ai**: Settings → Connectors → Add custom connector, URL `https://<host>/mcp`. Sign in
