@@ -957,6 +957,8 @@ impl Live {
             "daemon_cpu_percent": cpu(from.cpu, to.cpu),
             "decoder_thread_cpu_percent": cpu(from.decoder_cpu, to.decoder_cpu),
             "settled": state.settled,
+            // The newest decoded picture's age: every decoded unit makes a new picture, changed
+            // or not, so on a still screen this grows only while the phone sends nothing.
             "latest_age_ms": since(state.latest.map(|l| l.0)),
             "ms_since_change": since(state.last_change.map(|c| c.0)),
             "size": state.latest.map(|l| [l.2, l.3]),
@@ -1014,6 +1016,15 @@ impl Live {
         if let (Value::Object(report), Value::Object(clock)) = (&mut report, clock) {
             report.extend(clock);
         }
+        // Picture age and change age apart, so a still screen is never read as a stale picture.
+        report["picture_age_ms"] = report["latest_age_ms"].clone();
+        report["last_change_age_ms"] = report["ms_since_change"].clone();
+        // The picture shows the screen as the phone last sent it: no unit waits to be decoded and
+        // the stream is not stalled. A quiet stream keeps an old picture current.
+        report["picture_current"] = (state.latest.is_some()
+            && screen.stalled_since.is_none()
+            && c.units_to_decoder == c.units_done)
+            .into();
         report
     }
 }
@@ -2235,6 +2246,13 @@ mod tests {
                 assert_eq!(c.stalls, 0, "no stall once pictures come");
                 assert!(!screen.restart_requested, "no reopen asked for");
                 drop(screen);
+                // A quiet stream: the picture ages, its last change ages, and it stays current.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let report = live.report(&live.mark());
+                assert!(report["picture_age_ms"].as_u64().unwrap() >= 300);
+                assert_eq!(report["picture_age_ms"], report["latest_age_ms"]);
+                assert!(report["last_change_age_ms"].as_u64().unwrap() >= 300);
+                assert_eq!(report["picture_current"], true);
                 drop(tx);
             });
     }
