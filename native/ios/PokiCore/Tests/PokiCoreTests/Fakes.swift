@@ -17,9 +17,18 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
         set("GET /screenshot") { _ in (200, ["value": .string(Data("png".utf8).base64EncodedString())]) }
         set("GET /wda/activeAppInfo") { _ in (200, ["value": ["bundleId": "com.apple.Preferences", "name": "Settings"]]) }
         source([("Button", "General"), ("Button", "Privacy")])
-        for path in ["POST /wda/tap", "POST /wda/keys", "POST /wda/dragfromtoforduration", "POST /wda/touchAndHold", "POST /wda/apps/launch", "POST /wda/apps/terminate", "POST /wda/homescreen", "POST /wda/lock", "POST /wda/pressButton", "POST /actions"] {
+        for path in ["POST /wda/tap", "POST /wda/keys", "POST /wda/dragfromtoforduration", "POST /wda/touchAndHold", "POST /wda/apps/launch", "POST /wda/apps/terminate", "POST /wda/homescreen", "POST /wda/lock", "POST /wda/pressButton", "POST /actions", "POST /wda/pressAndDragWithVelocity", "POST /appium/settings"] {
             set(path) { _ in (200, ["value": .null]) }
         }
+    }
+
+    /// The screen as a tree: (type, label, [x, y, w, h], children).
+    func tree(_ nodes: [Node], app: String = "X") {
+        func json(_ n: Node) -> JSON {
+            ["type": .string("XCUIElementType\(n.type)"), "label": n.label.map(JSON.string) ?? .null, "rect": ["x": .number(n.frame[0]), "y": .number(n.frame[1]), "width": .number(n.frame[2]), "height": .number(n.frame[3])], "children": .array(n.children.map(json))]
+        }
+        let root: JSON = ["type": "XCUIElementTypeApplication", "label": .string(app), "rect": ["x": 0, "y": 0, "width": 390, "height": 844], "children": .array(nodes.map(json))]
+        set("GET /source") { _ in (200, ["value": root]) }
     }
 
     func set(_ key: String, _ route: @escaping Route) { lock.lock(); routes[key] = route; lock.unlock() }
@@ -66,12 +75,28 @@ struct FakeKey: RelayKey {
     func sign(_ message: Data) throws -> Data { Data(message.reversed()) }
 }
 
+struct Node {
+    var type: String
+    var label: String?
+    var frame: [Double]
+    var children: [Node] = []
+    init(_ type: String, _ label: String?, _ frame: [Double], _ children: [Node] = []) {
+        self.type = type
+        self.label = label
+        self.frame = frame
+        self.children = children
+    }
+}
+
 final class FakeHost: CoreHost, @unchecked Sendable {
     let state = LockedBox<RunnerState>(.running)
     let restarts = LockedBox(0)
+    let texts = LockedBox<[RecognizedText]?>(nil)
+    let widths = LockedBox<[Int]>([])
+    func recognizeText(inPNG png: Data) async -> [RecognizedText]? { texts.value }
     func signingKey() throws -> RelayKey { FakeKey() }
     func accessHashes() -> [String] { ["abc123"] }
-    func jpeg(fromPNG png: Data, width: Int, quality: Double) throws -> Data { Data("jpeg:\(png.count)".utf8) }
+    func jpeg(fromPNG png: Data, width: Int, quality: Double) throws -> Data { widths.update { $0.append(width) }; return Data("jpeg:\(png.count)".utf8) }
     func runnerState() -> RunnerState { state.value }
     func restartRunner() { restarts.update { $0 += 1 } }
 }

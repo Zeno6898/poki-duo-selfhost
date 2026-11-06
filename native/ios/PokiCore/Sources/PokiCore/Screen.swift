@@ -2,7 +2,25 @@ import Foundation
 
 public struct Rect: Equatable, Sendable {
     public var x, y, width, height: Double
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
     public var centre: (x: Double, y: Double) { (x + width / 2, y + height / 2) }
+    public var maxX: Double { x + width }
+    public var maxY: Double { y + height }
+    public var area: Double { max(0, width) * max(0, height) }
+    public var isEmpty: Bool { width <= 0 || height <= 0 }
+    public func contains(_ p: (x: Double, y: Double)) -> Bool { x <= p.x && p.x <= maxX && y <= p.y && p.y <= maxY }
+    public func intersection(_ o: Rect) -> Rect {
+        let left = max(x, o.x), top = max(y, o.y), right = min(maxX, o.maxX), bottom = min(maxY, o.maxY)
+        return Rect(x: left, y: top, width: max(0, right - left), height: max(0, bottom - top))
+    }
+    public func intersects(_ o: Rect) -> Bool { !intersection(o).isEmpty }
+    /// x, y, width and height rounded to whole points.
+    var described: String { "[\([x, y, width, height].map { String(Int($0.rounded())) }.joined(separator: ","))]" }
 }
 
 /// One element of the accessibility tree, flattened.
@@ -13,6 +31,26 @@ public struct Element: Equatable, Sendable {
     public var identifier: String?
     public var frame: Rect
     public var depth: Int
+    /// The element's place in the tree, in document order, and the last place inside it: an element
+    /// whose `node` is in `node+1...end` is inside this one.
+    public var node = 0
+    public var end = 0
+    /// Not in the tree: text read from the screenshot.
+    public var fromPicture = false
+
+    public init(type: String, label: String?, value: String?, identifier: String?, frame: Rect, depth: Int, node: Int = 0, end: Int = 0, fromPicture: Bool = false) {
+        self.type = type
+        self.label = label
+        self.value = value
+        self.identifier = identifier
+        self.frame = frame
+        self.depth = depth
+        self.node = node
+        self.end = end
+        self.fromPicture = fromPicture
+    }
+
+    func contains(_ other: Element) -> Bool { node < other.node && other.node <= end }
 
     /// What the element says: its label, and its value when it has one.
     public var text: String { [label, value].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " = ") }
@@ -42,17 +80,23 @@ public struct Reading: Sendable {
 /// frame and something to say.
 func flatten(_ root: JSON) -> [Element] {
     var out: [Element] = []
+    var counter = 0
     func walk(_ node: JSON, _ depth: Int) {
         guard case .object = node else { return }
+        counter += 1
+        let place = counter
         let r = node["rect"]
         let frame = Rect(x: r?["x"]?.double ?? 0, y: r?["y"]?.double ?? 0, width: r?["width"]?.double ?? 0, height: r?["height"]?.double ?? 0)
         let visible = node["isVisible"]?.bool ?? true
+        var index: Int?
         if depth > 0, visible, frame.width > 0, frame.height > 0 {
             let type = (node["type"]?.string ?? "Other").replacingOccurrences(of: "XCUIElementType", with: "")
             let name = node["name"]?.text
-            out.append(Element(type: type, label: node["label"]?.text ?? name, value: node["value"]?.text, identifier: name, frame: frame, depth: depth))
+            index = out.count
+            out.append(Element(type: type, label: node["label"]?.text ?? name, value: node["value"]?.text, identifier: name, frame: frame, depth: depth, node: place, end: place))
         }
         for child in node["children"]?.array ?? [] { walk(child, depth + 1) }
+        if let index { out[index].end = counter }
     }
     walk(root, 0)
     return out

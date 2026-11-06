@@ -9,20 +9,48 @@ import Foundation
 //   {long_press: n | [x, y] | {ref | x, y, ms?}}   {drag: {from, to, ms?} | [x1, y1, x2, y2]}
 //   {pinch: {ref | x, y, scale}}               {button: "home" | "lock" | "volume_up" | "volume_down"}
 //   {launch: "bundle" | {bundle, fresh?}}      {wait: ms}
+//   {wait_until: "text" | {text, gone?, ms?} | {settled: true, ms?}}
 extension Computer {
     static let keyText: [String: String] = ["return": "\n", "enter": "\n", "delete": "\u{8}", "backspace": "\u{8}", "tab": "\t", "space": " ", "escape": "\u{1b}"]
     static let buttons: [String: String] = ["volume_up": "volumeUp", "volume-up": "volumeUp", "volume_down": "volumeDown", "volume-down": "volumeDown"]
 
+    /// The point to touch for a target. A numbered element is touched where a tap reaches it: its
+    /// centre, or the nearest part of it that is on screen and not under a bar or another element.
+    /// None: not_hittable, and nothing is sent.
     func point(_ spec: JSON?) throws -> (x: Double, y: Double) {
         guard let spec else { throw ActionFailure(message: "no target given", delivery: .notSent) }
-        if let a = spec.array, a.count >= 2, let x = a[0].double, let y = a[1].double { return (x, y) }
+        if let a = spec.array, a.count >= 2, let x = a[0].double, let y = a[1].double { return try onScreen((x, y)) }
         if case .object = spec {
-            if let ref = spec["ref"]?.int { return try element(ref).frame.centre }
-            if let x = spec["x"]?.double, let y = spec["y"]?.double { return (x, y) }
+            if let ref = spec["ref"]?.int { return try reachable(ref) }
+            if let x = spec["x"]?.double, let y = spec["y"]?.double { return try onScreen((x, y)) }
             throw ActionFailure(message: "a target is a number, [x, y], {ref} or {x, y}", delivery: .notSent)
         }
         guard let ref = spec.int else { throw ActionFailure(message: "a target is a number, [x, y], {ref} or {x, y}", delivery: .notSent) }
-        return try element(ref).frame.centre
+        return try reachable(ref)
+    }
+
+    func onScreen(_ p: (x: Double, y: Double)) throws -> (x: Double, y: Double) {
+        if let size, p.x < 0 || p.y < 0 || p.x > size.width || p.y > size.height {
+            throw ActionFailure(message: "not_hittable: [\(Int(p.x)), \(Int(p.y))] is off the screen (\(Int(size.width))x\(Int(size.height)) points); nothing was sent", delivery: .notSent)
+        }
+        return p
+    }
+
+    func reachable(_ ref: Int) throws -> (x: Double, y: Double) {
+        let e = try element(ref)
+        if e.fromPicture || size == nil { return e.frame.centre }
+        let layout = self.layout
+        guard let p = layout.hitPoint(e) else {
+            throw ActionFailure(message: "not_hittable: element \(ref) \(e.type) \"\(e.text.prefix(40))\": \(layout.unreachable(e)); nothing was sent. Bring it into view first ({scroll_to: {ref: \(ref)}}) or touch a point you can see on the screenshot", delivery: .notSent)
+        }
+        return p
+    }
+
+    /// " at [x, y]" when the point touched is not the element's centre (its centre is off screen or covered).
+    func offCentre(_ spec: JSON?, _ p: (x: Double, y: Double)) -> String {
+        guard let spec, let ref = spec.int ?? spec["ref"]?.int, let e = refs[ref] else { return "" }
+        let c = e.frame.centre
+        return abs(c.x - p.x) < 0.5 && abs(c.y - p.y) < 0.5 ? "" : " at [\(Int(p.x.rounded())), \(Int(p.y.rounded()))] (its centre is off screen or covered)"
     }
 
     func element(_ ref: Int) throws -> Element {
@@ -30,9 +58,11 @@ extension Computer {
         return e
     }
 
+    /// Where a swipe goes: inside the element named, or the biggest list on screen, less the bars
+    /// and anything drawn over it (a reply bar), so the finger lands on what scrolls.
     func area(_ ref: JSON?, _ screen: ScreenSize) throws -> Rect {
-        guard let ref, let n = ref.int ?? ref["ref"]?.int else { return Rect(x: 0, y: 0, width: screen.width, height: screen.height) }
-        return try element(n).frame
+        let named = try ref.flatMap { r -> Element? in try (r.int ?? r["ref"]?.int).map(element) }
+        return Layout(all: lastAll, screen: screen).swipeArea(named)
     }
 
     func swipePath(_ area: Rect, _ direction: String, _ distance: String = "long") throws -> (Double, Double, Double, Double) {
@@ -49,8 +79,22 @@ extension Computer {
         return (cx - d.0 * half, cy - d.1 * half, cx + d.0 * half, cy + d.1 * half)
     }
 
-    func drag(_ path: (Double, Double, Double, Double), seconds: Double) async throws {
-        _ = try await runner.call("POST", "/wda/dragfromtoforduration", ["fromX": .number(path.0), "fromY": .number(path.1), "toX": .number(path.2), "toY": .number(path.3), "duration": .number(max(0.05, seconds))], timeout: 4 + seconds)
+    /// One touch from a point to another: down, `hold` seconds still, moving at a steady speed for
+    /// `seconds`, then `rest` seconds still before lifting (no rest = a flick that keeps a list
+    /// moving; a rest = the list stops where the finger stopped). XCTest's own press-drag through
+    /// WDA's pressAndDragWithVelocity; its time limit is the gesture's own and a slow answer is not
+    /// taken as the runner being gone.
+    func gesture(_ path: (Double, Double, Double, Double), seconds: Double, hold: Double = 0, rest: Double = 0, until: Double) async throws {
+        let distance = max(1, hypot(path.2 - path.0, path.3 - path.1))
+        let velocity = distance / max(0.05, seconds)
+        let expected = hold + distance / velocity + rest
+        let timeout = max(1, min(expected + 5, until - now() - 0.2))
+        do {
+            _ = try await runner.call("POST", "/wda/pressAndDragWithVelocity", ["fromX": .number(path.0), "fromY": .number(path.1), "toX": .number(path.2), "toY": .number(path.3), "pressDuration": .number(hold), "holdDuration": .number(rest), "velocity": .number(velocity.rounded())], timeout: timeout, countsAsMiss: false)
+        } catch let e as RunnerError where e.code == "unknown command" || e.code == "unknown method" {
+            // A runner older than pressAndDragWithVelocity.
+            _ = try await runner.call("POST", "/wda/dragfromtoforduration", ["fromX": .number(path.0), "fromY": .number(path.1), "toX": .number(path.2), "toY": .number(path.3), "duration": .number(max(0.05, hold))], timeout: timeout, countsAsMiss: false)
+        }
     }
 
     func tap(_ p: (x: Double, y: Double)) async throws {
@@ -60,8 +104,9 @@ extension Computer {
     /// Returns the action's kind (for the settle pause) and what it did.
     func perform(_ action: JSON, until: Double) async throws -> (String, String) {
         if let spec = action["tap"] {
-            try await tap(try point(spec))
-            return ("tap", "tap \(describe(action))")
+            let p = try point(spec)
+            try await tap(p)
+            return ("tap", "tap \(describe(action))\(offCentre(spec, p))")
         }
         if let text = action["type"]?.text {
             if let ref = action["ref"] {
@@ -83,8 +128,8 @@ extension Computer {
             let direction = spec.string ?? spec["direction"]?.string ?? ""
             let screen = try await screenSize(until: until)
             let path = try swipePath(try area(spec["in"] ?? action["in"], screen), direction, spec["distance"]?.string ?? "long")
-            try await drag(path, seconds: 0.3)
-            return ("swipe", "swipe \(direction)")
+            try await gesture(path, seconds: 0.25, until: until)
+            return ("swipe", "swipe \(direction) from [\(Int(path.0)), \(Int(path.1))] to [\(Int(path.2)), \(Int(path.3))]")
         }
         if let spec = action["scroll_to"] {
             return ("scroll_to", "scroll_to \(spec.serialized()): \(try await scrollTo(spec, until: until))")
@@ -103,8 +148,9 @@ extension Computer {
                 from = try point(spec["from"]); to = try point(spec["to"])
             }
             let ms = min(3000, max(100, spec["ms"]?.double ?? 400))
-            try await drag((from.x, from.y, to.x, to.y), seconds: ms / 1000)
-            return ("drag", "drag \(spec.serialized())")
+            let hold = min(3000, max(0, spec["hold_ms"]?.double ?? 0))
+            try await gesture((from.x, from.y, to.x, to.y), seconds: ms / 1000, hold: hold / 1000, rest: 0.15, until: until)
+            return ("drag", "drag from [\(Int(from.x)), \(Int(from.y))] to [\(Int(to.x)), \(Int(to.y))] in \(Int(ms)) ms\(hold > 0 ? " after holding \(Int(hold)) ms" : "")")
         }
         if let spec = action["pinch"] {
             let p = try point(spec)
@@ -145,6 +191,9 @@ extension Computer {
             _ = try await runner.call("POST", "/wda/apps/launch", ["bundleId": .string(bundle)], timeout: 8)
             return ("launch", "launch \(bundle)\(fresh ? " (fresh)" : "")")
         }
+        if let spec = action["wait_until"] {
+            return ("wait_until", try await waitUntil(spec, until: until))
+        }
         if let ms = action["wait"]?.double {
             let seconds = min(ms / 1000, 3, max(0, until - now()))
             await sleep(seconds: seconds)
@@ -170,8 +219,9 @@ extension Computer {
         _ = try await runner.call("POST", "/wda/keys", ["value": .array(keys.map(JSON.string))], timeout: 3 + 0.06 * Double(keys.count))
     }
 
-    /// Swipes until the target is fully on screen, with a tree read after each swipe. Stops at the
-    /// end of the list, at max_swipes, or when the action time runs out.
+    /// Swipes until the target is fully on screen and not under a bar, with a tree read after each
+    /// swipe. The finger stops before lifting, so the list does not coast past the target. Stops at
+    /// the end of the list, at max_swipes, or when the action time runs out.
     func scrollTo(_ spec: JSON, until: Double) async throws -> String {
         let screen = try await screenSize(until: until)
         let wantedKey: String? = try spec["ref"]?.int.map { try element($0).key }
@@ -180,22 +230,60 @@ extension Computer {
         let region = try area(spec["in"], screen)
         let fingerGoes = ["down": "up", "up": "down", "right": "left", "left": "right"][spec["direction"]?.string ?? "down"] ?? "up"
         let max = min(12, spec["max_swipes"]?.int ?? 6)
-        func onScreen(_ e: Element) -> Bool { e.frame.x >= 0 && e.frame.y >= 0 && e.frame.x + e.frame.width <= screen.width && e.frame.y + e.frame.height <= screen.height }
-        func hit(_ elements: [Element]) -> Element? {
-            elements.first { e in onScreen(e) && (wantedKey.map { e.key == $0 } ?? e.text.lowercased().contains(wantedText!.lowercased())) }
+        func hit(_ all: [Element]) -> Element? {
+            let layout = Layout(all: all, screen: screen)
+            return all.first { e in
+                guard wantedKey.map({ e.key == $0 }) ?? (!e.text.isEmpty && e.text.lowercased().contains(wantedText!.lowercased())) else { return false }
+                let f = e.frame
+                guard f.x >= 0, f.y >= 0, f.maxX <= screen.width, f.maxY <= screen.height else { return false }
+                let c = f.centre
+                return !layout.covers(e).contains { $0.frame.contains(c) }
+            }
         }
-        var elements = lastElements, swipes = 0, last: String?
-        while hit(elements) == nil, swipes < max, until - now() > 0.9 {
-            try await drag(try swipePath(region, fingerGoes), seconds: 0.25)
+        var all = lastAll, swipes = 0, last: String?
+        while hit(all) == nil, swipes < max, until - now() > 0.9 {
+            try await gesture(try swipePath(region, fingerGoes), seconds: 0.3, rest: 0.1, until: until)
             swipes += 1
-            await sleep(seconds: 0.25)
+            await sleep(seconds: 0.15)
             guard let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(1.5, until - now() - 0.2))) else { continue }
             let signature = seen.elements.map { "\($0.key)@\(Int($0.frame.y))" }.joined(separator: ";")
             if signature == last { return "\(swipes) swipes, not found: the list stopped moving" }
             last = signature
-            elements = seen.elements
+            all = seen.elements
         }
-        if let found = hit(elements) { return "\(swipes) swipes, found at [\(Int(found.frame.x)),\(Int(found.frame.y))]" }
+        if let found = hit(all) { return "\(swipes) swipes, found at \(found.frame.described)" }
         return "\(swipes) swipes, not found\(swipes >= max ? " within \(max) swipes" : "")"
+    }
+
+    /// Reads the tree every quarter second until the text is there (or gone), or the screen holds still
+    /// for two reads in a row. Not finding it is a fact, not a failure: the model decides.
+    func waitUntil(_ spec: JSON, until: Double) async throws -> String {
+        let text = spec.string ?? spec["text"]?.string
+        let gone = spec["gone"]?.bool ?? false
+        let settled = spec["settled"]?.bool ?? (spec.string == "settled")
+        guard settled || (text != nil && !text!.isEmpty) else { throw ActionFailure(message: "wait_until takes text, {text, gone?: true, ms?} or {settled: true, ms?}", delivery: .notSent) }
+        let started = now()
+        let limit = Swift.min(started + Swift.min(10, Swift.max(0.2, (spec["ms"]?.double ?? 3000) / 1000)), until)
+        let screen = size ?? ScreenSize(width: 10_000, height: 10_000)
+        let what = settled && text == nil ? "the screen held still" : "\"\(text!.prefix(40))\" \(gone ? "was gone" : "appeared")"
+        var last: String?
+        var reads = 0
+        while now() < limit {
+            if let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(1.5, limit - now()))) {
+                reads += 1
+                let elements = listable(seen.elements, screen)
+                let ms = Int(((now() - started) * 1000).rounded())
+                if settled && text == nil {
+                    let signature = elements.map { "\($0.key)@\($0.frame.described)" }.joined(separator: ";")
+                    if signature == last { return "wait_until: \(what) after \(ms) ms" }
+                    last = signature
+                } else if let text {
+                    let present = elements.contains { $0.text.lowercased().contains(text.lowercased()) }
+                    if present != gone { return "wait_until: \(what) after \(ms) ms" }
+                }
+            }
+            await sleep(seconds: Swift.min(0.25, Swift.max(0, limit - now())))
+        }
+        return "wait_until: not seen within \(Int(((limit - started) * 1000).rounded())) ms that \(what) (\(reads) reads)"
     }
 }
