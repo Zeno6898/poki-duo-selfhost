@@ -46,9 +46,13 @@ set_key() { plutil -replace "$1" -string "$2" "$PLIST"; }
 set_key CFBundleDisplayName "Poki Runner"
 set_key UILaunchStoryboardName LaunchScreen
 set_key UIMainStoryboardFile RunnerInfo
-if /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest' "$PLIST" >/dev/null 2>&1; then
-  echo "note: the host declares scenes; UIMainStoryboardFile may be ignored" >&2
-  /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest' "$PLIST" >&2
+# The XCTest host declares a scene (delegate _XCTRunnerAppDelegate), so UIKit takes the storyboard from
+# the scene configuration, not UIMainStoryboardFile.
+SCENE=":UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleApplication:0"
+if /usr/libexec/PlistBuddy -c "Print $SCENE" "$PLIST" >/dev/null 2>&1; then
+  /usr/libexec/PlistBuddy -c "Delete $SCENE:UISceneStoryboardFile" "$PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add $SCENE:UISceneStoryboardFile string RunnerInfo" "$PLIST"
+  /usr/libexec/PlistBuddy -c "Print :UIApplicationSceneManifest" "$PLIST"
 fi
 plutil -lint "$PLIST"
 echo "branded $APP"
