@@ -298,8 +298,9 @@ struct LoopbackContent: View {
                 Text(monitor.detail).font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
-            if let at = monitor.checkedAt {
-                Text(at, style: .relative).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+            if monitor.state != .checking {
+                Image(systemName: "dot.radiowaves.left.and.right").font(.caption).foregroundStyle(.tertiary)
+                    .symbolEffect(.pulse, options: .repeating).accessibilityLabel("Checked live")
             }
         }
         .onAppear { monitor.resume() }

@@ -32,6 +32,13 @@ final class LoopbackMonitor {
         path.start(queue: DispatchQueue(label: "poki.path"))
     }
 
+    private static func same(_ a: State, _ b: State) -> Bool {
+        switch (a, b) {
+        case (.working(let x), .working(let y)): abs(x - y) < 100
+        default: a == b
+        }
+    }
+
     var isWorking: Bool { if case .working = state { true } else { false } }
 
     /// Checks every 3 s until `pause`.
@@ -49,11 +56,10 @@ final class LoopbackMonitor {
         Task {
             let result = await probe(label: "loopback", host: "10.7.0.1", port: 62078, timeout: 1.5)
             running = false
-            checkedAt = Date()
-            switch result.outcome {
-            case "connected": state = .working(ms: result.milliseconds)
-            default: state = loopbackInterface() == nil ? .off : .noAnswer
-            }
+            let next: State = result.outcome == "connected" ? .working(ms: result.milliseconds) : loopbackInterface() == nil ? .off : .noAnswer
+            // Only a change is published, so the screens are not redrawn every 3 s (a redraw while
+            // the person drags a list makes scrolling stutter).
+            if !Self.same(next, state) { state = next; checkedAt = Date() }
         }
     }
 

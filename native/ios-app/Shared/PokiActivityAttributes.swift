@@ -28,6 +28,8 @@ struct PokiActivityAttributes: ActivityAttributes {
         var steps: [Step] = []
         /// During setup: which step the person is on ("2 of 6") and what to do in Settings.
         var guide: Guide?
+        /// When the agent's current run of steps began, for the elapsed time on the Live Activity.
+        var since: Date?
     }
     struct Step: Codable, Hashable {
         var text: String

@@ -259,7 +259,7 @@ public final class PokiCore: @unchecked Sendable {
     func call(_ name: String, _ args: JSON) async -> ToolResult {
         if name == "status" { return status() }
         guard name == "look" || name == "do" else { return ToolResult(text: "unknown tool \(name); the tools are look, do and status", jpeg: nil, isError: true) }
-        let activity = ToolActivity(id: UUID().uuidString, name: name, summary: name == "do" ? (args["actions"]?.array ?? []).map(computer.describe).joined(separator: ", ") : "look", started: Date())
+        let activity = ToolActivity(id: UUID().uuidString, name: name, summary: name == "do" ? computer.labels(args["actions"]?.array ?? []) : "Look at the screen", started: Date())
         // One tool call at a time per phone; a second waits briefly, then says what the first is doing.
         guard await gate.enter(waiting: config.busyWait) else {
             return ToolResult(text: "busy: another call is still running (\(gate.current ?? "a tool")); nothing was sent. Try again in a moment.", jpeg: nil, isError: true)

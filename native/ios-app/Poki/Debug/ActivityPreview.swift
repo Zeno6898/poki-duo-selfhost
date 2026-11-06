@@ -10,10 +10,10 @@ struct ActivityPreview: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(name).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
                         LockScreenView(state: state)
-                            .padding(16)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(white: 0.12), in: .rect(cornerRadius: 24, style: .continuous))
+                            .padding(.horizontal, 18).padding(.vertical, 16)
+                            .background(Brand.night.opacity(0.92), in: .rect(cornerRadius: 24, style: .continuous))
                             .environment(\.colorScheme, .dark)
+                        IslandPreview(state: state)
                     }
                 }
             }
@@ -24,17 +24,38 @@ struct ActivityPreview: View {
     }
 
     static let samples: [(String, PokiState)] = {
-        var working = PokiState(phase: .working, headline: "tap 'Like', swipe up", thumbnailVersion: 0)
-        working.app = "X"
-        working.steps = [.init(text: "launch com.atebits.Tweetie2", ok: true), .init(text: "tap 'Replies'", ok: true), .init(text: "tap [212, 640]", ok: false)]
-        var standing = PokiState(phase: .idle, headline: "On. Waiting for an agent", thumbnailVersion: 0)
+        var working = PokiState(phase: .working, headline: "Tap “Send”", thumbnailVersion: 0)
+        working.app = "WeChat"
+        working.since = Date().addingTimeInterval(-42)
+        working.steps = [.init(text: "Open WeChat", ok: true), .init(text: "Tap “Search”, then type “Mom”", ok: true), .init(text: "Tap at 212, 640", ok: false)]
+        var standing = PokiState(phase: .idle, headline: "Waiting for an agent", thumbnailVersion: 0)
         standing.runnerPaused = true
-        var pairing = PokiState(phase: .pairing, headline: "Pairing code", thumbnailVersion: 0)
+        var pairing = PokiState(phase: .pairing, headline: "Pairing", thumbnailVersion: 0)
         pairing.pin = "482913"
         var setup = PokiState(phase: .setup, headline: "Setting up Poki", thumbnailVersion: 0)
         setup.guide = .init(number: 2, count: 6, title: SetupStep.developerMode.title, hint: SetupStep.developerMode.hint)
-        var approval = PokiState(phase: .approval, headline: "Approve: send message", thumbnailVersion: 0)
-        approval.approval = PendingApproval(id: "a", app: "Messages", summary: "type 'On my way' and tap Send", expires: Date().addingTimeInterval(90))
-        return [("Working", working), ("Standing by", standing), ("Pairing", pairing), ("Setup", setup), ("Approval", approval)]
+        var approval = PokiState(phase: .approval, headline: "Allow this step?", thumbnailVersion: 0)
+        approval.app = "Messages"
+        approval.approval = PendingApproval(id: "a", app: "Messages", summary: "Type “On my way”, then tap “Send”", expires: Date().addingTimeInterval(20))
+        return [("Working", working), ("Idle", standing), ("Pairing", pairing), ("Setup", setup), ("Approval", approval)]
     }()
+}
+
+/// The expanded Dynamic Island, drawn the way iOS lays out its regions.
+private struct IslandPreview: View {
+    var state: PokiState
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                HStack(spacing: 8) { BearMark(size: 30); Text("Poki").font(.subheadline.weight(.semibold)) }
+                Spacer()
+                StatusPill(state: state)
+            }
+            IslandBody(state: state)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 22).padding(.vertical, 18)
+        .background(.black, in: .rect(cornerRadius: 44, style: .continuous))
+        .environment(\.colorScheme, .dark)
+    }
 }

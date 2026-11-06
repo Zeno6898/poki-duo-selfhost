@@ -24,8 +24,10 @@ final class AppModel {
     /// The runner is stopped until the next agent request (idle, or the owner tapped Stop runner).
     private(set) var runnerPaused = false
     /// Stop the runner after this long without agent activity; 0 never stops it.
-    var idleStopSeconds: Int = UserDefaults.standard.object(forKey: "idleStopSeconds.v2") as? Int ?? 60 {
-        didSet { UserDefaults.standard.set(idleStopSeconds, forKey: "idleStopSeconds.v2") }
+    /// Two minutes by default: an agent can think for a minute between steps of a long task, and the
+    /// runner must not stop (and the banner flash) in the middle of it.
+    var idleStopSeconds: Int = UserDefaults.standard.object(forKey: "idleStopSeconds.v3") as? Int ?? 120 {
+        didSet { UserDefaults.standard.set(idleStopSeconds, forKey: "idleStopSeconds.v3"); log.add("runner", "idle stop set to \(idleStopSeconds) s") }
     }
     /// Poki was on when it last ran; it turns itself on again at launch.
     private var wantsOn: Bool {
@@ -43,6 +45,7 @@ final class AppModel {
     private let launcher: RunnerLauncher
     private let pairer: DevicePairing
     private let activity = ActivityController()
+    let log = AppLog.shared
     private var eventsTask: Task<Void, Never>?
 
     init() {
@@ -56,7 +59,9 @@ final class AppModel {
         // answer is started again (each restart costs seconds and flashes the automation banner).
         host.onRestart {
             Task.detached {
-                if !(await RunnerProbe.answers()) { launcher.restart() }
+                let answers = await RunnerProbe.answers()
+                await MainActor.run { AppLog.shared.add("runner", answers ? "PokiCore asked for a restart; the runner answers, so it was kept" : "PokiCore asked for a restart; the runner does not answer: restarting it") }
+                if !answers { launcher.restart() }
             }
         }
         host.onWake { [weak self] in Task { @MainActor in self?.wakeRunner() } }
@@ -81,6 +86,7 @@ final class AppModel {
     /// iOS's automation banner up for half a minute. iOS gives a few seconds for this.
     private func appWillTerminate() {
         guard sessionOn else { return }
+        log.add("app", "Poki is closing: ending the runner")
         launcher.stop()
         Thread.sleep(forTimeInterval: 2.5)
     }
@@ -98,7 +104,9 @@ final class AppModel {
             Task { await diskImage.download() }
             return
         }
+        log.add("session", "turned on")
         background.start()
+        ApprovalNotice.requestPermission()
         stopGuide()
         activity.start(deviceName: deviceName)
         sessionOn = true
@@ -117,8 +125,10 @@ final class AppModel {
     func stopSession() {
         guard sessionOn else { return }
         wantsOn = false
+        log.add("session", "turned off: ending the runner")
         core.stop()
         launcher.stop()
+        confirmRunnerEnded()
         idleTimer?.invalidate(); idleTimer = nil
         runnerPaused = false; host.setPaused(false)
         eventsTask?.cancel(); eventsTask = nil
@@ -143,8 +153,27 @@ final class AppModel {
     /// next agent request starts it again. From the Stop runner button, the Live Activity, or idle.
     func pauseRunner(reason: String = "Stopped") {
         guard sessionOn, !runnerPaused, approvals.isEmpty else { return }
+        log.add("runner", "stopping: \(reason)")
         launcher.stop()
         standBy(reason: reason)
+        confirmRunnerEnded()
+    }
+
+    /// After a stop, checks that the runner really ended (and with it the automation banner). If it
+    /// still answers after 8 s, says so on the home screen and in the log instead of looking stopped.
+    private func confirmRunnerEnded() {
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            let alive = await RunnerProbe.answers()
+            guard let self else { return }
+            if alive, self.runnerPaused || !self.sessionOn {
+                self.log.add("runner", "still answering 8 s after Stop")
+                self.problem = "Poki Runner is still running after Stop. Swipe it away in the app switcher; the banner goes with it."
+            } else {
+                self.log.add("runner", alive ? "running again (an agent asked)" : "ended")
+                if self.problem?.hasPrefix("Poki Runner is still running") == true { self.problem = nil }
+            }
+        }
     }
 
     /// The runner is off and starts on the next agent request.
@@ -154,7 +183,7 @@ final class AppModel {
         host.update(runner: .starting("starting the runner"))
         host.setPaused(true)
         activityText = "Idle"
-        activity.update { $0.runnerPaused = true; $0.phase = .idle; $0.headline = "On. Waiting for an agent" }
+        activity.update { $0.runnerPaused = true; $0.phase = .idle; $0.headline = "Waiting for an agent"; $0.since = nil }
     }
 
     /// Starts a paused runner again (the next agent request, or the owner).
@@ -163,7 +192,8 @@ final class AppModel {
         runnerPaused = false
         host.setPaused(false)
         lastAgentActivity = Date()
-        activity.update { $0.runnerPaused = false; $0.phase = .working; $0.headline = "Starting the runner" }
+        log.add("runner", "an agent asked: starting the runner")
+        activity.update { $0.runnerPaused = false; $0.phase = .working; $0.headline = "Starting the runner"; $0.since = Date() }
         launchRunner()
     }
 
@@ -177,6 +207,7 @@ final class AppModel {
     private func runnerChanged(_ status: RunnerStatus) {
         // Events from a launcher that was stopped for idle are old news.
         guard !runnerPaused else { return }
+        if status != runner { log.add("runner", "\(status.state)\(status.detail.map { ": \($0)" } ?? "")") }
         runner = status
         host.update(runner: status.coreState)
         if status.state == "failed" {
@@ -191,32 +222,48 @@ final class AppModel {
     private func handle(_ event: ShellEvent) {
         switch event {
         case .relay(let status):
+            if status != relayStatus { log.add("relay", "\(status)") }
             relayStatus = status
         case .toolStarted(_, let summary):
             lastAgentActivity = Date()
             activityText = summary
-            activity.update { $0.phase = $0.approval == nil ? .working : .approval; $0.headline = summary }
+            log.add("agent", "started: \(summary)")
+            activity.update { state in
+                if state.approval == nil {
+                    if state.phase != .working || state.since == nil { state.since = Date() }
+                    state.phase = .working
+                }
+                state.headline = summary
+            }
         case .toolFinished(let summary, let delivery, let app, let thumbnail):
             lastAgentActivity = Date()
             lastAction = "\(summary) · \(delivery)"
             activityText = "Idle"
             let failed = delivery.hasPrefix("failed")
-            recentSteps.append(RecentStep(text: summary, detail: delivery, ok: !failed, at: Date()))
+            log.add("agent", "\(failed ? "failed" : "done"): \(summary) · \(delivery.prefix(160))")
+            let place = app.map { "In \($0)" }
+            let detail = failed ? ([place, "Didn't go through"].compactMap { $0 }.joined(separator: " · ")) : (place ?? "Done")
+            recentSteps.append(RecentStep(text: summary, detail: detail, ok: !failed, at: Date()))
             if recentSteps.count > 20 { recentSteps.removeFirst(recentSteps.count - 20) }
             activity.record(step: summary, ok: !failed)
             activity.update { state in
-                state.lastAction = "\(summary) · \(delivery)"
+                state.lastAction = summary
                 state.app = app ?? state.app
-                if state.approval == nil { state.phase = .idle; state.headline = "Waiting for the agent" }
+                if state.approval == nil { state.headline = "Waiting for the agent's next step" }
             }
             activity.setThumbnail(thumbnail)
         case .approvalRequested(let approval):
             approvals.append(approval)
-            activity.update { $0.phase = .approval; $0.approval = approval; $0.headline = "Approve: \(approval.summary)" }
+            log.add("approval", "requested \(approval.id) in \(approval.app): \(approval.summary)")
+            activity.update { $0.phase = .approval; $0.approval = approval; $0.headline = "Allow this step?" }
+            activity.alert(title: "Poki needs your OK", body: "\(approval.summary) in \(approval.app)")
+            ApprovalNotice.post(approval)
         case .approvalEnded(let id, _):
             approvals.removeAll { $0.id == id }
+            log.add("approval", "ended \(id): \(approved.map { $0 ? "approved" : "denied" } ?? "expired or replaced")")
+            ApprovalNotice.clear(id)
             activity.update { state in
-                if state.approval?.id == id { state.approval = nil; state.phase = .idle; state.headline = "Waiting for the agent" }
+                if state.approval?.id == id { state.approval = nil; state.phase = .working; state.headline = approved == true ? "Approved. Continuing" : "Not allowed" }
             }
         }
     }

@@ -48,7 +48,7 @@ final class ActivityController {
     func end() {
         guard let activity else { return }
         self.activity = nil
-        state.steps = []; state.guide = nil; state.pin = nil
+        state.steps = []; state.guide = nil; state.pin = nil; state.since = nil
         Task { await activity.end(nil, dismissalPolicy: .immediate) }
     }
 
@@ -57,6 +57,16 @@ final class ActivityController {
         guard let activity else { return }
         let content = content()
         Task { await activity.update(content) }
+    }
+
+    /// An update that lights up the screen, expands the Dynamic Island and plays a sound: for an
+    /// approval the person has to see. Without a running Live Activity, ApprovalNotice's notification
+    /// does the job.
+    func alert(title: String, body: String) {
+        guard let activity else { return }
+        let content = content()
+        let alert = AlertConfiguration(title: LocalizedStringResource(stringLiteral: title), body: LocalizedStringResource(stringLiteral: body), sound: .default)
+        Task { await activity.update(content, alertConfiguration: alert) }
     }
 
     /// Writes a thumbnail, at most about 160 points wide, to the App Group container for the widget.
