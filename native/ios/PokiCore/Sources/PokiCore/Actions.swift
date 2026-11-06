@@ -122,7 +122,8 @@ extension Computer {
             }
             // What the field holds now, so the model sees at once whether the text arrived whole.
             let reads = await fieldValue(timeout: min(1.5, max(0.3, until - now() - 0.2)))
-            let readBack = reads.map { hidden ? "; the field now holds \($0.count) characters" : "; the field now reads \"\($0.count > 200 ? String($0.prefix(190)) + "…" : $0)\"" } ?? ""
+            let readBack = reads.map { hidden ? "; the field now holds \($0.count) characters" : "; the field now reads \"\($0.count > 200 ? String($0.prefix(190)) + "…" : $0)\"" }
+                ?? "; the field could not be read back (no focused field answered in time), so check the elements or the picture"
             return ("type", "\(describe(action)) (\(via))\(readBack)")
         }
         if let key = action["key"]?.text {
@@ -182,7 +183,8 @@ extension Computer {
             let n = name.lowercased()
             switch n {
             case "lock", "power": _ = try await runner.call("POST", "/wda/lock", [:], timeout: 3)
-            case "home": _ = try await runner.call("POST", "/wda/homescreen", [:], timeout: 3)
+            // WDA serves the Home button only outside a session ("Unhandled endpoint" inside one).
+            case "home": _ = try await runner.raw("POST", "/wda/homescreen", [:], timeout: 3)
             default:
                 guard let wda = Self.buttons[n] else { throw ActionFailure(message: "button \(name) has no equivalent; use home, lock, volume_up or volume_down", delivery: .notSent) }
                 _ = try await runner.call("POST", "/wda/pressButton", ["name": .string(wda)], timeout: 3)
@@ -339,8 +341,11 @@ extension Computer {
         let what = settled && text == nil ? "the screen held still" : "\"\(text!.prefix(40))\" \(gone ? "was gone" : "appeared")"
         var last: String?
         var reads = 0
-        while now() < limit {
-            if let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(1.5, limit - now()))) {
+        // A read takes as long as the runner needs (up to readTimeout, within the call's deadline), not
+        // the window: a phone that reads in 2.5 s still gets its answer. "Settled" compares two reads,
+        // so it gets a second one past the window when the deadline leaves room for it.
+        while now() < limit || (settled && text == nil && reads == 1 && until - now() > 1) {
+            if let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(config.readTimeout, until - now() - 0.3))) {
                 reads += 1
                 let elements = listable(seen.elements, screen)
                 let ms = Int(((now() - started) * 1000).rounded())
@@ -353,7 +358,7 @@ extension Computer {
                     if present != gone { return "wait_until: \(what) after \(ms) ms" }
                 }
             }
-            await sleep(seconds: Swift.min(0.25, Swift.max(0, limit - now())))
+            if now() < limit { await sleep(seconds: Swift.min(0.25, Swift.max(0, limit - now()))) }
         }
         return "wait_until: not seen within \(Int(((limit - started) * 1000).rounded())) ms that \(what) (\(reads) reads)"
     }

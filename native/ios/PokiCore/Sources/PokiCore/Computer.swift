@@ -124,6 +124,22 @@ final class Computer: @unchecked Sendable {
             }
         }
 
+        // No tree in time (a slow runner, a heavy keyboard): the text read from the picture stands in for
+        // it, numbered and tappable at its centre, so the model is never left with only a picture.
+        var pictureOnly = false
+        if !treeRead, let png = reading.png, size != nil {
+            let host = self.host
+            let left = min(2, until - now() - 0.6)
+            if left >= 0.3, let texts = (try? await withDeadline(left, "reading text from the picture", { await host.recognizeText(inPNG: png) })) ?? nil, !texts.isEmpty {
+                shown = texts.map { t in
+                    Element(type: "Text", label: t.text, value: nil, identifier: nil,
+                            frame: Rect(x: t.box.x * screen.width, y: t.box.y * screen.height, width: t.box.width * screen.width, height: t.box.height * screen.height),
+                            depth: 0, fromPicture: true)
+                }.sorted { ($0.frame.y, $0.frame.x) < ($1.frame.y, $1.frame.x) }
+                pictureOnly = true
+            }
+        }
+
         // Numbers: an element still there keeps its number (same text and frame first, then same text).
         let prior = treeRead ? listed : []
         var exact: [String: [Int]] = [:], loose: [String: [Int]] = [:]
@@ -164,6 +180,7 @@ final class Computer: @unchecked Sendable {
         } else {
             refs = [:]
             listed = []
+            for (i, e) in shown.enumerated() { refs[assigned[i]!] = e }
         }
 
         func line(_ ref: Int, _ e: Element, _ mark: String) -> String {
@@ -191,6 +208,7 @@ final class Computer: @unchecked Sendable {
             body = shown.indices.prefix(full ? 1000 : Self.lineLimit).map { line(assigned[$0]!, shown[$0], marks[$0]) }
             if !full, shown.count > Self.lineLimit { body.append("… \(shown.count - Self.lineLimit) more; full=true lists all") }
         }
+        if pictureOnly { heading = "elements (\(shown.count), read from the picture because the element tree did not come in time; a number taps the text's centre):" }
         if !collapsed.isEmpty, !full { heading += "  ([collapsed] = one element whose parts are not in the tree; full=true adds the text read from the picture inside it, or tap a point on the screenshot)" }
 
         var jpeg: Data?

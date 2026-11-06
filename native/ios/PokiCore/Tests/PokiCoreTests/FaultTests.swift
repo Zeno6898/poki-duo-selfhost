@@ -197,4 +197,73 @@ final class FaultTests: XCTestCase {
         _ = await core.call("look", [:])
         XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, 1, wda.sent.joined(separator: ", "))
     }
+
+    /// WDA serves requests one at a time, so a slow read makes the next ones time out too. That runner
+    /// is busy: it keeps its session and is not restarted while it still answers /status.
+    func testABusyRunnerIsNotRestartedWhileItStillAnswersStatus() async throws {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.3 }
+        core.runner.probeTimeout = 0.5
+        _ = await core.call("look", [:])
+        let slow: FakeWDA.Route = { _ in try await Task.sleep(nanoseconds: 2_000_000_000); return (200, ["value": .null]) }
+        for key in ["GET /source", "GET /screenshot", "GET /wda/activeAppInfo"] { wda.set(key, slow) }
+        let sessions = wda.sent.filter { $0 == "POST /session" }.count
+        _ = await core.call("look", [:])
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertEqual(host.restarts.value, 0, "a busy runner is left to finish")
+        XCTAssertGreaterThanOrEqual(wda.sent.filter { $0 == "GET /status" }.count, 1, "it was asked whether it is there")
+        wda.source([("Button", "General")])
+        for key in ["GET /screenshot", "GET /wda/activeAppInfo"] { wda.set(key) { _ in (200, ["value": .null]) } }
+        _ = await core.call("look", [:])
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, sessions, "the session is kept")
+    }
+
+    func testAWedgedRunnerThatAnswersNothingIsRestartedAfterTheProbe() async throws {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.3 }
+        core.runner.probeTimeout = 0.3
+        _ = await core.call("look", [:])
+        let stuck: FakeWDA.Route = { _ in try await Task.sleep(nanoseconds: 20_000_000_000); return (200, ["value": .null]) }
+        for key in ["GET /source", "GET /screenshot", "GET /wda/activeAppInfo", "GET /status"] { wda.set(key, stuck) }
+        _ = await core.call("look", [:])
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(host.restarts.value, 1, "no answer to /status either: the runner is started again")
+    }
+
+    /// Found on the simulator: WDA answers the Home button only outside a session.
+    func testHomeIsPressedOutsideTheSession() async {
+        let (core, wda, _) = makeCore()
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["button": "home"]]])
+        XCTAssertFalse(result.text.contains("not_sent"), result.text)
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /wda/homescreen" }.count, 1, wda.sent.joined(separator: ", "))
+    }
+
+    /// Found on the simulator: with a keyboard up the tree can take longer than a read waits. The text
+    /// in the picture is listed instead, numbered, and a number taps that text.
+    func testWithoutATreeTheTextInThePictureIsListedAndTappable() async {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.5 }
+        _ = await core.call("look", [:])
+        host.texts.value = [RecognizedText(text: "Continue", box: Rect(x: 0.25, y: 0.9, width: 0.5, height: 0.05))]
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 5_000_000_000); return (200, ["value": .null]) }
+        let look = await core.call("look", [:])
+        XCTAssertTrue(look.text.contains("read from the picture because the element tree did not come in time"), look.text)
+        XCTAssertTrue(look.text.contains("1 Text \"Continue\""), look.text)
+        wda.source([("Button", "Continue")])
+        let tap = await core.call("do", ["actions": [["tap": 1]]])
+        XCTAssertFalse(tap.text.contains("not_sent"), tap.text)
+        let body = wda.bodies("POST /wda/tap").last
+        XCTAssertEqual(body?["x"]?.double, 195)
+        XCTAssertEqual(body?["y"]?.double ?? 0, 0.925 * 844, accuracy: 0.5)
+    }
+
+    /// Found on the simulator: reads took 2.5 s, longer than a read inside wait_until was allowed, so
+    /// "settled" never saw two reads. Each read now gets the runner's time, and settled a second read.
+    func testWaitUntilSettledWorksWhenEachReadIsSlow() async {
+        let (core, wda, _) = makeCore { $0.readTimeout = 1.5; $0.toolDeadline = 8 }
+        _ = await core.call("look", [:])
+        let rows: [JSON] = [["type": "XCUIElementTypeButton", "label": "General", "rect": ["x": 16, "y": 100, "width": 358, "height": 44]]]
+        let root: JSON = ["type": "XCUIElementTypeApplication", "label": "Settings", "rect": ["x": 0, "y": 0, "width": 390, "height": 844], "children": .array(rows)]
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 900_000_000); return (200, ["value": root]) }
+        let result = await core.call("do", ["actions": [["wait_until": ["settled": true, "ms": 500]]]])
+        XCTAssertTrue(result.text.contains("wait_until: the screen held still after"), result.text)
+    }
 }

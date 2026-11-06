@@ -70,9 +70,15 @@ public final class Runner: @unchecked Sendable {
     public let url: URL
     let transport: HTTPTransport
     private let state = LockedBox<(session: String?, misses: Int)>((nil, 0))
-    /// Called after `unhealthyAfter` silent requests in a row.
+    /// Called after `unhealthyAfter` silent requests in a row: at once when the runner refused or
+    /// broke the connection, and only after a `GET /status` probe also went unanswered for
+    /// `probeTimeout` when the requests merely timed out. WDA serves every request on its main
+    /// thread, so one slow read (a big tree, a keyboard coming up) holds back all the others; that
+    /// runner is busy, not gone, and restarting it would cost the owner far more than waiting.
     var onUnhealthy: (@Sendable () -> Void)?
     var unhealthyAfter = 2
+    var probeTimeout: Double = 15
+    private let probing = LockedBox(false)
 
     public init(url: URL, transport: HTTPTransport = URLSessionTransport()) {
         self.url = url
@@ -100,10 +106,10 @@ public final class Runner: @unchecked Sendable {
             miss()
             throw RunnerError(message: "the runner is not running (connection refused at \(url.absoluteString)); it is being restarted", delivery: .notSent, silent: true)
         } catch let error as DeadlineExceeded {
-            if countsAsMiss { miss() }
+            if countsAsMiss { miss(timedOut: true) }
             throw RunnerError(message: error.description, delivery: .unknown, silent: true)
         } catch TransportError.timedOut {
-            if countsAsMiss { miss() }
+            if countsAsMiss { miss(timedOut: true) }
             throw RunnerError(message: "the runner did not answer \(method) \(Self.short(path)) within \(DeadlineExceeded.format(timeout))", delivery: .unknown, silent: true)
         } catch is CancellationError {
             throw CancellationError()
@@ -124,9 +130,21 @@ public final class Runner: @unchecked Sendable {
         return value
     }
 
-    private func miss() {
+    private func miss(timedOut: Bool = false) {
         let misses = state.update { s -> Int in s.misses += 1; return s.misses }
-        if misses == unhealthyAfter { onUnhealthy?() }
+        guard misses == unhealthyAfter else { return }
+        if !timedOut { onUnhealthy?(); return }
+        // Slow, not refused: ask whether it is still there before giving up on it. One probe at a time;
+        // it runs apart from the calls, which have already answered with what they had.
+        guard probing.update({ p -> Bool in defer { p = true }; return !p }) else { return }
+        Task { [weak self, transport, url, probeTimeout] in
+            let alive = (try? await withDeadline(probeTimeout + 0.5, "the runner's status") {
+                try await transport.send(method: "GET", url: url.appendingPathComponent("status"), body: nil, timeout: probeTimeout)
+            }).map { (200..<300).contains($0.status) } ?? false
+            guard let self else { return }
+            self.probing.value = false
+            if alive { self.state.update { $0.misses = 0 } } else { self.onUnhealthy?() }
+        }
     }
 
     func forgetSession() { state.update { $0.session = nil } }

@@ -13,6 +13,7 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
 
     init() {
         set("POST /session") { _ in (200, ["value": ["sessionId": "s1"]]) }
+        set("GET /status") { _ in (200, ["value": ["ready": true]]) }
         set("GET /wda/screen") { _ in (200, ["value": ["screenSize": ["width": 390, "height": 844]]]) }
         set("GET /screenshot") { _ in (200, ["value": .string(Data("png".utf8).base64EncodedString())]) }
         set("GET /wda/activeAppInfo") { _ in (200, ["value": ["bundleId": "com.apple.Preferences", "name": "Settings"]]) }
@@ -30,6 +31,8 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
         let root: JSON = ["type": "XCUIElementTypeApplication", "label": .string(app), "rect": ["x": 0, "y": 0, "width": 390, "height": 844], "children": .array(nodes.map(json))]
         set("GET /source") { _ in (200, ["value": root]) }
     }
+
+    static let sessionlessOnly: Set<String> = ["POST /wda/homescreen"]
 
     func set(_ key: String, _ route: @escaping Route) { lock.lock(); routes[key] = route; lock.unlock() }
 
@@ -52,9 +55,16 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
     func bodies(_ key: String) -> [JSON] { lock.lock(); defer { lock.unlock() }; return log.filter { "\($0.method) \($0.path)" == key }.compactMap(\.body) }
 
     func send(method: String, url: URL, body: Data?, timeout: Double) async throws -> (status: Int, body: Data) {
+        let inSession = url.path.hasPrefix("/session/")
         var path = url.path.replacingOccurrences(of: #"^/session/[^/]+"#, with: "", options: .regularExpression)
         if path.isEmpty { path = "/session" }
         let key = "\(method) \(path)"
+        // As in WDA 16.15.3 (FBCustomCommands.m): the Home button has no route inside a session.
+        if inSession, Self.sessionlessOnly.contains(key) {
+            let missing: JSON = ["value": ["error": "unknown command", "message": .string("Unhandled endpoint: \(url.path)")]]
+            _ = record(method, url.path, nil, "")
+            return (404, missing.data())
+        }
         let parsed = body.flatMap { try? JSON.parse($0) }
         let route = record(method, path, parsed, key)
         guard let route else { let missing: JSON = ["value": ["error": "unknown command", "message": .string("no route \(key)")]]; return (404, missing.data()) }
