@@ -37,9 +37,18 @@ for key in CFBundleIcons CFBundleIcons~ipad; do /usr/libexec/PlistBuddy -c "Dele
 
 xcrun ibtool --compile "$APP/LaunchScreen.storyboardc" "$HERE/LaunchScreen.storyboard" \
   --minimum-deployment-target "$MIN" --target-device iphone --target-device ipad --errors --warnings
+# The test host has no screen of its own (opened by hand it is black), so it gets this one as its main
+# interface: the bear and a line saying Poki starts it. It changes nothing for the test session.
+xcrun ibtool --compile "$APP/RunnerInfo.storyboardc" "$HERE/RunnerInfo.storyboard" \
+  --minimum-deployment-target "$MIN" --target-device iphone --target-device ipad --errors --warnings
 
 set_key() { plutil -replace "$1" -string "$2" "$PLIST"; }
 set_key CFBundleDisplayName "Poki Runner"
 set_key UILaunchStoryboardName LaunchScreen
+set_key UIMainStoryboardFile RunnerInfo
+if /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest' "$PLIST" >/dev/null 2>&1; then
+  echo "note: the host declares scenes; UIMainStoryboardFile may be ignored" >&2
+  /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest' "$PLIST" >&2
+fi
 plutil -lint "$PLIST"
 echo "branded $APP"

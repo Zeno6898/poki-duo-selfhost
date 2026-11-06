@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="22155" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="info">
+    <device id="retina6_12" orientation="portrait" appearance="light"/>
+    <dependencies>
+        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="22131"/>
+        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+    </dependencies>
+    <scenes>
+        <scene sceneID="scene">
+            <objects>
+                <viewController id="info" sceneMemberID="viewController">
+                    <view key="view" contentMode="scaleToFill" id="root">
+                        <rect key="frame" x="0.0" y="0.0" width="393" height="852"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                        <subviews>
+                            <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" image="LaunchBear" translatesAutoresizingMaskIntoConstraints="NO" id="bear">
+                                <rect key="frame" x="96.5" y="326" width="200" height="200"/>
+                            </imageView>
+                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="Poki Runner" textAlignment="center" lineBreakMode="tailTruncation" baselineAdjustment="alignBaselines" adjustsFontForContentSizeCategory="YES" translatesAutoresizingMaskIntoConstraints="NO" id="title">
+                                <fontDescription key="fontDescription" style="UICTFontTextStyleTitle1"/>
+                                <color key="textColor" white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
+                            </label>
+                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="Poki starts this for you. You don't need to open it." textAlignment="center" lineBreakMode="wordWrap" numberOfLines="0" baselineAdjustment="alignBaselines" adjustsFontForContentSizeCategory="YES" translatesAutoresizingMaskIntoConstraints="NO" id="note">
+                                <fontDescription key="fontDescription" style="UICTFontTextStyleBody"/>
+                                <color key="textColor" white="1" alpha="0.85" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
+                            </label>
+                        </subviews>
+                        <viewLayoutGuide key="safeArea" id="safe"/>
+                        <color key="backgroundColor" red="0.12549019607843137" green="0.51764705882352946" blue="0.99215686274509807" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                        <constraints>
+                            <constraint firstItem="bear" firstAttribute="centerX" secondItem="root" secondAttribute="centerX" id="cx"/>
+                            <constraint firstItem="bear" firstAttribute="centerY" secondItem="root" secondAttribute="centerY" id="cy"/>
+                            <constraint firstItem="bear" firstAttribute="width" constant="200" id="w"/>
+                            <constraint firstItem="bear" firstAttribute="height" constant="200" id="h"/>
+                            <constraint firstItem="title" firstAttribute="top" secondItem="bear" secondAttribute="bottom" constant="24" id="t1"/>
+                            <constraint firstItem="title" firstAttribute="centerX" secondItem="root" secondAttribute="centerX" id="t2"/>
+                            <constraint firstItem="note" firstAttribute="top" secondItem="title" secondAttribute="bottom" constant="8" id="n1"/>
+                            <constraint firstItem="note" firstAttribute="leading" secondItem="safe" secondAttribute="leading" constant="32" id="n2"/>
+                            <constraint firstItem="safe" firstAttribute="trailing" secondItem="note" secondAttribute="trailing" constant="32" id="n3"/>
+                        </constraints>
+                    </view>
+                </viewController>
+                <placeholder placeholderIdentifier="IBFirstResponder" id="first" userLabel="First Responder" sceneMemberID="firstResponder"/>
+            </objects>
+        </scene>
+    </scenes>
+    <resources>
+        <image name="LaunchBear" width="512" height="512"/>
+    </resources>
+</document>
