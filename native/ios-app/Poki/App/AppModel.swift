@@ -270,8 +270,8 @@ final class AppModel {
             approvals.append(approval)
             log.add("approval", "requested \(approval.id) in \(approval.app): \(approval.summary)")
             activity.update { $0.phase = .approval; $0.approval = approval; $0.headline = "Allow this step?" }
-            activity.alert(title: "Poki needs your OK", body: "\(approval.summary) in \(approval.app)")
-            ApprovalNotice.post(approval)
+            // The Live Activity pops up for it by itself; the notification is for when it is not running.
+            if !activity.isRunning { ApprovalNotice.post(approval) }
         case .approvalEnded(let id, _):
             approvals.removeAll { $0.id == id }
             log.add("approval", "ended \(id): \(approved.map { $0 ? "approved" : "denied" } ?? "expired or replaced")")
