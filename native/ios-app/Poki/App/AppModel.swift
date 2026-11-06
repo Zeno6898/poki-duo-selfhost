@@ -67,6 +67,7 @@ final class AppModel {
         host.onWake { [weak self] in Task { @MainActor in self?.wakeRunner() } }
         listenForApprovals()
         if !diskImage.isReady { Task { await diskImage.download() } }
+        if UserDefaults.standard.bool(forKey: "pokiSample") { loadSample() }
         NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.appWillTerminate() }
         }
@@ -92,6 +93,19 @@ final class AppModel {
     }
 
     var deviceName: String { UIDevice.current.name }
+
+    /// `-pokiSample YES`: sample steps and an approval, only for the build's screenshots of the home
+    /// screen. Nothing is started.
+    private func loadSample() {
+        let now = Date()
+        recentSteps = [
+            RecentStep(text: "Open WeChat", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-70)),
+            RecentStep(text: "Tap “Search”, then type “Mom”", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-52)),
+            RecentStep(text: "Tap at 212, 640", detail: "In WeChat · Didn't go through", ok: false, at: now.addingTimeInterval(-30)),
+            RecentStep(text: "Type “On my way”", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-12)),
+        ]
+        approvals = [PendingApproval(id: "sample", app: "WeChat", summary: "Tap “Send”", expires: now.addingTimeInterval(45))]
+    }
 
     // MARK: Session
 
