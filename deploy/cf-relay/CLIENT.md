@@ -17,6 +17,8 @@ Open `wss://pokimcp.zheha.nz/v1/<label>/connect`.
    `access` holds at most 8 hashes, one per secret that is not revoked.
 3. The relay answers `{"t":"ready","max_body":4194304,"req_timeout_ms":60000}`. Use these numbers rather than assuming them.
 
+If the upgrade itself is refused, nothing reached the phone's relay: a well-formed label that no phone holds gets `404` on the MCP path. While `ORIGIN_FALLBACK=1` is set on pokimcp.zheha.nz, a malformed label (not 52 lowercase base32 characters) is not the Worker's, so it falls through to the old tunnel's Access check and gets a bare `403`. Treat 403, 404 and 401 as "wrong URL or wrong host" and do not retry quickly.
+
 Close codes:
 - `4401`: the key does not match the label, or the signature is wrong.
 - `4000`: a newer connection for this label took over.
@@ -53,7 +55,7 @@ Answer each one exactly once:
 3. The client runs OAuth on its own: it discovers the metadata, registers itself and opens the authorize page. The relay asks the connected phone whether it knows this secret and grants at once. There is no password and no page to click through, because the URL itself is the credential. The phone must be online, otherwise the page says so.
 4. The client now calls tools, and each call arrives at the phone as a `req`. To disconnect a client, the user revokes its secret in Poki.
 
-Approving each new client on the phone, with a prompt that names the client, would need a v2 frame pair. DEPLOY.md has the proposal.
+Approving each new client on the phone, with a prompt that names the client, would need a v2 frame pair. [APPROVAL-v2.md](APPROVAL-v2.md) has the proposal.
 
 ## Trying it without a phone
 

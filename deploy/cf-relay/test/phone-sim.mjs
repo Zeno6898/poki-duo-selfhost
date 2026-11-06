@@ -11,6 +11,8 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
+// Every HTTP call gives up after 20 s, so --check fails instead of hanging behind a proxy that never answers.
+const fetch = (url, options = {}) => globalThis.fetch(url, { signal: AbortSignal.timeout(20_000), ...options });
 const origin = (process.argv[2] ?? '').replace(/\/$/, '');
 const check = process.argv.includes('--check');
 const stateFile = process.env.PHONE_SIM_STATE ?? 'phone-sim.json';
@@ -67,6 +69,8 @@ function connect() {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${origin.replace(/^http/, 'ws')}/v1/${label}/connect`);
     let lastPong = Date.now();
+    // Fail fast when the upgrade is refused (e.g. 401 from Cloudflare Access) or never answers.
+    const handshake = setTimeout(() => { reject(new Error('no ready frame within 15 s')); ws.close(); }, 15_000);
     const keepalive = setInterval(() => {
       if (Date.now() - lastPong > 60_000) ws.close();
       else if (ws.readyState === WebSocket.OPEN) ws.send('ping');
@@ -78,6 +82,7 @@ function connect() {
         const signature = sign(null, Buffer.concat([Buffer.from(`poki-relay-v1:${label}:`), Buffer.from(frame.nonce, 'base64')]), privateKey);
         ws.send(JSON.stringify({ t: 'hello', v: 1, key: raw.toString('base64'), sig: signature.toString('base64'), access, app: 'phone-sim' }));
       } else if (frame.t === 'ready') {
+        clearTimeout(handshake);
         resolve(ws);
       } else if (frame.t === 'req') {
         let answer;
@@ -87,10 +92,11 @@ function connect() {
     });
     ws.addEventListener('close', event => {
       clearInterval(keepalive);
+      clearTimeout(handshake);
       reject(new Error(`closed ${event.code} ${event.reason}`));
       if (!check) { console.error(`phone-sim: connection closed (${event.code}); reconnecting in 2 s`); setTimeout(() => connect().catch(() => {}), 2000); }
     });
-    ws.addEventListener('error', () => {});
+    ws.addEventListener('error', event => { clearTimeout(handshake); reject(new Error(`connect failed: ${event.message ?? 'websocket error'}`)); });
   });
 }
 
@@ -130,7 +136,7 @@ async function asClient() {
   expect(echo.json.result?.content?.[0]?.text === 'phone-sim echo: hello', `tools/call round trip (${echo.ms} ms)`);
 }
 
-const ws = await connect();
+const ws = await connect().catch(error => { console.error(`phone-sim: ${error.message}`); process.exit(1); });
 console.log(`phone-sim: connected as ${label}`);
 console.log(`connector URL: ${connectorUrl}`);
 if (check) {
