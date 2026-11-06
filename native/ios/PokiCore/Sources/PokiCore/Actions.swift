@@ -113,8 +113,17 @@ extension Computer {
                 try await tap(try point(ref))
                 await sleep(seconds: 0.25)
             }
-            try await type(text, clear: action["clear"]?.bool ?? false)
-            return ("type", describe(action))
+            let hidden = describe(action).hasSuffix("(hidden)")
+            let via = action["via"]?.string == "paste" ? "pasted" : "typed"
+            if via == "pasted" {
+                try await paste(text, clear: action["clear"]?.bool ?? false, until: until)
+            } else {
+                try await type(text, clear: action["clear"]?.bool ?? false)
+            }
+            // What the field holds now, so the model sees at once whether the text arrived whole.
+            let reads = await fieldValue(timeout: min(1.5, max(0.3, until - now() - 0.2)))
+            let readBack = reads.map { hidden ? "; the field now holds \($0.count) characters" : "; the field now reads \"\($0.count > 200 ? String($0.prefix(190)) + "…" : $0)\"" } ?? ""
+            return ("type", "\(describe(action)) (\(via))\(readBack)")
         }
         if let key = action["key"]?.text {
             let k = key.lowercased()
@@ -219,6 +228,68 @@ extension Computer {
         _ = try await runner.call("POST", "/wda/keys", ["value": .array(keys.map(JSON.string))], timeout: 3 + 0.06 * Double(keys.count))
     }
 
+    /// The focused field's id and value, or nil when nothing is focused or the runner does not say.
+    func focusedField(timeout: Double) async -> (id: String, value: String?)? {
+        guard let active = try? await runner.call("GET", "/element/active", timeout: timeout, countsAsMiss: false),
+              let id = active["ELEMENT"]?.string ?? active["element-6066-11e4-a52e-4f735466cecf"]?.string else { return nil }
+        let value = try? await runner.call("GET", "/element/\(id)/attribute/value", timeout: timeout, countsAsMiss: false)
+        return (id, value?.string)
+    }
+
+    func fieldValue(timeout: Double) async -> String? {
+        await focusedField(timeout: timeout / 2)?.value
+    }
+
+    /// Words of the edit menu's Paste item in the languages iOS ships most.
+    static let pasteWords = ["paste", "粘贴", "貼上", "貼り付け", "ペースト", "붙여넣기", "coller", "einfügen", "pegar", "incolla", "colar", "вставить"]
+
+    /// The backup to typing (`via: "paste"`): the text goes through the clipboard and the field's edit
+    /// menu. The owner's clipboard is read first and put back afterwards, whatever happens; if it
+    /// cannot be read, nothing is pasted (it would be lost).
+    func paste(_ text: String, clear: Bool, until: Double) async throws {
+        let saved: JSON
+        do { saved = try await runner.call("POST", "/wda/getPasteboard", ["contentType": "plaintext"], timeout: 2, countsAsMiss: false) }
+        catch { throw ActionFailure(message: "the clipboard could not be read, so it was not used (the owner's clipboard would be lost); type the text instead", delivery: .notSent) }
+        guard let field = await focusedField(timeout: 1) else {
+            throw ActionFailure(message: "no field is focused to paste into; tap the field first", delivery: .notSent)
+        }
+        let rect = try? await runner.call("GET", "/element/\(field.id)/rect", timeout: 1.5, countsAsMiss: false)
+        guard let x = rect?["x"]?.double, let y = rect?["y"]?.double, let w = rect?["width"]?.double, let h = rect?["height"]?.double else {
+            throw ActionFailure(message: "the focused field's frame is unknown, so there is nowhere to open its menu", delivery: .notSent)
+        }
+        var restored = false
+        func restore() async {
+            guard !restored else { return }
+            restored = true
+            _ = try? await runner.call("POST", "/wda/setPasteboard", ["content": .string(saved.string ?? ""), "contentType": "plaintext"], timeout: 2, countsAsMiss: false)
+        }
+        do {
+            if clear, let value = field.value, !value.isEmpty {
+                _ = try await runner.call("POST", "/wda/keys", ["value": .array(Array(repeating: JSON.string("\u{8}"), count: min(400, value.count)))], timeout: 3 + 0.06 * Double(min(400, value.count)))
+            }
+            _ = try await runner.call("POST", "/wda/setPasteboard", ["content": .string(Data(text.utf8).base64EncodedString()), "contentType": "plaintext"], timeout: 2, countsAsMiss: false)
+            _ = try await runner.call("POST", "/wda/touchAndHold", ["x": .number(x + w / 2), "y": .number(y + h / 2), "duration": .number(0.7)], timeout: 4)
+            var item: Element?
+            let menuBy = min(until - 0.3, now() + 2)
+            while item == nil, now() < menuBy {
+                await sleep(seconds: 0.2)
+                if let seen = try? await runner.tree(timeout: max(0.3, min(1.2, menuBy - now()))) {
+                    item = seen.elements.first { e in Self.pasteWords.contains { e.text.lowercased() == $0 } }
+                }
+            }
+            guard let item else {
+                await restore()
+                throw ActionFailure(message: "the field's menu showed no Paste item; the text was not pasted (a long press was sent)", delivery: .sent)
+            }
+            try await tap(item.frame.centre)
+            await sleep(seconds: 0.3)
+            await restore()
+        } catch {
+            await restore()
+            throw error
+        }
+    }
+
     /// Swipes until the target is fully on screen and not under a bar, with a tree read after each
     /// swipe. The finger stops before lifting, so the list does not coast past the target. Stops at
     /// the end of the list, at max_swipes, or when the action time runs out.
@@ -258,9 +329,9 @@ extension Computer {
     /// Reads the tree every quarter second until the text is there (or gone), or the screen holds still
     /// for two reads in a row. Not finding it is a fact, not a failure: the model decides.
     func waitUntil(_ spec: JSON, until: Double) async throws -> String {
-        let text = spec.string ?? spec["text"]?.string
-        let gone = spec["gone"]?.bool ?? false
         let settled = spec["settled"]?.bool ?? (spec.string == "settled")
+        let text = settled && spec.string == "settled" ? nil : (spec.string ?? spec["text"]?.string)
+        let gone = spec["gone"]?.bool ?? false
         guard settled || (text != nil && !text!.isEmpty) else { throw ActionFailure(message: "wait_until takes text, {text, gone?: true, ms?} or {settled: true, ms?}", delivery: .notSent) }
         let started = now()
         let limit = Swift.min(started + Swift.min(10, Swift.max(0.2, (spec["ms"]?.double ?? 3000) / 1000)), until)
