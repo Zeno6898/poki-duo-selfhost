@@ -428,8 +428,18 @@ struct Screen {
     points: Option<(f64, f64)>,
     /// When the decoder last gave a picture.
     last_decoded_at: Option<Instant>,
-    /// Since when packets arrive but no picture comes out (cleared by the next picture).
+    /// Since when the newest picture does not show the screen (see check): a backlog over
+    /// BACKLOG_STALL, units that give no picture, no key unit, or a silent session.
     stalled_since: Option<Instant>,
+    stall_reason: Option<&'static str>,
+    /// When the units waiting for the decoder arrived, oldest first.
+    queued: VecDeque<Instant>,
+    /// Since when units go to the decoder and no picture comes out (cleared by a picture).
+    no_picture_since: Option<Instant>,
+    /// When the key unit went to the decoder; since when one is awaited.
+    keyed_at: Option<Instant>,
+    key_wait_since: Option<Instant>,
+    last_rtcp: Option<Instant>,
     /// Set when resynchronizing did not bring a key frame: the media session should be reopened.
     restart_requested: bool,
     /// Since when the pictures may show errors from a lost packet (cleared by a key unit).
@@ -607,6 +617,7 @@ impl Live {
         let mut screen = self.screen.lock().unwrap();
         if screen.decoding_since.is_none() {
             screen.decoding_since = Some(Instant::now());
+            screen.key_wait_since = screen.decoding_since;
             screen.decoder_error = libav::available().err();
         }
     }
@@ -638,7 +649,8 @@ impl Live {
 
     /// state() with the quiet needed after an input-driven change given (`settle` for none).
     pub fn state_with(&self, settle: Duration, after_change: Duration) -> State {
-        let screen = self.screen.lock().unwrap();
+        let mut screen = self.screen.lock().unwrap();
+        check(&mut screen, Instant::now());
         let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
         // When decoding, the pixel difference is the authority on movement; otherwise the size
         // of the units (see UnitSizes).
@@ -676,9 +688,10 @@ impl Live {
         // The newest picture is not older than the newest unit that meant movement: whatever
         // waits in the decoder's queue repeats it.
         let picture_current = !decoding
-            || screen
+            || (screen
                 .latest
-                .is_some_and(|l| screen.activity.is_none_or(|a| l.0 >= a.at));
+                .is_some_and(|l| screen.activity.is_none_or(|a| l.0 >= a.at))
+                && !matches!(screen.stall_reason, Some("no_output" | "media_silent")));
         State {
             settled: quiet
                 && !awaiting_answer
@@ -713,7 +726,9 @@ impl Live {
 
     /// Whether resynchronizing failed and the media session should be reopened; clears it.
     pub fn take_restart_request(&self) -> bool {
-        std::mem::take(&mut self.screen.lock().unwrap().restart_requested)
+        let mut screen = self.screen.lock().unwrap();
+        check(&mut screen, Instant::now());
+        std::mem::take(&mut screen.restart_requested)
     }
 
     /// Learns the screen's size in points from an accessibility tree (its Application frame), so
@@ -805,6 +820,32 @@ impl Live {
                 .min(deadline)
                 .max(now + Duration::from_millis(1));
             let _ = tokio::time::timeout_at(until, changed.changed()).await;
+        }
+    }
+
+    /// Waits, for at most `timeout`, until no unit that arrived by now waits for the decoder:
+    /// the picture then shows the screen as the phone last sent it. Whether it did.
+    pub async fn wait_drained(&self, timeout: Duration) -> bool {
+        let now = Instant::now();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut changed = self.changed.clone();
+        loop {
+            changed.mark_unchanged();
+            {
+                let screen = self.screen.lock().unwrap();
+                if screen.queued.front().is_none_or(|at| *at > now) {
+                    return true;
+                }
+                if screen.stalled_since.is_some() || screen.closed {
+                    return false;
+                }
+            }
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
     }
 
@@ -1019,12 +1060,19 @@ impl Live {
         // Picture age and change age apart, so a still screen is never read as a stale picture.
         report["picture_age_ms"] = report["latest_age_ms"].clone();
         report["last_change_age_ms"] = report["ms_since_change"].clone();
-        // The picture shows the screen as the phone last sent it: no unit waits to be decoded and
-        // the stream is not stalled. A quiet stream keeps an old picture current.
-        report["picture_current"] = (state.latest.is_some()
-            && screen.stalled_since.is_none()
-            && c.units_to_decoder == c.units_done)
+        // How far the decoder is behind (the oldest queued unit's wait), apart from a stall: a
+        // backlog under BACKLOG_STALL drains on its own (Nov 6: 0.5 s at a launch).
+        report["backlog_ms"] = screen
+            .queued
+            .front()
+            .map_or(0, |at| at.elapsed().as_millis() as u64)
             .into();
+        report["queued_units"] = screen.queued.len().into();
+        report["stall_reason"] = screen.stall_reason.into();
+        let silent_ms = silence(&screen, Instant::now()).map(|d| d.as_millis() as u64);
+        report["media_silent_ms"] = silent_ms.into();
+        report["media_silent"] = (screen.stall_reason == Some("media_silent")).into();
+        report["ms_since_last_rtcp"] = since(screen.last_rtcp).into();
         report
     }
 }
@@ -1085,6 +1133,93 @@ const RECOVER_AFTER: Duration = Duration::from_millis(1500);
 /// How long a new session may take to send its key unit before it is given up.
 const FIRST_KEY_WITHIN: Duration = Duration::from_secs(5);
 
+/// A backlog (the oldest queued unit waiting) this long is a stall; a shorter one drains on its
+/// own and only makes the picture wait (Nov 6: 0.5 s backlogs at a cold start and a launch made
+/// a whole run read "stalled").
+const BACKLOG_STALL: Duration = Duration::from_millis(1500);
+/// A backlog this long: the decoder cannot catch up, and a new session starts from its key unit.
+const BACKLOG_REOPEN: Duration = Duration::from_secs(5);
+/// No packet at all (RTP or RTCP) this long, from a session whose phone sends RTCP: the session
+/// is dead (Nov 6: no packet for 43 s after a tunnel rebuild, reported current).
+const SILENT_AFTER: Duration = Duration::from_secs(2);
+/// No RTP this long: reopen even when the phone sends no RTCP (a still screen sends nothing, so
+/// silence alone proves less; seen up to 4.3 s on a healthy stream).
+const SILENT_REOPEN: Duration = Duration::from_secs(30);
+
+/// How long nothing has come from the phone, once decoding: since the newest RTP or RTCP packet
+/// (or since decoding started).
+fn silence(s: &Screen, now: Instant) -> Option<Duration> {
+    s.decoding_since?;
+    [s.counters.last_packet, s.last_rtcp, s.decoding_since]
+        .into_iter()
+        .flatten()
+        .max()
+        .map(|at| now.saturating_duration_since(at))
+}
+
+/// The stall rules, run for each packet, each finished unit and each look at the screen (so
+/// they hold when no packet comes): sets or clears the stall and asks for a new session.
+fn check(s: &mut Screen, now: Instant) {
+    let decoding = s.decoding_since.is_some() && s.decoder_error.is_none() && !s.closed;
+    if !decoding {
+        return;
+    }
+    let waited = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+    let backlog = waited(s.queued.front().copied());
+    let no_output = waited(s.no_picture_since);
+    let key_wait = waited(s.key_wait_since.filter(|_| s.keyed_at.is_none()));
+    let silent = silence(s, now);
+    // The phone sent RTCP in this session: its silence means the session is gone.
+    let silent_dead = s.last_rtcp.is_some() && silent.is_some_and(|d| d >= SILENT_AFTER);
+    let reason = if key_wait.is_some_and(|d| d >= FIRST_KEY_WITHIN) {
+        Some(("no_key", true))
+    } else if silent_dead {
+        Some(("media_silent", true))
+    } else if no_output.is_some_and(|d| d >= STALL_AFTER) {
+        Some(("no_output", no_output.is_some_and(|d| d >= RECOVER_AFTER)))
+    } else if backlog.is_some_and(|d| d >= BACKLOG_STALL) {
+        Some(("backlog", backlog.is_some_and(|d| d >= BACKLOG_REOPEN)))
+    } else {
+        None
+    };
+    let reopen_quiet = silent.is_some_and(|d| d >= SILENT_REOPEN);
+    match reason {
+        Some((why, _)) if s.stalled_since.is_none() => {
+            s.stalled_since = Some(now);
+            s.stall_reason = Some(why);
+            s.counters.stalls += 1;
+            let c = &s.counters;
+            eprintln!(
+                "{} poki-bridged: live frames: video stalled ({why}): backlog {} ms, {} units queued, no picture for {} ms (no key yet {}, no output {}, errors {}), silent {} ms",
+                crate::ax::watch::stamp(),
+                backlog.map_or(0, |d| d.as_millis()),
+                s.queued.len(),
+                no_output.map_or(0, |d| d.as_millis()),
+                c.units_before_key,
+                c.units_without_picture,
+                c.decode_errors,
+                silent.map_or(0, |d| d.as_millis()),
+            );
+        }
+        Some((why, _)) => s.stall_reason = Some(why),
+        None => {
+            s.stalled_since = None;
+            s.stall_reason = None;
+        }
+    }
+    let reopen = reason.is_some_and(|(_, reopen)| reopen) || reopen_quiet;
+    // A reopen asked for stays asked for until the daemon takes it (take_restart_request).
+    if reopen && !s.restart_requested {
+        s.restart_requested = true;
+        s.counters.restart_requests += 1;
+        eprintln!(
+            "{} poki-bridged: live frames: the media session should be reopened ({})",
+            crate::ax::watch::stamp(),
+            reason.map_or("quiet", |(why, _)| why)
+        );
+    }
+}
+
 async fn receive<S: Datagrams>(
     socket: Arc<S>,
     screen: Arc<Mutex<Screen>>,
@@ -1104,15 +1239,13 @@ async fn receive<S: Datagrams>(
     let mut last_request: Option<Instant> = None;
     let mut fir_seq = 0u8;
     let mut last_ssrc: Option<u32> = None;
-    // Since when a key unit is awaited (after the start, a loss or a stall).
-    let mut waiting_since: Option<Instant> = None;
-    // When a key unit last went to the decoder.
-    let mut keyed_at: Option<Instant> = None;
     while let Ok(datagram) = socket.recv().await {
         let now = Instant::now();
         let data = &datagram;
         if rtcp::is_rtcp(data) {
-            screen.lock().unwrap().counters.rtcp += 1;
+            let mut s = screen.lock().unwrap();
+            s.counters.rtcp += 1;
+            s.last_rtcp = Some(now);
             continue;
         }
         let Some(packet) = RtpPacket::parse(data) else {
@@ -1179,7 +1312,9 @@ async fn receive<S: Datagrams>(
             keyed = false;
             unit.clear();
             last_request = None;
-            waiting_since = Some(now);
+            let mut s = screen.lock().unwrap();
+            s.keyed_at = None;
+            s.key_wait_since = Some(now);
         }
         was_decoding = decoding;
         if !decoding {
@@ -1196,69 +1331,7 @@ async fn receive<S: Datagrams>(
             s.counters.damaging_losses += 1;
             s.damaged_since.get_or_insert(now);
         }
-        // Units keep coming but the newest picture grows old: the decoder is far behind or gets
-        // nothing it can use. Report it stale, and past RECOVER_AFTER ask for a new session.
-        if keyed {
-            let mut s = screen.lock().unwrap();
-            // Stale (reported, and pictures come from the screenshot service) when the newest
-            // picture's unit arrived STALL_AFTER ago: a decoder behind by a backlog is as stale as
-            // one that gives nothing.
-            let behind = s
-                .latest
-                .map(|l| l.0)
-                .into_iter()
-                .chain(keyed_at)
-                .max()
-                .map(|at| now.duration_since(at));
-            if behind.is_some_and(|age| age >= STALL_AFTER) && s.stalled_since.is_none() {
-                s.counters.stalls += 1;
-                s.stalled_since = Some(now);
-                let c = &s.counters;
-                let queued = c.units_to_decoder.saturating_sub(c.units_done);
-                eprintln!(
-                    "{} poki-bridged: live frames: video stalled: newest picture {} ms behind the stream; {queued} units queued, {} in a row gave no picture (no key yet {}, no output {}, errors {})",
-                    crate::ax::watch::stamp(),
-                    behind.unwrap().as_millis(),
-                    c.units_without_picture_run,
-                    c.units_before_key,
-                    c.units_without_picture,
-                    c.decode_errors,
-                );
-            }
-            // A new session only when the decoder gives no pictures at all: a reopen does not
-            // make a slow decoder faster, and the new session needs about 1.3 s and its key unit
-            // before its first picture (Nov 6: reopening on a backlog reopened every 10 to 15 s).
-            let silent = s
-                .last_decoded_at
-                .into_iter()
-                .chain(keyed_at)
-                .max()
-                .map(|at| now.duration_since(at));
-            if silent.is_some_and(|age| age >= RECOVER_AFTER) && !s.restart_requested {
-                s.restart_requested = true;
-                s.counters.restart_requests += 1;
-                eprintln!(
-                    "{} poki-bridged: live frames: no picture for {} ms while units arrive; the media session should be reopened",
-                    crate::ax::watch::stamp(),
-                    silent.unwrap().as_millis()
-                );
-            }
-        }
-        // No key unit since decoding started: a new session starts with one. A session's key
-        // unit can come over a second after it opens, so this waits FIRST_KEY_WITHIN.
-        if !keyed && waiting_since.is_some_and(|at| now.duration_since(at) >= FIRST_KEY_WITHIN) {
-            let mut s = screen.lock().unwrap();
-            if !s.restart_requested {
-                s.restart_requested = true;
-                s.counters.restart_requests += 1;
-                eprintln!(
-                    "{} poki-bridged: live frames: no key unit {} ms after decoding started; the media session should be reopened",
-                    crate::ax::watch::stamp(),
-                    FIRST_KEY_WITHIN.as_millis()
-                );
-            }
-            s.stalled_since.get_or_insert(now);
-        }
+        check(&mut screen.lock().unwrap(), now);
         if !keyed
             && decoder_ready.load(Ordering::SeqCst)
             && last_request.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
@@ -1291,12 +1364,16 @@ async fn receive<S: Datagrams>(
             }
             continue;
         }
-        if !keyed {
-            keyed_at = Some(now);
-            waiting_since = None;
-        }
         keyed = true;
-        screen.lock().unwrap().counters.units_to_decoder += 1;
+        {
+            let mut s = screen.lock().unwrap();
+            if s.keyed_at.is_none() {
+                s.keyed_at = Some(now);
+                s.key_wait_since = None;
+            }
+            s.counters.units_to_decoder += 1;
+            s.queued.push_back(now);
+        }
         if jobs.send(Job::Unit(complete, now)).is_err() {
             return;
         }
@@ -1393,6 +1470,7 @@ fn decode_loop(
                         let mut screen = screen.lock().unwrap();
                         screen.counters.units_without_picture += 1;
                         screen.counters.units_without_picture_run += 1;
+                        screen.no_picture_since.get_or_insert(arrived);
                         break 'unit;
                     }
                     Ok(pictures) => pictures,
@@ -1400,6 +1478,7 @@ fn decode_loop(
                         let mut screen = screen.lock().unwrap();
                         screen.counters.decode_errors += 1;
                         screen.counters.last_decode_error = Some(error);
+                        screen.no_picture_since.get_or_insert(arrived);
                         break 'unit;
                     }
                 };
@@ -1442,11 +1521,7 @@ fn decode_loop(
                     screen.latest = Some((arrived, wall, size.0, size.1));
                     screen.last_decoded_at = Some(decoded_at);
                     screen.counters.units_without_picture_run = 0;
-                    // Only a picture that shows the screen now ends a stall. A reopen asked for
-                    // stays asked for until the daemon takes it (take_restart_request).
-                    if arrived.elapsed() < STALL_AFTER {
-                        screen.stalled_since = None;
-                    }
+                    screen.no_picture_since = None;
                     screen.epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
                     let epoch = screen.epoch;
                     if let Some(latest) = latest.as_mut() {
@@ -1499,6 +1574,8 @@ fn decode_loop(
             // Done with it, picture or not: waiters for a current picture look again.
             let mut screen = screen.lock().unwrap();
             screen.counters.units_done += 1;
+            screen.queued.pop_front();
+            check(&mut screen, Instant::now());
             screen.generation += 1;
             notify.send_replace(screen.generation);
         }
@@ -2310,6 +2387,132 @@ mod tests {
                 assert_eq!(screen.counters.decoded, 30, "the new decoder runs on");
                 drop(screen);
                 drop((new, new_tx, old_tx));
+            });
+    }
+
+    /// A fake session for the stall rules: Frames over a socket the test feeds.
+    fn session() -> (Frames, tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let socket = Arc::new(FakeSocket {
+            incoming: tokio::sync::Mutex::new(rx),
+            sent: Mutex::new(Vec::new()),
+        });
+        (Frames::over(socket, 7, true), tx)
+    }
+
+    #[test]
+    fn a_short_backlog_is_waited_for_not_called_a_stall() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        // Phone size: a burst of these takes the decoder a while (Nov 6: 0.5 s at a launch).
+        let Some(units) = stream_with(150, "testsrc2=size=1216x2656:rate=60", 150) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (frames, tx) = session();
+                let live = frames.live();
+                let mut seq = 1u16;
+                let mut send = |index: usize| {
+                    for packet in packetize(&units[index], &mut seq, index as u32 * 1500) {
+                        tx.send(packet).unwrap();
+                    }
+                };
+                // Open, then an idle stream with a pause (a still screen sends nothing).
+                for index in 0..30 {
+                    send(index);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                assert!(live.state(Duration::ZERO).stalled_since.is_none(), "a pause is no stall");
+                // The burst after the pause, all at once: the decoder falls behind for a while.
+                for index in 30..150 {
+                    send(index);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let during = live.report(&live.mark());
+                let started = Instant::now();
+                let drained = live.wait_drained(Duration::from_millis(1500)).await;
+                let after = live.report(&live.mark());
+                println!(
+                    "burst of 120: backlog {} ms with {} queued; drained {drained} in {} ms; stall_reason {}",
+                    during["backlog_ms"],
+                    during["queued_units"],
+                    started.elapsed().as_millis(),
+                    after["stall_reason"]
+                );
+                assert!(drained, "the queue drains");
+                assert_eq!(after["queued_units"], 0);
+                assert_eq!(after["backlog_ms"], 0);
+                assert_eq!(after["video_stalled"], false);
+                assert_eq!(after["totals"]["stalls"], 0, "no stall under BACKLOG_STALL");
+                assert_eq!(after["picture_current"], true);
+                assert_eq!(after["totals"]["decoded"], 150);
+                assert!(!live.take_restart_request(), "no reopen for a backlog");
+                drop((frames, tx));
+            });
+    }
+
+    #[test]
+    fn a_session_that_sends_nothing_is_reopened() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        let Some(units) = stream_with(20, "testsrc2=size=320x640:rate=60", 60) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // After a tunnel rebuild: the new session opens and no packet ever comes.
+                let (frames, tx) = session();
+                let live = frames.live();
+                tokio::time::sleep(FIRST_KEY_WITHIN + Duration::from_millis(100)).await;
+                let report = live.report(&live.mark());
+                assert_eq!(report["stall_reason"], "no_key");
+                assert_eq!(report["video_stalled"], true);
+                assert_eq!(report["picture_current"], false);
+                assert!(live.take_restart_request(), "reopened without any packet");
+                drop((frames, tx));
+
+                // A session whose phone sends RTCP goes silent: dead after SILENT_AFTER.
+                let (frames, tx) = session();
+                let live = frames.live();
+                let mut seq = 1u16;
+                let mut sr = vec![0x80, 200, 0, 6];
+                sr.extend_from_slice(&[0; 24]);
+                tx.send(sr).unwrap();
+                for (index, unit) in units.iter().enumerate() {
+                    for packet in packetize(unit, &mut seq, index as u32 * 1500) {
+                        tx.send(packet).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let report = live.report(&live.mark());
+                assert_eq!(report["totals"]["rtcp"], 1);
+                assert_eq!(report["media_silent"], false);
+                assert_eq!(report["picture_current"], true);
+                tokio::time::sleep(SILENT_AFTER).await;
+                let report = live.report(&live.mark());
+                println!(
+                    "silent: {} ms, stall_reason {}",
+                    report["media_silent_ms"], report["stall_reason"]
+                );
+                assert_eq!(report["media_silent"], true);
+                assert_eq!(report["picture_current"], false);
+                assert!(live.take_restart_request(), "a silent session is reopened");
+                drop((frames, tx));
             });
     }
 

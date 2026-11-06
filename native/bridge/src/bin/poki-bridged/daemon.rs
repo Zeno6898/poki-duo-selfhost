@@ -519,18 +519,14 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 // What observe needs to know before trusting a picture.
                 let mut reasons = Vec::new();
                 let frames = &pong["frames"];
-                if frames["video_stalled"] == json!(true) {
+                if frames["media_silent"] == json!(true) {
+                    // Nothing comes from the phone: the media session is gone (a reopen is asked).
+                    reasons.push("media_silent");
+                } else if frames["video_stalled"] == json!(true) {
                     reasons.push("video_stalled");
-                } else if frames["latest_age_ms"]
-                    .as_u64()
-                    .is_some_and(|age| age > 1000)
-                    && frames["ms_since_last_packet"]
-                        .as_u64()
-                        .is_some_and(|ms| ms < 500)
-                {
-                    // Units arrive but the newest picture is old: decoding is behind.
-                    reasons.push("decode_backlog");
                 }
+                // A backlog under the stall time is not a reason: it drains on its own, and
+                // latest_frame waits for it (backlog_ms says how far behind).
                 if frames["picture_damaged"] == json!(true) {
                     // A packet was lost: pictures may show errors until the session reopens.
                     reasons.push("picture_damaged");
@@ -663,6 +659,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
         _ = closed.wait_for(|closed| *closed) => return None,
     };
     let mut timings = Timings::default();
+    let read = parse(&object).is_ok_and(|request| reads_only(&request));
     let limit = Duration::from_secs(if op == "install_app" { 180 } else { 90 });
     let outcome = tokio::select! {
         outcome = tokio::time::timeout(limit, Box::pin(session.handle(object, &mut timings))) => Some(outcome),
@@ -674,7 +671,10 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     let result = match outcome {
         None => {
             log(&format!("{op}: client left; cancelled"));
-            session.recover().await;
+            // Not a device failure: only what the op may have left half-used goes. A full
+            // recover here closed the media session and probed the tunnel for 5 s (Nov 6:
+            // "client left" at 07:22:55.9, "tunnel lost" at 07:23:00.8, video never back).
+            session.cancelled(read).await;
             return None;
         }
         Some(Err(elapsed)) => {
@@ -993,7 +993,19 @@ impl Session {
         if self.link.is_some() && !self.tunnel_alive().await {
             log("tunnel lost");
             self.tunnels_lost += 1;
+            self.foreground.borrow_mut().lost_at = Some(Instant::now());
             self.link = None;
+        }
+    }
+
+    /// After an op cancelled midway: accessibility state goes (its connection may be mid
+    /// message), and the input connections too when the op used them. The tunnel and, for a
+    /// read, the media session stay.
+    async fn cancelled(&mut self, read: bool) {
+        self.ax = None;
+        self.ax_link = None;
+        if !read {
+            self.close_input().await;
         }
     }
 

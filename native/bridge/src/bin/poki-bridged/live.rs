@@ -421,6 +421,8 @@ pub struct Foreground {
     pub(crate) known: std::collections::HashMap<u64, Value>,
     /// When the last input that may change the screen was sent.
     pub(crate) last_input: Option<Instant>,
+    /// When the tunnel was last lost: the phone may have been used meanwhile.
+    pub(crate) lost_at: Option<Instant>,
     wanted: Option<u64>,
     failed: Option<(u64, Instant)>,
 }
@@ -467,10 +469,11 @@ pub fn foreground_json(state: &State) -> Value {
     // latest_frame: the input time is kept here, not read from the session.
     // A tree asked for before the screen had time to answer the input shows the screen before
     // it (Nov 6: Clock still in the tree just after Home).
-    answer["stale"] = f
+    answer["stale"] = (f
         .last_input
         .is_some_and(|input| at < input + crate::frames::no_response_time())
-        .into();
+        || f.lost_at.is_some_and(|lost| at < lost))
+    .into();
     if let Some(pid) = pid {
         if let Some(known) = f.known.get(&pid) {
             if answer["bundle_id"].is_null() {
@@ -685,6 +688,9 @@ async fn picture(
         live.wait_picture_after(since, Duration::from_millis(wait_ms.max(1)))
             .await;
     }
+    // A backlog drains on its own in well under the stall time: wait for it rather than serve an
+    // old picture or take a screenshot (0.8 s).
+    live.wait_drained(Duration::from_millis(1500)).await;
     if source == "auto"
         && let Some(reason) = video_unusable(live)
     {
