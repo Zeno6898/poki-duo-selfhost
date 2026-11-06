@@ -71,7 +71,7 @@ On Linux, `bin/build-native` (through `bin/build-ocr-linux`) installs the Python
 | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) models, as converted to ONNX and bundled in the `rapidocr` wheel | `PP-OCRv6_det_small`, `PP-OCRv6_rec_small`, `ch_ppocr_mobile_v2.0_cls` | Apache-2.0; copyright in the weights stays with Baidu and the PaddleOCR rights holders, as recorded in the wheel's `MODEL_LICENSES.md`. |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | `onnxruntime` 1.31.1 | MIT, with the third-party notices shipped in the wheel. |
 | [OpenCV](https://github.com/opencv/opencv-python) | `opencv-python-headless` 5.0.0.93 | Apache-2.0 for OpenCV; the wheel's bundled libraries keep their own notices. |
-| [NumPy](https://github.com/numpy/numpy) | `numpy` 2.5.4 | BSD-3-Clause, with bundled-library notices in the wheel. |
+| [NumPy](https://github.com/numpy/numpy) | `numpy` 2.4.6 | BSD-3-Clause, with bundled-library notices in the wheel. |
 | [Pillow](https://github.com/python-pillow/Pillow) | `pillow` 13.0.0 | MIT-CMU (HPND). |
 | [Shapely](https://github.com/shapely/shapely), [pyclipper](https://github.com/fonttools/pyclipper) | `shapely` 2.2.0, `pyclipper` 1.4.0 | BSD-3-Clause; MIT (pyclipper bundles Clipper, BSL-1.0). |
 | [OmegaConf](https://github.com/omry/omegaconf), [PyYAML](https://github.com/yaml/pyyaml), [Protocol Buffers](https://github.com/protocolbuffers/protobuf), [FlatBuffers](https://github.com/google/flatbuffers) | `omegaconf` 2.4.0, `PyYAML` 6.0.3, `protobuf` 7.36.2, `flatbuffers` 25.12.19 | BSD-3-Clause; MIT; BSD-3-Clause; Apache-2.0. |
