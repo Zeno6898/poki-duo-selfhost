@@ -10,5 +10,7 @@ let package = Package(
     targets: [
         .target(name: "PokiCore"),
         .testTarget(name: "PokiCoreTests", dependencies: ["PokiCore"]),
+        // Drives look/do against a real WebDriverAgent in the iOS Simulator (CI's simulator job).
+        .executableTarget(name: "poki-sim-check", dependencies: ["PokiCore"]),
     ]
 )

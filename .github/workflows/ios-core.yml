@@ -79,3 +79,53 @@ jobs:
       - name: Build for iOS
         working-directory: native/ios/PokiCore
         run: xcodebuild -scheme PokiCore -destination 'generic/platform=iOS' -quiet build
+
+  # look/do against a real WebDriverAgent in the iOS Simulator: real gestures, typing and timings.
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      WDA_COMMIT: 02cb92f0e93c8b021443bcbb8eeb80932c113220
+    steps:
+      - uses: actions/checkout@v4
+      - name: WebDriverAgent (the runner's pinned version)
+        run: |
+          git init -q build/wda
+          git -C build/wda fetch -q --depth 1 https://github.com/appium/WebDriverAgent "$WDA_COMMIT"
+          git -C build/wda checkout -q FETCH_HEAD
+      - name: Boot a simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)['devices']
+          runtimes = sorted((r for r in d if 'iOS' in r), reverse=True)
+          phones = [x for r in runtimes for x in d[r] if x['name'].startswith('iPhone')]
+          pro = [x for x in phones if 'Pro' in x['name'] and 'Max' not in x['name']]
+          print((pro or phones)[0]['udid'])")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices | grep "$UDID"
+      - name: Build WebDriverAgent for the simulator
+        run: xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd build-for-testing -quiet
+      - name: Start WebDriverAgent
+        run: |
+          nohup xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd test-without-building > build/wda.log 2>&1 &
+          for i in $(seq 1 150); do curl -sf http://127.0.0.1:8100/status > /dev/null && echo "up after $((i * 2)) s" && exit 0; sleep 2; done
+          tail -50 build/wda.log; exit 1
+      - name: look/do in Settings
+        working-directory: native/ios/PokiCore
+        run: |
+          set -o pipefail
+          swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check.txt
+      - name: Summary
+        if: always()
+        run: |
+          { echo '## look/do on the simulator'; echo; sed -n '/^| call/,$p' build/sim-check.txt 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-check
+          path: |
+            build/sim-check.txt
+            build/wda.log
