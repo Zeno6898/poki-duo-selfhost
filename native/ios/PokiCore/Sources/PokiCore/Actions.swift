@@ -183,7 +183,8 @@ extension Computer {
             let n = name.lowercased()
             switch n {
             case "lock", "power": _ = try await runner.call("POST", "/wda/lock", [:], timeout: 3)
-            case "home": _ = try await runner.call("POST", "/wda/homescreen", [:], timeout: 3)
+            // WDA serves the Home button only outside a session ("Unhandled endpoint" inside one).
+            case "home": _ = try await runner.raw("POST", "/wda/homescreen", [:], timeout: 3)
             default:
                 guard let wda = Self.buttons[n] else { throw ActionFailure(message: "button \(name) has no equivalent; use home, lock, volume_up or volume_down", delivery: .notSent) }
                 _ = try await runner.call("POST", "/wda/pressButton", ["name": .string(wda)], timeout: 3)

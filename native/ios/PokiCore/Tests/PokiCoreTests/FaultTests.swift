@@ -227,4 +227,31 @@ final class FaultTests: XCTestCase {
         try await Task.sleep(nanoseconds: 1_200_000_000)
         XCTAssertEqual(host.restarts.value, 1, "no answer to /status either: the runner is started again")
     }
+
+    /// Found on the simulator: WDA answers the Home button only outside a session.
+    func testHomeIsPressedOutsideTheSession() async {
+        let (core, wda, _) = makeCore()
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["button": "home"]]])
+        XCTAssertFalse(result.text.contains("not_sent"), result.text)
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /wda/homescreen" }.count, 1, wda.sent.joined(separator: ", "))
+    }
+
+    /// Found on the simulator: with a keyboard up the tree can take longer than a read waits. The text
+    /// in the picture is listed instead, numbered, and a number taps that text.
+    func testWithoutATreeTheTextInThePictureIsListedAndTappable() async {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.5 }
+        _ = await core.call("look", [:])
+        host.texts.value = [RecognizedText(text: "Continue", box: Rect(x: 0.25, y: 0.9, width: 0.5, height: 0.05))]
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 5_000_000_000); return (200, ["value": .null]) }
+        let look = await core.call("look", [:])
+        XCTAssertTrue(look.text.contains("read from the picture because the element tree did not come in time"), look.text)
+        XCTAssertTrue(look.text.contains("1 Text \"Continue\""), look.text)
+        wda.source([("Button", "Continue")])
+        let tap = await core.call("do", ["actions": [["tap": 1]]])
+        XCTAssertFalse(tap.text.contains("not_sent"), tap.text)
+        let body = wda.bodies("POST /wda/tap").last
+        XCTAssertEqual(body?["x"]?.double, 195)
+        XCTAssertEqual(body?["y"]?.double ?? 0, 0.925 * 844, accuracy: 0.5)
+    }
 }

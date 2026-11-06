@@ -32,6 +32,8 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
         set("GET /source") { _ in (200, ["value": root]) }
     }
 
+    static let sessionlessOnly: Set<String> = ["POST /wda/homescreen"]
+
     func set(_ key: String, _ route: @escaping Route) { lock.lock(); routes[key] = route; lock.unlock() }
 
     /// The screen as rows of (type, label), 44 points apart.
@@ -53,9 +55,16 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
     func bodies(_ key: String) -> [JSON] { lock.lock(); defer { lock.unlock() }; return log.filter { "\($0.method) \($0.path)" == key }.compactMap(\.body) }
 
     func send(method: String, url: URL, body: Data?, timeout: Double) async throws -> (status: Int, body: Data) {
+        let inSession = url.path.hasPrefix("/session/")
         var path = url.path.replacingOccurrences(of: #"^/session/[^/]+"#, with: "", options: .regularExpression)
         if path.isEmpty { path = "/session" }
         let key = "\(method) \(path)"
+        // As in WDA 16.15.3 (FBCustomCommands.m): the Home button has no route inside a session.
+        if inSession, Self.sessionlessOnly.contains(key) {
+            let missing: JSON = ["value": ["error": "unknown command", "message": .string("Unhandled endpoint: \(url.path)")]]
+            _ = record(method, url.path, nil, "")
+            return (404, missing.data())
+        }
         let parsed = body.flatMap { try? JSON.parse($0) }
         let route = record(method, path, parsed, key)
         guard let route else { let missing: JSON = ["value": ["error": "unknown command", "message": .string("no route \(key)")]]; return (404, missing.data()) }
