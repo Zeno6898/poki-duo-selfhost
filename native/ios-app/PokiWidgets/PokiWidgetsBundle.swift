@@ -17,12 +17,12 @@ struct PokiWidgetsBundle: WidgetBundle {
 struct PokiLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: PokiActivityAttributes.self) { context in
-            LockScreenView(state: context.state)
+            LockScreenView(state: context.shown)
                 .padding(.horizontal, 14).padding(.vertical, 12)
                 .activityBackgroundTint(Brand.night.opacity(0.94))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
-            let state = context.state
+            let state = context.shown
             return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) { IslandLeading(state: state) }
                 DynamicIslandExpandedRegion(.trailing) { IslandTrailing(state: state) }
@@ -37,5 +37,20 @@ struct PokiLiveActivity: Widget {
             .keylineTint(state.accent)
             .contentMargins(.horizontal, 14, for: .expanded)
         }
+    }
+}
+
+extension ActivityViewContext<PokiActivityAttributes> {
+    /// The state to draw. An approval's stale date is its expiry: once it passes, the buttons go
+    /// even if the app has not had a chance to update yet, so nobody taps Allow on a dead request.
+    var shown: PokiState {
+        var state = self.state
+        if isStale, state.approval != nil {
+            state.approval = nil
+            state.phase = .working
+            state.headline = String(localized: "The approval timed out")
+            state.event = .init(kind: .expired, text: String(localized: "Timed out"))
+        }
+        return state
     }
 }
