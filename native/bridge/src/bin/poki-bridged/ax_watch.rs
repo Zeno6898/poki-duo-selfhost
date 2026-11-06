@@ -221,6 +221,8 @@ pub enum Served {
     Unchanged,
     /// The held subscription failed or was not answered in time; the daemon read without it.
     Fallback,
+    /// Read ahead of time after the screen settled (live frames), and still current.
+    Prefetched,
 }
 
 impl Inner {
@@ -348,6 +350,13 @@ impl Watch {
                 inner.changed.notify_waiters();
             }
         }));
+    }
+
+    /// When the latest tree was asked for: its subscription's time, or its arrival if it came unasked.
+    pub fn latest_requested(&self) -> Option<Instant> {
+        let state = self.inner.state.borrow();
+        let (_, at) = state.latest.as_ref()?;
+        Some(state.latest_asked.unwrap_or(*at))
     }
 
     /// The held tree, if it shows the screen as it is now (no input since, and not too old).

@@ -54,6 +54,7 @@ pub fn settle_time() -> Duration {
 struct Thumb {
     arrived: Instant,
     wall: SystemTime,
+    epoch: u64,
     pixels: Vec<u8>,
     width: u32,
     height: u32,
@@ -376,6 +377,34 @@ impl Live {
         }
     }
 
+    /// Whether the screen is as it was at `at`: no pixel change and no input since.
+    pub fn unchanged_since(&self, at: Instant) -> bool {
+        let screen = self.screen.lock().unwrap();
+        screen.last_change.is_none_or(|(changed, _)| changed <= at)
+            && screen.last_input.is_none_or(|input| input <= at)
+            && !screen.closed
+    }
+
+    /// The number of the latest picture that had arrived by `at`.
+    pub fn epoch_at(&self, at: Instant) -> u64 {
+        let screen = self.screen.lock().unwrap();
+        screen
+            .thumbs
+            .iter()
+            .rev()
+            .find(|t| t.arrived <= at)
+            .map_or_else(
+                || {
+                    if screen.latest.is_some_and(|l| l.0 <= at) {
+                        screen.epoch
+                    } else {
+                        0
+                    }
+                },
+                |t| t.epoch,
+            )
+    }
+
     /// A receiver that changes at every picture and input.
     pub fn watcher(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changed.clone()
@@ -680,6 +709,7 @@ fn decode_loop(
                         |(pixels, width, height)| Thumb {
                             arrived,
                             wall,
+                            epoch: 0,
                             pixels,
                             width,
                             height,
@@ -720,7 +750,8 @@ fn decode_loop(
                         screen.last_change_wall = Some(wall);
                         screen.last_change_epoch = Some(epoch);
                     }
-                    if let Some(thumb) = thumb {
+                    if let Some(mut thumb) = thumb {
+                        thumb.epoch = epoch;
                         while screen
                             .thumbs
                             .front()
@@ -777,6 +808,7 @@ mod tests {
         Thumb {
             arrived: Instant::now(),
             wall: SystemTime::now(),
+            epoch: 0,
             pixels,
             width,
             height,

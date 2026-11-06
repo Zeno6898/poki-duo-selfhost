@@ -77,7 +77,9 @@ pub async fn answer(
         match op {
             "latest_frame" => {
                 let wait = number(&object, "wait_ms", 3000);
-                picture(&live, &object, wait).await
+                let mut answer = picture(&live, &object, wait).await?;
+                answer["tree"] = tree_summary(&state.prefetch, &live);
+                Ok(answer)
             }
             "wait_settled" => {
                 let timeout = Duration::from_millis(number(&object, "timeout_ms", 3000));
@@ -90,6 +92,7 @@ pub async fn answer(
                 let mut answer = picture(&live, &object, 0).await?;
                 answer["settled"] = settled.into();
                 answer["waited_ms"] = ms(waiting).into();
+                answer["tree"] = tree_summary(&state.prefetch, &live);
                 Ok(answer)
             }
             "frame_diff" => {
@@ -194,6 +197,8 @@ pub async fn subscribe(
             return;
         }
         let mut watcher = live.watcher();
+        let mut trees = state.prefetch_events.subscribe();
+        trees.mark_unchanged();
         let start = live.state(settle);
         let (mut change_seen, mut input_seen) = (start.last_change.map(|c| c.0), start.last_input);
         let mut settled_for = start.settled.then_some(start.quiet_since);
@@ -237,6 +242,16 @@ pub async fn subscribe(
                 last_settled_at = Some(Instant::now());
                 events.push(event);
             }
+            if trees.has_changed().unwrap_or(false) {
+                trees.mark_unchanged();
+                if let Some(read) = state.prefetch.borrow().ready.as_ref() {
+                    let mut event = read.provenance(&live);
+                    event["event"] = "tree".into();
+                    event["read_ms"] = read.read_ms.into();
+                    event["epoch"] = live.state(settle).epoch.into();
+                    events.push(event);
+                }
+            }
             if now.closed {
                 events.push(json!({"event": "media", "state": "closed"}));
             }
@@ -256,6 +271,7 @@ pub async fn subscribe(
                 .min(heartbeat);
             tokio::select! {
                 _ = watcher.changed() => {},
+                _ = trees.changed() => {},
                 _ = tokio::time::sleep_until(wake) => {},
                 _ = closed.wait_for(|closed| *closed) => {
                     log("subscribe_frames: feed closed");
@@ -363,4 +379,237 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(&[0xff, 0xd8, 0xff, 0xe0]), "/9j/4A==");
     }
+}
+
+/// Accessibility reads made ahead of time (AX-on-settle): when the screen settles after a change
+/// or an input, the daemon reads the tree on the held tunnel without waiting for anyone to ask, and
+/// drops the read when the screen changes before it is answered. A read is current while no pixel
+/// change and no input has happened since it was requested.
+#[derive(Default)]
+pub struct Prefetch {
+    pending: Option<Pending>,
+    ready: Option<TreeRead>,
+    /// Bumped when a read lands, for the feed.
+    generation: u64,
+    reads: u64,
+    dropped: u64,
+    /// When the last failed read was asked for; the same screen is not read again.
+    failed: Option<Instant>,
+}
+
+struct Pending {
+    requested: Instant,
+    wall: std::time::SystemTime,
+    epoch: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub struct TreeRead {
+    pub tree: Value,
+    pub requested: Instant,
+    pub wall: std::time::SystemTime,
+    pub epoch: u64,
+    pub read_ms: u64,
+}
+
+impl TreeRead {
+    /// request_started_at, request_epoch and current, as every tree answer carries them.
+    pub fn provenance(&self, live: &Live) -> Value {
+        json!({
+            "request_started_at": stamp_at(self.wall),
+            "request_epoch": self.epoch,
+            "current": live.unchanged_since(self.requested),
+        })
+    }
+}
+
+pub type Prefetcher = std::rc::Rc<std::cell::RefCell<Prefetch>>;
+
+/// What latest_frame says about the accessibility tree: when the newest ready read was asked for,
+/// whether it is still current, and whether a read is under way.
+pub fn tree_summary(prefetch: &Prefetcher, live: &Live) -> Value {
+    let p = prefetch.borrow();
+    let ready = p.ready.as_ref();
+    json!({
+        "request_started_at": ready.map(|read| stamp_at(read.wall)),
+        "request_epoch": ready.map(|read| read.epoch),
+        "current": ready.is_some_and(|read| live.unchanged_since(read.requested)),
+        "pending": p.pending.is_some(),
+    })
+}
+
+/// The prefetch's state for latest_frame and ping.
+pub fn prefetch_json(prefetch: &Prefetcher, live: &Live) -> Value {
+    let p = prefetch.borrow();
+    json!({
+        "pending": p.pending.as_ref().map(|pending| json!({
+            "request_started_at": stamp_at(pending.wall),
+            "request_epoch": pending.epoch,
+            "current": live.unchanged_since(pending.requested),
+        })),
+        "ready": p.ready.as_ref().map(|read| read.provenance(live)),
+        "reads": p.reads,
+        "dropped": p.dropped,
+    })
+}
+
+/// A current prefetched tree, waiting for a current pending read for up to `wait`.
+pub async fn prefetched(
+    prefetch: &Prefetcher,
+    events: &watch::Sender<u64>,
+    live: &Live,
+    wait: Duration,
+) -> Option<TreeRead> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut watcher = events.subscribe();
+    loop {
+        watcher.mark_unchanged();
+        {
+            let p = prefetch.borrow();
+            if let Some(read) = p
+                .ready
+                .as_ref()
+                .filter(|r| live.unchanged_since(r.requested))
+            {
+                return Some(read.clone());
+            }
+            let pending = p
+                .pending
+                .as_ref()
+                .filter(|p| live.unchanged_since(p.requested))?;
+            let _ = pending;
+        }
+        if tokio::time::timeout_at(deadline, watcher.changed())
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+}
+
+/// Runs for the daemon's life with live frames on: starts a read whenever the screen settles
+/// after a change or input and no current read exists, and drops reads the screen outran.
+pub async fn prefetch_loop(state: Rc<State>) {
+    if std::env::var("POKI_LIVE_AX_PREFETCH").as_deref() == Ok("0") {
+        return;
+    }
+    let settle = settle_time();
+    loop {
+        let found = state.session.try_lock().ok().and_then(|session| {
+            let live = session.input.as_ref()?.frames.live();
+            let device = &session.link.as_ref()?.device;
+            (live.decoding() && live.error().is_none())
+                .then(|| (live, device.adapter.clone(), device.rsd.clone()))
+        });
+        let Some((live, adapter, rsd)) = found else {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        };
+        let mut watcher = live.watcher();
+        loop {
+            watcher.mark_unchanged();
+            let now = live.state(settle);
+            if now.closed {
+                break;
+            }
+            {
+                let mut p = state.prefetch.borrow_mut();
+                // The screen moved after the request: its answer would show the old screen.
+                if p.pending
+                    .as_ref()
+                    .is_some_and(|pending| !live.unchanged_since(pending.requested))
+                {
+                    let pending = p.pending.take().expect("checked");
+                    pending.task.abort();
+                    p.dropped += 1;
+                }
+                let current = p
+                    .ready
+                    .as_ref()
+                    .is_some_and(|r| live.unchanged_since(r.requested));
+                let failed_here = p.failed.is_some_and(|at| live.unchanged_since(at));
+                if now.settled
+                    && p.pending.is_none()
+                    && !current
+                    && !failed_here
+                    && now.latest.is_some()
+                {
+                    let requested = Instant::now();
+                    let wall = std::time::SystemTime::now();
+                    let epoch = now.epoch;
+                    let task = tokio::task::spawn_local(read_ahead(
+                        state.clone(),
+                        live.clone(),
+                        adapter.clone(),
+                        rsd.clone(),
+                        requested,
+                        wall,
+                        epoch,
+                    ));
+                    p.pending = Some(Pending {
+                        requested,
+                        wall,
+                        epoch,
+                        task,
+                    });
+                }
+            }
+            let wake = now
+                .quiet_since
+                .filter(|_| !now.settled)
+                .map(|at| tokio::time::Instant::from_std(at + settle));
+            let tick = tokio::time::Instant::now() + Duration::from_secs(2);
+            tokio::select! {
+                _ = watcher.changed() => {},
+                _ = tokio::time::sleep_until(wake.unwrap_or(tick).min(tick)) => {},
+            }
+        }
+        if let Some(pending) = state.prefetch.borrow_mut().pending.take() {
+            pending.task.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn read_ahead(
+    state: Rc<State>,
+    live: Live,
+    mut adapter: idevice::tcp::handle::AdapterHandle,
+    rsd: idevice::rsd::RsdHandshake,
+    requested: Instant,
+    wall: std::time::SystemTime,
+    epoch: u64,
+) {
+    let result =
+        crate::ax::read_tree_with_timeout(&mut adapter, &rsd, false, Duration::from_secs(4)).await;
+    let mut p = state.prefetch.borrow_mut();
+    if p.pending
+        .as_ref()
+        .is_some_and(|pending| pending.requested == requested)
+    {
+        p.pending = None;
+    }
+    match result {
+        Ok(tree) if live.unchanged_since(requested) => {
+            p.reads += 1;
+            p.ready = Some(TreeRead {
+                tree,
+                requested,
+                wall,
+                epoch,
+                read_ms: requested.elapsed().as_millis() as u64,
+            });
+        }
+        Ok(_) => p.dropped += 1,
+        Err(error) => {
+            p.failed = Some(requested);
+            log(&format!("accessibility read after settle failed: {error}"));
+        }
+    }
+    p.generation += 1;
+    let generation = p.generation;
+    drop(p);
+    state.prefetch_events.send_replace(generation);
 }

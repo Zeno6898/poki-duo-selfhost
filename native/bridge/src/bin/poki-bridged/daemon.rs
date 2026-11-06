@@ -143,12 +143,23 @@ struct State {
     stop: watch::Sender<bool>,
     started: Instant,
     version: u64,
+    /// Accessibility reads made after the screen settles (live frames), and their arrivals.
+    prefetch: live::Prefetcher,
+    prefetch_events: Rc<watch::Sender<u64>>,
 }
 
 impl State {
     fn new(target: Target) -> Self {
+        let prefetch = live::Prefetcher::default();
+        let prefetch_events = Rc::new(watch::channel(0).0);
         Self {
-            session: Mutex::new(Session::new(target)),
+            session: Mutex::new(Session::new(
+                target,
+                prefetch.clone(),
+                prefetch_events.clone(),
+            )),
+            prefetch,
+            prefetch_events,
             stop: watch::channel(false).0,
             started: Instant::now(),
             version: executable_version(),
@@ -171,6 +182,8 @@ fn executable_version() -> u64 {
 async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let reaper = tokio::task::spawn_local(reap(state.clone()));
+    let prefetcher =
+        live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -185,6 +198,9 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
         }
     }
     reaper.abort();
+    if let Some(prefetcher) = prefetcher {
+        prefetcher.abort();
+    }
     Ok(())
 }
 
@@ -310,6 +326,9 @@ struct Timings {
     reused_tunnel: bool,
     reused_input: bool,
     retried: bool,
+    /// When the tree answered was asked for, and whether the screen has changed since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree: Option<Value>,
     /// Where a quick type_text spent its time.
     #[serde(skip_serializing_if = "Option::is_none")]
     stages: Option<Value>,
@@ -387,6 +406,9 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     "opened": session.ax_opened,
                     "fallbacks": session.ax_fallbacks,
                     "last_error": session.ax_last_error,
+                    "prefetch": session.input.as_ref().map(|input| {
+                        live::prefetch_json(&state.prefetch, &input.frames.live())
+                    }),
                 });
             }
             return Some(json!({"id": id, "ok": true, "pong": pong}));
@@ -445,6 +467,17 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     })
 }
 
+/// An accessibility tree with when it was asked for (request_started_at, request_epoch) and
+/// whether the screen has changed since (current), as top-level fields.
+fn with_provenance(mut tree: Value, provenance: &Value) -> Value {
+    if let (Some(tree), Some(provenance)) = (tree.as_object_mut(), provenance.as_object()) {
+        for (key, value) in provenance {
+            tree.insert(key.clone(), value.clone());
+        }
+    }
+    tree
+}
+
 struct Link {
     device: Device,
 }
@@ -463,6 +496,8 @@ struct Input {
 
 struct Session {
     target: Target,
+    prefetch: live::Prefetcher,
+    prefetch_events: Rc<watch::Sender<u64>>,
     link: Option<Link>,
     input: Option<Input>,
     /// The held accessibility subscription, inside the tunnel.
@@ -543,9 +578,15 @@ fn uses_touch(request: &Request) -> bool {
 }
 
 impl Session {
-    fn new(target: Target) -> Self {
+    fn new(
+        target: Target,
+        prefetch: live::Prefetcher,
+        prefetch_events: Rc<watch::Sender<u64>>,
+    ) -> Self {
         Self {
             target,
+            prefetch,
+            prefetch_events,
             link: None,
             input: None,
             ax: None,
@@ -621,7 +662,7 @@ impl Session {
         } = request
             && std::env::var("POKI_BRIDGED_AX_WATCH").as_deref() != Ok("0")
         {
-            return Box::pin(self.watched_tree(timings)).await;
+            return Box::pin(self.live_tree(timings)).await;
         }
         if matches!(
             request,
@@ -935,6 +976,50 @@ impl Session {
         result
     }
 
+    /// The on-screen tree: a current read made when the screen settled, else the watched tree,
+    /// with when it was asked for and whether the screen has changed since.
+    async fn live_tree(&mut self, timings: &mut Timings) -> Result<Value> {
+        let live = self.live_view();
+        if let Some(live) = &live
+            && let Some(read) = Box::pin(live::prefetched(
+                &self.prefetch,
+                &self.prefetch_events,
+                live,
+                Duration::from_millis(1500),
+            ))
+            .await
+        {
+            timings.ax = Some(crate::ax::watch::Served::Prefetched);
+            let provenance = read.provenance(live);
+            timings.tree = Some(provenance.clone());
+            return Ok(with_provenance(read.tree, &provenance));
+        }
+        let requested = Instant::now();
+        let tree = Box::pin(self.watched_tree(timings)).await?;
+        let asked = self
+            .ax
+            .as_ref()
+            .and_then(|watch| watch.latest_requested())
+            .filter(|_| timings.ax != Some(crate::ax::watch::Served::Fallback))
+            .unwrap_or(requested);
+        let wall = std::time::SystemTime::now() - asked.elapsed();
+        let provenance = json!({
+            "request_started_at": crate::ax::watch::stamp_at(wall),
+            "request_epoch": live.as_ref().map(|live| live.epoch_at(asked)),
+            "current": live.as_ref().map(|live| live.unchanged_since(asked)),
+        });
+        timings.tree = Some(provenance.clone());
+        Ok(with_provenance(tree, &provenance))
+    }
+
+    /// The live screen, when it is being decoded.
+    fn live_view(&self) -> Option<crate::frames::Live> {
+        self.input
+            .as_ref()
+            .map(|input| input.frames.live())
+            .filter(|live| live.decoding() && live.error().is_none())
+    }
+
     async fn contact(&mut self, x: u16, y: u16) -> Result<()> {
         let touch = self
             .input
@@ -1191,11 +1276,22 @@ mod daemon_tests {
 
     /// The daemon over a real socket, against a target it cannot reach: the answers match what
     /// poki-native prints for the same failure, and the socket protocol works end to end.
-    #[tokio::test]
-    async fn serves_requests_over_the_socket() {
-        tokio::task::LocalSet::new()
-            .run_until(serves_requests())
-            .await;
+    /// The daemon runs on the main thread (8 MB of stack); unoptimized futures need more than the
+    /// 2 MB a test thread has, so the test gets a thread like the daemon's.
+    #[test]
+    fn serves_requests_over_the_socket() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(tokio::task::LocalSet::new().run_until(serves_requests()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     async fn serves_requests() {
