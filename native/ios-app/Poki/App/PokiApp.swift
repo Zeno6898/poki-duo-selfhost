@@ -4,6 +4,12 @@ import SwiftUI
 struct PokiApp: App {
     @State private var model = AppModel()
 
+    init() {
+        // PokiLauncher (Rust) and the relay write to sockets the other side may have closed. In an app,
+        // unlike a Rust executable, nothing ignores SIGPIPE, and it would end the whole app.
+        signal(SIGPIPE, SIG_IGN)
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView().environment(model)
