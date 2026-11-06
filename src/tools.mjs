@@ -45,6 +45,9 @@ export const definitions = catalog.tools.map(tool => [tool.name, [tool.descripti
 definitions.push(['poki_mcp_status', 'Report Poki MCP version, current Git commit, native bridge build time, tool count, connected-device count, selected device, and approval mode for this session.', z.object({}), true]);
 if (actAndObserve.registered()) { definitions.push(actAndObserve.definition); defaultTools.add(actAndObserve.name); }
 
+// The tools a tools/list answer names under this process's settings.
+export const listedNames = (env = process.env) => env.POKI_MCP_TOOLS === 'all' ? definitions.map(([name]) => name) : definitions.map(([name]) => name).filter(name => (profile(env) === 'agent' ? agentTools : defaultTools).has(name));
+
 export function createServer(call) {
   const agent = profile() === 'agent';
   const listed = agent ? agentTools : defaultTools;

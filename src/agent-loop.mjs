@@ -172,8 +172,14 @@ function answerOf(result) {
   const text = result.content?.find(block => block.type === 'text')?.text ?? '';
   try { return { ...JSON.parse(text), isError: Boolean(result.isError) }; } catch { return { message: text, isError: Boolean(result.isError) }; }
 }
-// What H's type_text reports about reading the text back, carried into `now`.
-const typedOf = answer => answer.verified !== undefined || answer.text_mismatch !== undefined ? { ...(answer.verified !== undefined ? { verified: answer.verified } : {}), ...(answer.text_mismatch !== undefined ? { text_mismatch: answer.text_mismatch } : {}) } : undefined;
+// How typed text was confirmed, and a later read-back that disagreed with it (the bridge reports that
+// on the next answer of any op, as warnings), carried into `now`.
+const typedOf = answer => {
+  const mismatch = (answer.warnings ?? []).filter(w => w?.warning === 'text_mismatch' || w?.warning === 'other_field_changed').map(({ warning, op, field, reason, instruction }) => ({ warning, op, field, reason, instruction }));
+  if (answer.text_mismatch !== undefined) mismatch.push({ warning: 'text_mismatch', reason: answer.text_mismatch });
+  if (answer.verified === undefined && !mismatch.length) return undefined;
+  return { ...(answer.verified !== undefined ? { verified: answer.verified } : {}), ...(mismatch.length ? { text_mismatch: mismatch } : {}) };
+};
 
 // Sends one step through the single-step tool of that name, with no read before or after it: the
 // World judges the result. A ref becomes the point it names on the current frame.

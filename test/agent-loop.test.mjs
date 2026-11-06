@@ -202,3 +202,12 @@ test('the agent profile lists the screen-as-state tools, and the default profile
   assert.equal(names.length, 29);
   assert.ok(!names.includes('observe') && names.includes('batch_commands'));
 });
+
+test('the profile and the count of listed tools follow the environment', async () => {
+  const { listedNames, profile } = await import('../src/tools.mjs');
+  assert.equal(profile({ POKI_LIVE_FRAMES: '1' }), 'agent');
+  assert.equal(profile({ POKI_LIVE_FRAMES: '1', POKI_TOOL_PROFILE: 'default' }), 'default');
+  assert.equal(listedNames({ POKI_TOOL_PROFILE: 'agent' }).length, 7);
+  assert.equal(listedNames({}).length, 29);
+  assert.equal(listedNames({ POKI_MCP_TOOLS: 'all' }).length, 59);
+});
