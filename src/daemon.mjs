@@ -35,6 +35,7 @@ const listener = http.createServer(async (req, res) => {
   if (!sessions.has(session)) sessions.set(session, new Devices(coordinator));
   const devices = sessions.get(session);
   devices.peers = () => sessions.values();
+  devices.label ??= session;
   if (req.url === '/session/close') {
     if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
     await devices.close(); sessions.delete(session); res.end('{}'); return;
