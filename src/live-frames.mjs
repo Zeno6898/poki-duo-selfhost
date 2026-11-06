@@ -116,8 +116,10 @@ export class LiveScreen {
     const { pong } = await this.daemon.ping(1000);
     return pong?.health ?? { ok: true, reasons: [] };
   }
-  async latestFrame({ maxWidth = 600, quality = 5, waitMs = 3000, rgb = false } = {}) {
-    return frameFromAnswer(await this.op({ op: 'latest_frame', max_width: Math.round(maxWidth), quality, wait_ms: waitMs }, waitMs + 5000), { rgb });
+  // source 'screenshot' asks for a picture from the screenshot service on the held tunnel instead of
+  // the decoded video: slower (about 1 s), but taken now, whatever state the video is in.
+  async latestFrame({ maxWidth = 600, quality = 5, waitMs = 3000, rgb = false, source } = {}) {
+    return frameFromAnswer(await this.op({ op: 'latest_frame', max_width: Math.round(maxWidth), quality, wait_ms: waitMs, ...(source ? { source } : {}) }, waitMs + 5000), { rgb });
   }
   // The daemon counts from this moment, and an input it carried makes the screen unsettled at once,
   // so a wait that starts after an input never returns the picture from before it.

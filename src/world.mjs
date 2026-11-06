@@ -75,6 +75,7 @@ class LiveSource {
   kind = 'live';
   constructor(screen) { this.screen = screen; }
   async frame() { return fromLive(await this.screen.latestFrame({ maxWidth: 600 })); }
+  async screenshot() { return fromLive(await this.screen.latestFrame({ maxWidth: 600, source: 'screenshot' })); }
   async settled({ timeoutMs, settleMs, maxWidth = 600 }) { return fromLive(await this.screen.waitSettled({ timeoutMs, settleMs, maxWidth })); }
 }
 
@@ -140,13 +141,23 @@ export class World {
   epoch = 0; axDownUntil = 0; lastFrame; lastSettle; settledFrame; tree; pendingTree;
   constructor(devices, screen) { this.devices = devices; this.source = screen ? new LiveSource(screen) : new CaptureSource(devices); }
   get live() { return this.source.kind === 'live'; }
-  noteInput(tool) { this.epoch++; this.lastInput = { tool, sentMs: Date.now(), epoch: this.epoch }; }
+  noteInput(tool, sentMs = Date.now()) { this.epoch++; this.lastInput = { tool, sentMs, epoch: this.epoch }; }
   async stamp(frame) {
     frame = await withThumb(frame);
     if (frame.bridgeEpoch !== undefined) this.epoch = Math.max(this.epoch, frame.bridgeEpoch);
     else if (!this.lastFrame || compare(this.lastFrame.thumb, frame.thumb).changed) this.epoch++;
     this.lastFrame = { ...frame, epoch: this.epoch };
     return this.lastFrame;
+  }
+  // One picture taken now, whatever the video is doing: on the live screen the screenshot service,
+  // otherwise an ordinary capture. A step whose wait found no picture newer than its input is judged on it.
+  async screenshot() {
+    const frame = await this.stamp(this.source.screenshot ? await this.source.screenshot() : await this.source.frame());
+    // Asked for after the input and taken by our own clock after it, it shows the screen since.
+    const after = !this.lastInput || (frame.startedMs ?? frame.capturedMs) >= this.lastInput.sentMs;
+    const shot = { ...frame, settled: frame.moving !== true, screenshot: true, afterInput: this.lastInput?.epoch, proven: after || this.proven(frame) };
+    this.lastSettle = shot;
+    return shot;
   }
   // The newest frame, without waiting for the screen to stop. When the live feed says the screen is
   // still on the last frame seen, with no input since, that frame is the answer and nothing is asked.
@@ -171,9 +182,6 @@ export class World {
     // A picture from a stalled video is older than the screen, whatever its number says.
     if (frame.videoStalled) return false;
     if (!input) return true;
-    // A source that watched the screen since the input and saw it settle without moving has proven
-    // it unchanged, with no newer picture needed.
-    if (frame.settled === true && frame.changedSinceInput === false && frame.observation) return true;
     // A source that numbers its frames says itself whether one is newer than the input (upstream's rule).
     if (frame.observation) return frame.observation !== 'unverified';
     if ((frame.startedMs ?? frame.capturedMs) >= input.sentMs || frame.pictureAfterInput === true) return true;
