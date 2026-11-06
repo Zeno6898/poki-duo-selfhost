@@ -1,0 +1,32 @@
+#!/bin/sh
+# Build build/ocr on Linux: a launcher for native/ocr.py (RapidOCR on onnxruntime)
+# that keeps the PNG-in, JSON-out contract of the macOS Vision helper.
+#
+# By default the pinned packages in native/ocr-requirements.txt go into
+# build/ocr-venv. Set POKI_OCR_PYTHON to an interpreter that already has them
+# (for example a Docker image's system Python) to skip the virtualenv.
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_dir"
+mkdir -p build
+if [ -n "${POKI_OCR_PYTHON:-}" ]; then
+  python=$POKI_OCR_PYTHON
+  launch=$python
+else
+  base=${PYTHON:-python3}
+  command -v "$base" >/dev/null 2>&1 || { echo "build-ocr-linux: $base not found; install Python 3.9 or newer" >&2; exit 1; }
+  if [ ! -x build/ocr-venv/bin/python ]; then
+    "$base" -m venv build/ocr-venv || { rm -rf build/ocr-venv; echo "build-ocr-linux: could not create a virtualenv; install python3-venv or set POKI_OCR_PYTHON" >&2; exit 1; }
+  fi
+  build/ocr-venv/bin/python -m pip install --quiet --disable-pip-version-check -r native/ocr-requirements.txt
+  python=$project_dir/build/ocr-venv/bin/python
+  launch='$here/ocr-venv/bin/python'
+fi
+"$python" -I -c 'import rapidocr, onnxruntime' || { echo "build-ocr-linux: rapidocr or onnxruntime is missing for $python" >&2; exit 1; }
+cat > build/ocr.tmp <<LAUNCHER
+#!/bin/sh
+here=\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)
+exec "$launch" -I "\$here/../native/ocr.py" "\$@"
+LAUNCHER
+chmod 755 build/ocr.tmp
+mv build/ocr.tmp build/ocr

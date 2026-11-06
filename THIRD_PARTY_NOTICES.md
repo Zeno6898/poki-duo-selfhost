@@ -61,6 +61,25 @@ Setup and runtime invoke these separately installed tools. Their versions and bu
 | [FFmpeg](https://github.com/FFmpeg/FFmpeg) | Encode and inspect recordings with `ffmpeg` and `ffprobe` | LGPL-2.1-or-later by default; GPL and other terms depend on the installed build. Run `ffmpeg -L` for that build's terms. |
 | [Git](https://github.com/git/git) | Download and check the pinned idevice checkout during setup | GPL-2.0-only and included third-party notices |
 
+## Linux OCR helper
+
+On Linux, `bin/build-native` (through `bin/build-ocr-linux`) installs the Python packages pinned in [native/ocr-requirements.txt](native/ocr-requirements.txt) into `build/ocr-venv`, and `build/ocr` becomes a launcher for [native/ocr.py](native/ocr.py). On macOS `build/ocr` is still the Vision helper built from `native/ocr.swift`, and none of these packages are installed. The packages are downloaded from PyPI at build time and are not committed here.
+
+| Repository | Packages and pinned versions | License |
+| --- | --- | --- |
+| [RapidOCR](https://github.com/RapidAI/RapidOCR) | `rapidocr` 3.10.0 | Apache-2.0. The wheel retains its `LICENSE` and `MODEL_LICENSES.md`. |
+| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) models, as converted to ONNX and bundled in the `rapidocr` wheel | `PP-OCRv6_det_small`, `PP-OCRv6_rec_small`, `ch_ppocr_mobile_v2.0_cls` | Apache-2.0; copyright in the weights stays with Baidu and the PaddleOCR rights holders, as recorded in the wheel's `MODEL_LICENSES.md`. |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | `onnxruntime` 1.31.1 | MIT, with the third-party notices shipped in the wheel. |
+| [OpenCV](https://github.com/opencv/opencv-python) | `opencv-python-headless` 5.0.0.93 | Apache-2.0 for OpenCV; the wheel's bundled libraries keep their own notices. |
+| [NumPy](https://github.com/numpy/numpy) | `numpy` 2.5.4 | BSD-3-Clause, with bundled-library notices in the wheel. |
+| [Pillow](https://github.com/python-pillow/Pillow) | `pillow` 13.0.0 | MIT-CMU (HPND). |
+| [Shapely](https://github.com/shapely/shapely), [pyclipper](https://github.com/fonttools/pyclipper) | `shapely` 2.2.0, `pyclipper` 1.4.0 | BSD-3-Clause; MIT (pyclipper bundles Clipper, BSL-1.0). |
+| [OmegaConf](https://github.com/omry/omegaconf), [PyYAML](https://github.com/yaml/pyyaml), [Protocol Buffers](https://github.com/protocolbuffers/protobuf), [FlatBuffers](https://github.com/google/flatbuffers) | `omegaconf` 2.4.0, `PyYAML` 6.0.3, `protobuf` 7.36.2, `flatbuffers` 25.12.19 | BSD-3-Clause; MIT; BSD-3-Clause; Apache-2.0. |
+| [Requests](https://github.com/psf/requests), [urllib3](https://github.com/urllib3/urllib3), [idna](https://github.com/kjd/idna), [charset-normalizer](https://github.com/jawah/charset_normalizer), [certifi](https://github.com/certifi/python-certifi) | `requests` 2.34.2, `urllib3` 2.8.0, `idna` 3.20, `charset-normalizer` 3.5.2, `certifi` 2026.10.23 | Apache-2.0; MIT; BSD-3-Clause; MIT; MPL-2.0 (certifi's CA bundle, unmodified). |
+| [tqdm](https://github.com/tqdm/tqdm), [colorlog](https://github.com/borntyping/python-colorlog), [six](https://github.com/benjaminp/six), [packaging](https://github.com/pypa/packaging) | `tqdm` 4.70.1, `colorlog` 6.12.0, `six` 1.17.0, `packaging` 26.3 | MPL-2.0 AND MIT; MIT; MIT; Apache-2.0 OR BSD-2-Clause. |
+
+The Requests stack, tqdm and colorlog are RapidOCR install requirements; `native/ocr.py` uses the bundled models and makes no network requests. The OCR test fixture [test/fixtures/ocr-zh-en.png](test/fixtures/ocr-zh-en.png) is synthetic text rendered by [test/fixtures/make-ocr-fixture.py](test/fixtures/make-ocr-fixture.py) with WenQuanYi Zen Hei (GPL-2.0-or-later with the font embedding exception); the font itself is not committed.
+
 ## Distribution scope
 
 This repository contains source code and the retained notices above. Setup downloads npm packages and builds idevice locally. Precompiled dependency bundles and the external tools are not committed here. A binary distribution must also retain the notices and satisfy the terms of the components actually included in that distribution. Poki's AGPL-3.0-only license does not replace any component's license.
