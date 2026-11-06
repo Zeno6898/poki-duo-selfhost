@@ -7,7 +7,7 @@ import { createServer, definitions } from './tools.mjs';
 import { Coordination } from './coordination.mjs';
 import { Devices } from './device.mjs';
 import { stateDir, endpointFile } from './config.mjs';
-import { warnIfNativeStale } from './build-info.mjs';
+import { warnIfNativeStale, warnIfOcrMissing } from './build-info.mjs';
 import { remoteConfig } from './auth/config.mjs';
 import { createFront } from './auth/front.mjs';
 
@@ -15,6 +15,7 @@ const portIndex = process.argv.indexOf('--port');
 const port = portIndex < 0 ? 47825 : Number(process.argv[portIndex + 1]);
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid port');
 await warnIfNativeStale();
+await warnIfOcrMissing();
 const sessions = new Map();
 const coordinator = new Coordination();
 // Remote access is opt-in (src/auth/config.mjs); with no settings this is the original local daemon.

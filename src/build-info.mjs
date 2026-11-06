@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, stat, access, constants } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
@@ -8,6 +8,16 @@ import { root } from './config.mjs';
 export const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 const execute = promisify(execFile);
 const bridge = join(root, 'build/poki-native');
+export const ocrPath = join(root, 'build/ocr');
+export const ocrMissing = `Text recognition is not installed on this server: ${ocrPath} is missing. Build it with bin/build-ocr-linux on Linux or bin/build-native on macOS. Without it there is no fallback when accessibility shows nothing; use take_screenshot and coordinates.`;
+
+// The OCR helper is a separate build, so a deployment can lack it while everything else works.
+export async function ocrStatus() {
+  return { available: await access(ocrPath, constants.X_OK).then(() => true, () => false), path: ocrPath };
+}
+export async function warnIfOcrMissing() {
+  if (!(await ocrStatus()).available) console.error(`Warning: ${ocrMissing}`);
+}
 
 async function codeMarker() {
   const files = (await readdir(join(root, 'src'), { recursive: true }))

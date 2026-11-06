@@ -9,11 +9,11 @@ import sharp from 'sharp';
 import { root, stateDir, idevice } from './config.mjs';
 import { definitions } from './tools.mjs';
 import { platformTool, inventorySimulators, simulatorModels, readSettings, closePlatform } from './platform.mjs';
-import { interaction, promptWarning, readScreen, screenChanged, justReadMs } from './interaction.mjs';
+import { interaction, promptWarning, readScreen, describeScreen, screenChanged, justReadMs } from './interaction.mjs';
 import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
-import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
+import { version, buildInfo, requireCurrentCode, ocrStatus, ocrMissing, ocrPath } from './build-info.mjs';
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
@@ -21,15 +21,29 @@ const usedSimulators = new Set();
 const approvedTools = new Set(['install_app', 'uninstall_app', 'build_and_run', 'open_url', 'download_app_container', 'get_clipboard', 'set_clipboard']);
 const platformTools = new Set(['start_simulator', 'shut_down_simulator', 'start_recording', 'stop_recording', 'set_appearance', 'set_accessibility', 'list_apps', 'launch_app', 'terminate_app', 'install_app', 'uninstall_app', 'open_settings', 'open_url', 'build_and_run', 'set_location', 'clear_location', 'get_clipboard', 'set_clipboard', 'list_crashes', 'get_crash', 'download_app_container']);
 
-const settleMs = 600, readbackMs = 5000;
+// A simulator reads its screen in about 0.2 s, so five seconds covers the two reads that call a screen
+// still. A phone over a network tunnel can take two seconds or more per read, so its budget follows
+// the reads it has just measured, up to a cap.
+const settleMs = 600, readbackMs = 5000, maxReadbackMs = 12000;
 const reportsScreen = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'swipe', 'drag', 'scroll', 'pinch', 'type_text', 'fill', 'press_key', 'press_button', 'go_back', 'handle_alert', 'system_gesture']);
 // These exist to act on a control, so the reply says when nothing was seen to change after one.
 const touchesControl = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'go_back', 'handle_alert']);
+// Touches aimed by coordinates. A run of them in a batch (selecting photos, paging a carousel) is
+// written for one screen, so the steps between them are not held back to read it.
+const geometricTouches = new Set(['tap', 'double_tap', 'long_press', 'swipe', 'drag', 'scroll', 'pinch']);
 const unchangedAdvice = 'The touch was sent, and no change was observed after it: accessibility reports the same elements, text, values, state (selected, enabled, focused) and positions. That is not proof it failed: its effect may be one accessibility does not report, such as a redrawn image or canvas, or may not have appeared yet. Nothing else was done. If a change was expected, check that the target is not covered or still loading before sending it again.';
 const onScreen = ({ width, height }) => element => {
   const box = element.frame ?? element;
   return box.x < width && box.y < height && box.x + box.width > 0 && box.y + box.height > 0;
 };
+
+// "unknown" means the screen could not be compared, never that nothing happened. screen_change_verified and
+// screen_changed are the earlier two-field form, kept for clients that read them.
+export function screenChange(before, after) {
+  if (before === undefined || after === undefined) return { screen_change: 'unknown', screen_change_verified: false };
+  const changed = after !== before;
+  return { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
+}
 
 export function hidPoint(x, y, width, height) {
   if (![x,y,width,height].every(Number.isFinite) || width < 2 || height < 2 || x < 0 || y < 0 || x >= width || y >= height) throw new Error(`Coordinates must be inside the screen (${width} × ${height} points).`);
@@ -38,7 +52,7 @@ export function hidPoint(x, y, width, height) {
 
 export class Devices {
   selected; requested; frame; size; seen; elements = []; elementsAt = 0; lastInputAt = -Infinity; inBatch = false;
-  scales = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
+  scales = new Map(); readCosts = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
     const result = await execute(file, args, { timeout, input });
@@ -200,10 +214,11 @@ export class Devices {
     return frame.ocr ??= phase('ocr', () => this.readOCR(frame));
   }
   async readOCR(frame) {
+    if (!(await ocrStatus()).available) throw new Error(ocrMissing);
     const file = join(stateDir, 'frames', `${randomUUID()}-ocr.png`);
     try {
       await writeFile(file, frame.data, { mode: 0o600 });
-      const { stdout } = await this.run(join(root, 'build/ocr'), [file]);
+      const { stdout } = await this.run(ocrPath, [file]);
       return JSON.parse(stdout).map(e => ({ ...e, label: e.text, type: 'StaticText', frame: { x:e.x,y:e.y,width:e.width,height:e.height } }));
     } finally { await unlink(file).catch(() => {}); }
   }
@@ -219,7 +234,8 @@ export class Devices {
       } catch (error) { if (stopped(error)) throw error; nativeError = error.message; if (args.source === 'accessibility' || args.source === 'ax') throw error; }
     }
     if (!elements) {
-      elements = await this.ocr(frame);
+      try { elements = await this.ocr(frame); }
+      catch (error) { if (stopped(error) || !nativeError) throw error; throw new Error(`Accessibility returned nothing (${nativeError}), and the text fallback failed: ${error.message}`); }
       source = 'ocr';
     }
     if (!args.include_offscreen) elements = elements.filter(onScreen(frame));
@@ -235,7 +251,10 @@ export class Devices {
   async structure(maxAge = 0) {
     const target = await this.target();
     if (this.seen?.device === target.id && performance.now() - this.seen.at <= maxAge) return this.seen;
+    const started = performance.now();
     const tree = await phase('accessibility', () => this.bridge({ op: 'ax', include_offscreen: false }));
+    this.readCosts.set(target.id, performance.now() - started);
+    if (tree.foreground?.pid) this.lastForeground = { device: target.id, pid: tree.foreground.pid };
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     const signature = JSON.stringify(elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; }));
@@ -245,18 +264,39 @@ export class Devices {
   // current orientation, so it keeps taking a fresh frame.
   async screenSize() {
     const target = await this.target();
-    return target.kind === 'simulator' && this.size?.device === target.id ? this.size : this.viewport();
+    // Inside a batch a phone keeps the size its first step measured; a rotate step clears it.
+    return (target.kind === 'simulator' || this.inBatch) && this.size?.device === target.id ? this.size : this.viewport();
   }
   // Reading the result back saves the caller a round trip to look. The action has already happened,
   // so a failed read only loses the report; a stop request still surfaces as a stop.
+  readCost() { return this.readCosts.get(this.resolved?.id) ?? 0; }
+  // Within a batch, a read is as fresh as the time another would take to arrive.
+  reuseMs() { return Math.max(justReadMs, this.readCost()); }
+  // A batch compares a touch with the screen before it only when that can hold back a later step:
+  // with stop_on_error off nothing is held back, and a next step aimed by coordinates is written
+  // for the same screen. The batch still ends with one read of the screen.
+  checksStep() {
+    if (!this.inBatch) return true;
+    const { next, stopOnError } = this.batchStep ?? {};
+    return stopOnError !== false && !geometricTouches.has(next?.tool);
+  }
+  observationBudget(target) {
+    const cost = this.readCosts.get(target.id);
+    if (target.kind === 'simulator' || cost === undefined) return readbackMs;
+    return Math.min(maxReadbackMs, Math.max(readbackMs, 3 * cost + settleMs));
+  }
   async readback(before) {
     try {
-      const { signature, screen } = await deadline(readbackMs, () => readScreen(this));
-      const compared = before !== undefined && signature !== undefined;
-      return { screen, screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
+      const target = await this.target();
+      const { signature, screen } = await deadline(this.observationBudget(target), () => readScreen(this));
+      return { screen, ...screenChange(before, signature) };
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
-      return { screen_change_verified: false, screen: { unavailable: error.message } };
+      // Input clears the last read, so one left now was taken after the action: report it rather than nothing.
+      const seen = this.seen?.device === this.resolved?.id && this.seen.elements.length ? this.seen : undefined;
+      if (!seen) return { ...screenChange(), screen: { unavailable: error.message } };
+      // One read that differs settles a change; a matching one needed a second read to confirm it.
+      return { ...screenChange(before, before !== undefined && seen.signature !== before ? seen.signature : undefined), screen: { ...describeScreen(seen), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
     }
   }
   // The action does not depend on this read, so a slow read only costs the comparison.
@@ -266,11 +306,11 @@ export class Devices {
   // A batch step reports only whether its touch changed the screen; the batch ends with the screen itself.
   async changedSince(before) {
     try {
-      const changed = await deadline(readbackMs, () => screenChanged(this, before));
-      return changed === undefined ? {} : { screen_change_verified: true, screen_changed: changed };
+      const changed = await deadline(this.observationBudget(await this.target()), () => screenChanged(this, before));
+      return changed === undefined ? screenChange() : { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
     } catch {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
-      return {};
+      return screenChange();
     }
   }
   // Lets the app react to the last input, so a read shows the new page rather than the old one.
@@ -323,20 +363,22 @@ export class Devices {
       checkWork();
       if (name !== 'poki_mcp_status' && name !== 'stop_recording') await requireCurrentCode();
       if (approvedTools.has(name)) await this.target();
-      if (approvedTools.has(name) && process.env.POKI_MCP_APPROVAL_MODE !== 'allow') {
+      // Says on the result who let it run, so an agent can tell a gated call from an ordinary one.
+      const approval = !approvedTools.has(name) ? undefined : process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? { mode: 'operator-preapproved', approved_by: 'operator' } : { mode: 'ask-human', approved_by: 'human' };
+      if (approval?.mode === 'ask-human') {
         const detail = args.path ?? args.project_path ?? args.bundle_id ?? args.url ?? (name === 'set_clipboard' ? `${Buffer.byteLength(args.text)} 字节的文本` : '');
         const action = { install_app: '安装应用', uninstall_app: '卸载应用', build_and_run: '构建并运行应用', open_url: '打开链接', download_app_container: '下载应用数据', get_clipboard: '读取剪贴板', set_clipboard: '写入剪贴板' }[name];
         const result = await askHuman(`是否允许${action}？\n设备：${args.device ?? this.selected ?? '当前选中的设备'}\n${detail}`, 120);
         if (!result.completed) return { isError: true, ...text({ ...result, executed: false }), _meta: { stop_reason: result.status === 'timeout' ? 'timeout' : 'cancelled' } };
       }
       if (platformTools.has(name)) {
-        const { _meta, ...result } = await platformTool(this, name, args);
+        const { _meta, ...result } = { ...await platformTool(this, name, args), ...(approval ? { approval } : {}) };
         if (name === 'start_simulator') usedSimulators.add(this.selected);
         return { ...text(result), ...(result.isError ? { isError: true } : {}), ...(_meta || result.stop_reason ? { _meta: { ..._meta, ...(result.stop_reason ? { stop_reason: result.stop_reason } : {}) } } : {}) };
       }
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
-        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human' });
+        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), ocr: await ocrStatus(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
         case 'list_devices': return text({ devices: await this.describeDevices(args.include_all_simulators), ...(args.include_all_simulators ? { simulator_models: await simulatorModels() } : {}) });
         case 'select_device': {
           this.requested = args.device;
@@ -361,7 +403,7 @@ export class Devices {
           let prompt;
           try { prompt = { status:'checked', source:'ocr', warning:promptWarning(await this.ocr(frame)) }; }
           catch (error) { if (stopped(error)) throw error; prompt = { status:'unavailable', instruction:'Inspect the screenshot for system prompts before continuing.' }; }
-          return { content: [...text({ observation: this.observation(frame) }).content, { type: 'text', text: `Screen: ${frame.width} × ${frame.height} points. Image width: ${width} pixels. Coordinates for tools are screen points. Source: lossless device capture.\nPrompt check: ${JSON.stringify(prompt)}` }, { type:'image',data:jpeg.toString('base64'),mimeType:'image/jpeg' }] };
+          return { content: [...text({ observation: this.observation(frame) }).content, { type: 'text', text: `Screen: ${frame.width} × ${frame.height} points. Image width: ${width} pixels. Coordinates for tools are screen points. Source: lossless device capture. Captured through the developer screenshot service; not saved to the device's Photos library.\nPrompt check: ${JSON.stringify(prompt)}` }, { type:'image',data:jpeg.toString('base64'),mimeType:'image/jpeg' }] };
         }
         case 'save_screenshot': {
           let path = args.path ?? join(homedir(), 'Pictures', 'Poki MCP');
@@ -412,10 +454,10 @@ export class Devices {
         // Without await, the finally below restores the device state while the first step is still looking up its device.
         case 'batch_commands': return await runBatch(this, args);
         default: {
-          const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name);
+          const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
           this.beforeInput = undefined;
           // A batch step may reuse the read its predecessor just took of the same screen.
-          const before = looks || touches ? await this.readBefore(this.inBatch ? justReadMs : 0) : undefined;
+          const before = looks || touches ? await this.readBefore(this.inBatch ? this.reuseMs() : 0) : undefined;
           let result = await interaction(this,name,args);
           if(result===undefined) throw new Error(`No implementation for ${name}`);
           const delivered = result.sent === true && !result.isError && !result.stopped;
@@ -423,7 +465,9 @@ export class Devices {
           const sentTo = this.beforeInput ?? before, signature = sentTo?.elements.length ? sentTo.signature : undefined;
           if (looks && delivered) result = { ...result, ...await this.readback(signature) };
           else if (touches && delivered && signature !== undefined) result = { ...result, ...await this.changedSince(signature) };
-          const unchanged = touches && result.screen_changed === false && !result.stopped;
+          // The input layers answer screen_change_verified false before anything is read, which means not looked at, not unchanged.
+          if (result.screen_change === undefined && result.screen_change_verified === false && !this.inBatch) result = { ...result, screen_change: 'unknown' };
+          const unchanged = touches && result.screen_change === 'unchanged' && !result.stopped;
           if (unchanged) result = { ...result, instruction: unchangedAdvice };
           // The input layers always answer false here. Only a touch is compared inside a batch; the batch ends with the screen.
           if (this.inBatch && result.screen_change_verified === false) { const { screen_change_verified, ...rest } = result; result = rest; }
