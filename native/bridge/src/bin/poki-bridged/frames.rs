@@ -38,6 +38,10 @@ const THUMB_WIDTH: u32 = 96;
 const PIXEL_DELTA: u8 = 12;
 /// Picture numbers, across every stream this daemon opens, so they only grow.
 static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Media session numbers: each Frames (one media session's stream) takes the next one. With the
+/// epoch (the frame's sequence number) it names a frame the way upstream's frame cache does:
+/// generation, seq, capture time, size, orientation and scale.
+static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How long the copies are kept for `frame_diff`.
 const RING: Duration = Duration::from_secs(5);
 
@@ -158,6 +162,10 @@ struct Screen {
     first_picture_after_ms: Option<u64>,
     /// Bumped for every picture and input, to wake waiters.
     generation: u64,
+    /// This stream's media session number (see SESSIONS).
+    session: u64,
+    /// The screen in points, from the newest accessibility tree's Application frame.
+    points: Option<(f64, f64)>,
 }
 
 enum Job {
@@ -214,7 +222,10 @@ impl Frames {
 
     /// Frames from any datagram source (the media session's UDP socket, or a test's).
     fn over<S: Datagrams>(socket: S, decode: bool) -> Self {
-        let screen = Arc::new(Mutex::new(Screen::default()));
+        let screen = Arc::new(Mutex::new(Screen {
+            session: SESSIONS.fetch_add(1, Ordering::SeqCst) + 1,
+            ..Screen::default()
+        }));
         let (jobs, queue) = mpsc::channel();
         let (notify, changed) = tokio::sync::watch::channel(0u64);
         let notify = Arc::new(notify);
@@ -282,6 +293,8 @@ pub struct State {
     pub last_input_wall: Option<SystemTime>,
     /// The media session closed; a new one has a new stream.
     pub closed: bool,
+    /// The media session number (upstream's session generation).
+    pub session: u64,
 }
 
 impl Live {
@@ -331,7 +344,45 @@ impl Live {
             last_input: screen.last_input,
             last_input_wall: screen.last_input_wall,
             closed: screen.closed,
+            session: screen.session,
         }
+    }
+
+    /// Learns the screen's size in points from an accessibility tree (its Application frame), so
+    /// frames can say their scale.
+    pub fn note_points(&self, tree: &Value) {
+        let points = tree
+            .get("elements")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find_map(|element| {
+                (element.get("role")?.as_str()? == "Application").then_some(())?;
+                let frame = element.get("frame")?;
+                Some((
+                    frame.get("width")?.as_f64()?,
+                    frame.get("height")?.as_f64()?,
+                ))
+            })
+            .filter(|(w, h)| *w > 0.0 && *h > 0.0);
+        if let Some(points) = points {
+            self.screen.lock().unwrap().points = Some(points);
+        }
+    }
+
+    /// A frame's identity: generation (media session), seq (its epoch), capture time, size in
+    /// pixels, orientation (from the size) and scale (pixels per point, once a tree has given the
+    /// screen's size in points; null before).
+    pub fn identity(&self, seq: u64, captured: SystemTime, width: u32, height: u32) -> Value {
+        let screen = self.screen.lock().unwrap();
+        identity(&screen, seq, captured, width, height)
+    }
+
+    /// The identity of the newest frame, if there is one.
+    pub fn latest_identity(&self) -> Option<Value> {
+        let screen = self.screen.lock().unwrap();
+        let (_, wall, width, height) = screen.latest?;
+        Some(identity(&screen, screen.epoch, wall, width, height))
     }
 
     /// Waits until the screen is settled, for at most `timeout`; whether it settled.
@@ -802,6 +853,23 @@ fn decode_loop(
     }
 }
 
+fn identity(screen: &Screen, seq: u64, captured: SystemTime, width: u32, height: u32) -> Value {
+    // Points keep the portrait order; a landscape picture swaps them.
+    let landscape = width > height;
+    let scale = screen.points.map(|(w, h)| {
+        let across = if landscape { w.max(h) } else { w.min(h) };
+        (f64::from(width) / across * 1000.0).round() / 1000.0
+    });
+    json!({
+        "generation": screen.session,
+        "seq": seq,
+        "captured_at": crate::ax::watch::stamp_at(captured),
+        "size": [width, height],
+        "orientation": if landscape { "landscape" } else { "portrait" },
+        "scale": scale,
+    })
+}
+
 /// NAL unit types in an Annex-B buffer, with their offsets (the start of the start code).
 fn nal_units(buf: &[u8]) -> impl Iterator<Item = (usize, u8)> + '_ {
     let mut i = 0;
@@ -867,6 +935,28 @@ mod tests {
         let d = compare(&thumb(a, 10), &thumb(b, 10));
         assert_eq!(d.changed, 10.0 / 200.0);
         assert_eq!(d.region, Some([0.2, 0.5, 0.2, 0.25]));
+    }
+
+    #[test]
+    fn a_frame_names_its_session_seq_size_orientation_and_scale() {
+        let mut screen = Screen {
+            session: 3,
+            ..Screen::default()
+        };
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1500);
+        let frame = identity(&screen, 41, at, 1206, 2622);
+        assert_eq!(frame["generation"], 3);
+        assert_eq!(frame["seq"], 41);
+        assert_eq!(frame["captured_at"], "1970-01-01T00:00:01.500Z");
+        assert_eq!(frame["orientation"], "portrait");
+        assert_eq!(frame["scale"], Value::Null, "unknown before a tree");
+        screen.points = Some((402.0, 874.0));
+        assert_eq!(identity(&screen, 41, at, 1206, 2622)["scale"], 3.0);
+        let wide = identity(&screen, 42, at, 2622, 1206);
+        assert_eq!(
+            (wide["orientation"].clone(), wide["scale"].clone()),
+            (json!("landscape"), json!(3.0))
+        );
     }
 
     #[test]

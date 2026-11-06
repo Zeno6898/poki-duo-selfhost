@@ -162,9 +162,16 @@ pub async fn subscribe(
     }
     log("subscribe_frames: feed open");
     let mut seq = 0u64;
+    // The media session the feed is following, for every event.
+    let generation = std::cell::Cell::new(None::<u64>);
     let mut emit = async |write: &mut tokio::net::unix::OwnedWriteHalf, mut event: Value| {
         seq += 1;
         event["seq"] = seq.into();
+        if event.get("generation").is_none()
+            && let Some(generation) = generation.get()
+        {
+            event["generation"] = generation.into();
+        }
         if event.get("at").is_none() {
             event["at"] = stamp().into();
         }
@@ -191,6 +198,7 @@ pub async fn subscribe(
                 }
             }
         };
+        generation.set(Some(live.state(settle).session));
         if emit(write, json!({"event": "media", "state": "open"}))
             .await
             .is_err()
@@ -234,6 +242,7 @@ pub async fn subscribe(
                     "captured_at": now.latest.map(|l| stamp_at(l.1)),
                     "size": now.latest.map(|l| [l.2, l.3]),
                     "epoch": now.epoch,
+                    "frame": live.latest_identity(),
                 });
                 if let Some(previous) = last_settled_at
                     && let Some((difference, _, _)) = live.diff(previous.elapsed(), Duration::ZERO)
@@ -331,6 +340,9 @@ async fn read_text(live: &Live, op: &str, object: &Map<String, Value>) -> Result
             let _ = tokio::time::timeout_at(deadline.into(), watcher.changed()).await;
         }
     }
+    if !crate::ocr::enabled() {
+        return Err("OCR is off: start the daemon with POKI_LIVE_OCR=1".into());
+    }
     let ocr = crate::ocr::shared();
     let started = Instant::now();
     let (reading, picture) = ocr.read_live(live, region, Duration::from_secs(5)).await?;
@@ -340,6 +352,7 @@ async fn read_text(live: &Live, op: &str, object: &Map<String, Value>) -> Result
         "elements": reading.json(),
         "box": region,
         "epoch": picture.epoch,
+        "frame": live.identity(picture.epoch, picture.wall, picture.width, picture.height),
         "epoch_matches": wanted.map(|wanted| wanted == picture.epoch),
         "latest_epoch": state.epoch,
         "captured_at": stamp_at(picture.wall),
@@ -384,6 +397,9 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
         "last_input_ms_ago": state.last_input.map(ago),
         "changed_since_input": state.last_input.map(|input| state.last_change.is_some_and(|(at, _)| at > input)),
         "picture_after_input": state.last_input.map(|input| jpeg.arrived > input),
+        // Upstream's rule: after an action, a frame not proven newer than it is unverified.
+        "observation": observation(jpeg.epoch, state.last_input_epoch),
+        "frame": live.identity(jpeg.epoch, jpeg.wall, state.latest.map_or(jpeg.width, |l| l.2), state.latest.map_or(jpeg.height, |l| l.3)),
         "screen_change_verified": false,
     });
     match object.get("path").and_then(Value::as_str) {
@@ -394,6 +410,16 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
         None => answer["jpeg_base64"] = base64(&jpeg.bytes).into(),
     }
     Ok(answer)
+}
+
+/// "after_input" when the frame is newer than the last input, "unverified" when it cannot be
+/// shown to be, "no_input" before any input.
+pub fn observation(seq: u64, last_input_epoch: Option<u64>) -> &'static str {
+    match last_input_epoch {
+        None => "no_input",
+        Some(at_input) if seq > at_input => "after_input",
+        Some(_) => "unverified",
+    }
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -423,6 +449,13 @@ pub const REOPEN_AFTER: Duration = Duration::from_secs(3);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_is_after_an_input_only_when_its_number_is_newer() {
+        assert_eq!(observation(7, None), "no_input");
+        assert_eq!(observation(7, Some(7)), "unverified");
+        assert_eq!(observation(8, Some(7)), "after_input");
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {
@@ -577,6 +610,7 @@ pub struct TreeRead {
     pub requested: Instant,
     pub wall: std::time::SystemTime,
     pub epoch: u64,
+    pub generation: u64,
     pub read_ms: u64,
 }
 
@@ -586,6 +620,7 @@ impl TreeRead {
         json!({
             "request_started_at": stamp_at(self.wall),
             "request_epoch": self.epoch,
+            "request_generation": self.generation,
             "current": live.unchanged_since(self.requested),
         })
     }
@@ -663,7 +698,8 @@ pub type TreeReader =
 /// Runs for the daemon's life with live frames on: starts a read whenever the screen settles
 /// after a change or input and no current read exists, and drops reads the screen outran.
 pub async fn prefetch_loop(state: Rc<State>) {
-    if std::env::var("POKI_LIVE_AX_PREFETCH").as_deref() == Ok("0") {
+    // Opt-in: an accessibility read on every settle is extra load on the phone.
+    if std::env::var("POKI_LIVE_AX_PREFETCH").as_deref() != Ok("1") {
         return;
     }
     loop {
@@ -780,12 +816,14 @@ async fn read_ahead(
     }
     match result {
         Ok(tree) if live.unchanged_since(requested) => {
+            live.note_points(&tree);
             p.reads += 1;
             p.ready = Some(TreeRead {
                 tree,
                 requested,
                 wall,
                 epoch,
+                generation: live.state(settle_time()).session,
                 read_ms: requested.elapsed().as_millis() as u64,
             });
         }

@@ -185,7 +185,7 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let prefetcher =
         live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     // Load the OCR models before the first type_text or ocr_region needs them.
-    if live::enabled() {
+    if live::enabled() && crate::ocr::enabled() {
         tokio::task::spawn_local(async { crate::ocr::shared().warm().await });
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -432,6 +432,35 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
         }
         op if live::is_live_op(op) => {
             return Box::pin(live::answer(op, id, object, state, closed)).await;
+        }
+        "ax_audit_probe" => {
+            let started = Instant::now();
+            let mut timings = Timings::default();
+            let result = Box::pin(async {
+                let mut session = state.session.lock().await;
+                session.connect(&mut timings).await?;
+                let live = session.live_view();
+                let device = &session.link.as_ref().expect("connected").device;
+                let (mut adapter, rsd) = (device.adapter.clone(), device.rsd.clone());
+                drop(session);
+                let seconds = object
+                    .get("seconds")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(10.0);
+                let event_type = object.get("event_type").and_then(Value::as_i64);
+                crate::ax::audit::probe(&mut adapter, &rsd, live, seconds, event_type).await
+            })
+            .await;
+            timings.total_ms = ms(started);
+            log(&format!(
+                "ax_audit_probe: {} in {} ms",
+                if result.is_ok() { "ok" } else { "error" },
+                timings.total_ms
+            ));
+            return Some(match result {
+                Ok(output) => success(id, &output, timings),
+                Err(error) => failure(id, &*error, timings),
+            });
         }
         "reset" => {
             state.session.lock().await.reset().await;
@@ -1013,6 +1042,9 @@ impl Session {
         }
         let requested = Instant::now();
         let tree = Box::pin(self.watched_tree(timings)).await?;
+        if let Some(live) = &live {
+            live.note_points(&tree);
+        }
         let asked = self
             .ax
             .as_ref()
@@ -1023,6 +1055,7 @@ impl Session {
         let provenance = json!({
             "request_started_at": crate::ax::watch::stamp_at(wall),
             "request_epoch": live.as_ref().map(|live| live.epoch_at(asked)),
+            "request_generation": live.as_ref().map(|live| live.state(Duration::ZERO).session),
             "current": live.as_ref().map(|live| live.unchanged_since(asked)),
         });
         timings.tree = Some(provenance.clone());
