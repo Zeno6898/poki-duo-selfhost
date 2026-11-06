@@ -82,7 +82,7 @@ jobs:
           curl -s -m 2 localhost:8100/status | head -c 300; echo
           mkdir -p shots; xcrun simctl io "$UDID" screenshot shots/as-test-home.png || true
           xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" || true
-          sleep 4; xcrun simctl io "$UDID" screenshot shots/as-test-opened.png || true
+          sleep 8; xcrun simctl io "$UDID" screenshot shots/as-test-opened.png || true
           pkill -f test-without-building || true; sleep 5; tail -30 poki.log
           echo "POKI_HOST_TEST=$ok" >> "$GITHUB_ENV"
       - name: Poki host opened by hand
@@ -90,7 +90,7 @@ jobs:
           APP="$PRODUCTS/$RUNNER"; ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
           xcrun simctl terminate "$UDID" "$ID" || true
           xcrun simctl install "$UDID" "$APP"
-          xcrun simctl launch "$UDID" "$ID"; sleep 5
+          xcrun simctl launch "$UDID" "$ID"; sleep 8
           xcrun simctl io "$UDID" screenshot shots/by-hand.png
           if curl -s -m 2 localhost:8100/status > /dev/null; then echo "by hand: WDA is up (a test started)"; byhand=bad; else echo "by hand: no test, WDA is not up"; byhand=ok; fi
           xcrun simctl spawn "$UDID" launchctl list | grep -i webdriver || true
