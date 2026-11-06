@@ -68,7 +68,7 @@ class LedgerPhone extends Devices {
     if (request.op === 'ax' && this.axDelayMs) await new Promise(r => setTimeout(r, this.axDelayMs));
     if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: this.pidOnly ? { pid: tree.foreground.pid } : tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
     if (request.op === 'app_for_pid') { this.lookups = (this.lookups ?? 0) + 1; return request.pid === ledger.pid ? { bundle_id: ledger.bundle_id, name: 'Ledger' } : { executable: '/System/Library/CoreServices/SpringBoard.app/SpringBoard' }; }
-    if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
+    if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.locked) return { pid: ledger.pid, bundle_id: ledger.bundle_id }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
     if (request.op === 'drag') {
       this.drags.push(request);
       const [x1, y1, x2] = [request.x1 / 65535 * (W - 1), request.y1 / 65535 * (H - 1), request.x2 / 65535 * (W - 1)];
@@ -368,4 +368,28 @@ test('a screenshot taken in place of a stalled video is a current picture, and n
   const frame = await world.settle(1000);
   assert.equal(frame.proven, true);
   assert.equal((await world.read(frame, { budgetMs: 500 })).foreground.bundle_id, 'local.ledger');
+});
+
+test('a launch the app service accepted is reported as sent even when the app stays behind a lock screen', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  phone.locked = true;
+  await phone.call('observe', {});
+  const result = await phone.call('act', { action: { tool: 'launch_app', arguments: { bundle_id: 'local.ledger' } }, expect: { foreground: 'local.ledger' } });
+  const answer = body(result);
+  assert.equal(answer.sent, true);
+  assert.match(answer.error, /launched it as pid 501\. If the phone is locked or its screen is off, unlock it/);
+  assert.equal(answer.now.outcome, 'unchanged');
+  assert.doesNotMatch(answer.now.reason, /no input was sent/);
+  assert.equal(answer.delivery, undefined);
+});
+
+test('a locked phone reported by the bridge blocks inputs as a device problem', { timeout: 30000 }, async () => {
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date().toISOString(), settled: true, observation: 'no_input' });
+  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: false, reasons: ['device_locked'] }) });
+  const phone = new LedgerPhone({ live });
+  const answer = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } }));
+  assert.equal(answer.sent, false);
+  assert.equal(answer.now.blocked.kind, 'device');
+  assert.match(answer.now.summary, /^The phone is locked or its screen is off; unlock it/);
+  assert.equal(phone.app.page, 'home');
 });

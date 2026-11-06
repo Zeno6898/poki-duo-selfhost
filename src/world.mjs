@@ -122,6 +122,9 @@ const lostText = {
   unreachable: 'The device bridge is not answering. Inputs are held until it does.',
 };
 lostText.needs_wifi = lostText.wifi_required;
+// Reasons that are about the phone itself rather than the connection to it.
+const deviceReasons = new Set(['device_locked', 'screen_locked', 'locked', 'screen_off']);
+for (const reason of deviceReasons) lostText[reason] = 'The phone is locked or its screen is off; unlock it. Inputs are held until it is unlocked.';
 // Reasons the picture may be old while inputs still work: reported as unverified, not blocked.
 const degraded = new Set(['video_stalled', 'decode_backlog', 'picture_damaged']);
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
@@ -190,7 +193,7 @@ export class World {
     if (!stalled && !lost) return undefined;
     return {
       ...(stalled ? { stalled: { ms: frame?.stalledMs ?? null, lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
-      ...(lost ? { lost: { reason: lost, text: lostText[lost] ?? `The device connection reports ${lost}. Inputs are held until it recovers.` } } : {}),
+      ...(lost ? { lost: { kind: deviceReasons.has(lost) ? 'device' : 'connection', reason: lost, text: lostText[lost] ?? `The device connection reports ${lost}. Inputs are held until it recovers.` } } : {}),
     };
   }
   // Whether this frame is the same picture as one seen earlier (same epoch, or no pixel change).

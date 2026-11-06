@@ -189,7 +189,7 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
     text: { of: condition?.stalled ? new Date().toISOString() : new Date(frame.capturedMs).toISOString(), source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
     ...(view.tree === 'pending' ? { tree: 'pending' } : {}),
     ...(full || refsInvalid ? { elements } : {}),
-    ...(condition?.lost ? { blocked: { kind: 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, text: lines.slice(0, 6) } } : {}),
+    ...(condition?.lost ? { blocked: { kind: condition.lost.kind ?? 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, text: lines.slice(0, 6) } } : {}),
     ...(typed ? { typed } : {}),
   };
 }
@@ -271,8 +271,13 @@ async function step(ctx, world, agent, item, { timeoutMs }) {
   }
   const answer = item.tool === 'select_items' ? await selectItems(ctx, world, agent, item.arguments ?? {}) : await send(ctx, world, agent, item);
   // Launching goes to the device's app service, not its input, so the World is told here.
-  if (appTools.has(item.tool) && !answer.isError && !(world.lastInput?.sentMs >= started)) world.noteInput(item.tool);
-  const sent = answer.sent === true || appTools.has(item.tool) && !answer.isError || world.lastInput?.sentMs >= started;
+  // A launch that returned a pid reached the device even when its app did not come to the front, and
+  // one whose outcome is unknown may have: neither is reported as not sent.
+  const delivered = appTools.has(item.tool) && (!answer.isError || Number.isSafeInteger(answer.pid) || answer.outcome === 'unknown');
+  if (delivered && !(world.lastInput?.sentMs >= started)) world.noteInput(item.tool);
+  const sent = answer.sent === true || delivered || world.lastInput?.sentMs >= started;
+  // The app service started the app, yet it is not in front: on a phone that is mostly a lock screen.
+  if (item.tool === 'launch_app' && answer.isError && Number.isSafeInteger(answer.pid)) answer.message = `${String(answer.error ?? 'The launched app did not come to the front').replace(/\.$/, '')}, although the app service launched it as pid ${answer.pid}. If the phone is locked or its screen is off, unlock it.`;
   const judged = await judge(world, base, { expect: item.expect, timeoutMs });
   return { base, judged, sent, answer, expect: item.expect, sentMs: sent ? world.lastInput?.sentMs : undefined };
 }
@@ -310,7 +315,7 @@ export async function act(ctx, args) {
     ...(answer.isError ? { error: answer.message ?? answer.error ?? 'The step failed.' } : {}),
     // Which list a scroll moved, from the trees read for the frames on either side of it.
     ...(/^scroll/.test(args.action.tool) && base.elements && judged.view.tree === 'current' ? { moved: whatMoved(base.elements, judged.view.elements) } : {}),
-    ...(answer.outcome === 'unknown' ? { delivery: 'unknown', instruction: 'The input may have been delivered. Do not send it again before checking now.' } : {}),
+    ...(answer.outcome === 'unknown' && !Number.isSafeInteger(answer.pid) ? { delivery: 'unknown', instruction: 'The input may have been delivered. Do not send it again before checking now.' } : {}),
     now,
   };
   return { ...(answer.isError ? { isError: true } : {}), ...await reply(ctx, world, body, judged.frame, args.full) };
