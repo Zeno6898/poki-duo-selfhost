@@ -87,3 +87,54 @@ The relay's namespaces are `poki-relay_DeviceRelay` (`ed9e180c5df4453c898b191550
 - **Worker requests.** `worker.requests` counts against the 10M included each month.
 
 The account's billing page (Manage Account → Billing → Billable usage) shows the same numbers a day late. If you want warnings, set a Billing notification there for Workers usage.
+
+## Cloudflare Access and the cut-over
+
+Cloudflare Access is checked before the Worker runs. The old "Poki MCP" app covers the whole host, so the relay's paths have their own bypass apps, and the more specific path wins. Each bypass app has one policy that lets everyone through. There is no sign-in, because the relay does its own OAuth.
+
+Zone `zheha.nz` is `b31403b7d3be18a6ad7689a364ad3fc2`.
+
+| Access app | id | Covers |
+|---|---|---|
+| Poki relay v1 (bypass) | `e299a7cd-ba26-44c7-8ddc-1545bbe07ac0` | `pokimcp.zheha.nz/v1` |
+| Poki relay well-known (bypass) | `9187a0b6-1974-4c99-a87c-227de0abd0fe` | `pokimcp.zheha.nz/.well-known` |
+| Poki MCP (old daemon, "ZhehanZ Only" allow policy) | `6c6b4223-148b-4a02-bd3b-cc88cc448568` | `pokimcp.zheha.nz` |
+
+### Recreate a bypass app
+
+You need this on a new account, or if one of the apps was deleted. Run it once per path, with `/v1` or `/.well-known`:
+
+```sh
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/access/apps" \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"name":"Poki relay v1 (bypass)","type":"self_hosted",
+       "domain":"pokimcp.zheha.nz/v1","destinations":[{"type":"public","uri":"pokimcp.zheha.nz/v1"}],
+       "session_duration":"24h","app_launcher_visible":false,
+       "policies":[{"name":"Everyone (bypass)","decision":"bypass","include":[{"everyone":{}}],"precedence":1}]}'
+```
+
+### Retire the old daemon (one-way; do it only once the phone app has replaced it)
+
+Do these steps in order. Until step 2, the tunnel keeps serving everything outside `/v1` and `/.well-known`.
+
+1. **Give the hostname a record that does not point at the tunnel.** Zone routes only run on a proxied record. Replace the tunnel CNAME (`99ffe9e8132b3ae3cf8b6a8cd4fa0382`) with a proxied placeholder. Create the new record first, then delete the CNAME:
+
+   ```sh
+   curl -X DELETE "https://api.cloudflare.com/client/v4/zones/b31403b7d3be18a6ad7689a364ad3fc2/dns_records/99ffe9e8132b3ae3cf8b6a8cd4fa0382" -H "Authorization: Bearer $TOKEN"
+   curl -X POST   "https://api.cloudflare.com/client/v4/zones/b31403b7d3be18a6ad7689a364ad3fc2/dns_records" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+     -d '{"type":"AAAA","name":"pokimcp","content":"100::","proxied":true,"comment":"Workers routes only (poki-relay)"}'
+   ```
+
+   Cloudflare refuses a second record with the same name, so run the DELETE right before the POST. Expect a few seconds of errors in between. As an alternative, swap both routes for a Workers Custom Domain on `pokimcp.zheha.nz`, which creates its own record.
+2. **Stop falling through to the origin.** Set `ORIGIN_FALLBACK` to `0`, as described under [Lower a cap](#lower-a-cap). Paths the Worker does not own then get 404 instead of the placeholder's error.
+3. **Delete the old Access app.**
+
+   ```sh
+   curl -X DELETE "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/access/apps/6c6b4223-148b-4a02-bd3b-cc88cc448568" -H "Authorization: Bearer $TOKEN"
+   ```
+
+   Its policy "ZhehanZ Only" (`c028eee8-4a06-49d0-bb97-6c9e86194ef2`) is reusable, so it survives the delete. Remove it under Zero Trust → Access → Policies if nothing else uses it.
+4. **Optionally remove the two bypass apps.** With no Access app covering the host, they do nothing. Keep them if you might put Access on the host again.
+5. **Stop the tunnel.** Stop `poki-cloudflared` on us-light and delete the tunnel under Zero Trust → Networks → Tunnels.
+
+To undo steps 1 to 3 before step 5, recreate the CNAME to `<tunnel id>.cfargotunnel.com` (proxied), set `ORIGIN_FALLBACK=1`, and recreate the Access app with an allow policy.
