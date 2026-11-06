@@ -24,7 +24,7 @@ jobs:
         with:
           submodules: true
       - name: Apply Poki's runner patch
-        run: git -C native/ios-runner/WebDriverAgent apply ../patches/wda-poki-runner.patch
+        run: cd native/ios-runner/WebDriverAgent && git apply "$GITHUB_WORKSPACE/native/ios-runner/patches/wda-poki-runner.patch" && git diff --stat
       - name: Boot a simulator
         run: |
           UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys;d=json.load(sys.stdin)["devices"];print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")))')
