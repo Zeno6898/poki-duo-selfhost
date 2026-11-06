@@ -360,3 +360,87 @@ test('external mode checks tokens against the issuer JWKS and the subject allowl
   await assert.rejects(verifier.verifyAccessToken(es256({ iss: 'https://evil.example.com', aud: 'https://poki.example.com/mcp', sub: 'owner@example.com', exp })), /issuer/);
   assert.equal(fetches, 2, 'the JWKS is cached');
 });
+
+// --- Cloudflare Access in front (POKI_OAUTH=cloudflare-access) ---------------------------------
+
+const AUD = 'a'.repeat(64);
+const cfEnv = { POKI_MCP_PUBLIC_URL: 'https://poki.example.com', POKI_OAUTH: 'cloudflare-access', POKI_CF_ACCESS_TEAM: 'myteam', POKI_CF_ACCESS_AUD: AUD, POKI_OAUTH_ALLOWED_SUBJECTS: 'owner@example.com' };
+
+test('cloudflare-access mode needs the team, AUD tag, allowed emails and a loopback bind', () => {
+  const config = remoteConfig(cfEnv, '/s');
+  assert.equal(config.issuer, 'https://myteam.cloudflareaccess.com');
+  assert.equal(config.jwksUrl, 'https://myteam.cloudflareaccess.com/cdn-cgi/access/certs');
+  assert.equal(config.audience, AUD);
+  assert.deepEqual(config.allowedAlgorithms, ['RS256']);
+  assert.throws(() => remoteConfig({ ...cfEnv, POKI_MCP_BIND: '0.0.0.0' }, '/s'), /loopback/);
+  assert.throws(() => remoteConfig({ ...cfEnv, POKI_CF_ACCESS_TEAM: '' }, '/s'), /POKI_CF_ACCESS_TEAM/);
+  assert.throws(() => remoteConfig({ ...cfEnv, POKI_CF_ACCESS_TEAM: 'evil.com/x' }, '/s'), /POKI_CF_ACCESS_TEAM/);
+  assert.throws(() => remoteConfig({ ...cfEnv, POKI_CF_ACCESS_AUD: '' }, '/s'), /POKI_CF_ACCESS_AUD/);
+  assert.throws(() => remoteConfig({ ...cfEnv, POKI_OAUTH_ALLOWED_SUBJECTS: '' }, '/s'), /POKI_OAUTH_ALLOWED_SUBJECTS/);
+});
+
+async function startCloudflareFront(t) {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'cf-1', alg: 'RS256', use: 'sig' };
+  const { createSign } = await import('node:crypto');
+  const sign = (claims, header = { alg: 'RS256', kid: 'cf-1' }, key = privateKey) => {
+    const input = `${Buffer.from(JSON.stringify(header)).toString('base64url')}.${Buffer.from(JSON.stringify(claims)).toString('base64url')}`;
+    return `${input}.${createSign('sha256').update(input).sign(key).toString('base64url')}`;
+  };
+  const fetched = [];
+  const fakeFetch = async url => { fetched.push(String(url)); return String(url) === 'https://myteam.cloudflareaccess.com/cdn-cgi/access/certs' ? Response.json({ keys: [jwk], public_cert: {}, public_certs: [] }) : new Response('', { status: 404 }); };
+  const config = remoteConfig(cfEnv, '/unused');
+  const front = await createFront(config, LOCAL_TOKEN, { fetch: fakeFetch });
+  const server = http.createServer(async (req, res) => {
+    const accepted = await front(req, res);
+    if (accepted) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ session: accepted.session, path: accepted.path })); }
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  const port = server.address().port;
+  const request = (method, path, { host = 'poki.example.com', headers = {} } = {}) => new Promise((resolve, reject) => {
+    const all = Object.fromEntries(Object.entries({ Host: host, 'Content-Type': 'application/json', 'Cf-Ray': 'x', ...headers }).filter(([, v]) => v !== undefined));
+    const req = http.request({ host: '127.0.0.1', port, method, path, headers: all }, res => {
+      let text = ''; res.setEncoding('utf8'); res.on('data', c => { text += c; });
+      res.on('end', () => { let parsed; try { parsed = JSON.parse(text); } catch {} resolve({ status: res.statusCode, text, json: parsed }); });
+    });
+    req.on('error', reject); req.end('{}');
+  });
+  const exp = Math.floor(Date.now() / 1000) + 300;
+  const claims = { iss: 'https://myteam.cloudflareaccess.com', aud: [AUD], email: 'owner@example.com', sub: 'user-uuid', exp, iat: exp - 600, type: 'app' };
+  return { request, sign, claims, fetched };
+}
+
+test('cloudflare-access mode accepts a verified Access assertion for an allowed email, with no bearer', async t => {
+  const f = await startCloudflareFront(t);
+  const ok = await f.request('POST', '/mcp', { headers: { 'Cf-Access-Jwt-Assertion': f.sign(f.claims) } });
+  assert.equal(ok.status, 200, ok.text);
+  const expected = createHash('sha256').update('owner@example.com').digest('base64url').slice(0, 32).replace(/[^a-zA-Z0-9_-]/g, '_');
+  assert.equal(ok.json.session, `cfaccess-${expected}`, 'the session is keyed by the email');
+  const again = await f.request('POST', '/mcp', { headers: { 'Cf-Access-Jwt-Assertion': f.sign({ ...f.claims, iat: f.claims.iat + 1 }) } });
+  assert.equal(again.json.session, ok.json.session, 'one person keeps one session across assertions');
+  assert.equal(f.fetched.length, 1, 'the JWKS is cached');
+});
+
+test('cloudflare-access mode refuses missing, forged, foreign or expired assertions', async t => {
+  const f = await startCloudflareFront(t);
+  const status = async headers => (await f.request('POST', '/mcp', { headers })).status;
+  assert.equal(await status({}), 401);
+  assert.equal(await status({ Authorization: `Bearer ${LOCAL_TOKEN}` }), 401, 'a bearer token is not a substitute');
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': f.sign({ ...f.claims, email: 'someone@example.com', sub: 'other' }) }), 401);
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': f.sign({ ...f.claims, aud: ['b'.repeat(64)] }) }), 401);
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': f.sign({ ...f.claims, iss: 'https://otherteam.cloudflareaccess.com' }) }), 401);
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': f.sign({ ...f.claims, exp: 1 }) }), 401);
+  const { privateKey: otherKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': f.sign(f.claims, { alg: 'RS256', kid: 'cf-1' }, otherKey) }), 401);
+  const unsigned = `${Buffer.from(JSON.stringify({ alg: 'none', kid: 'cf-1' })).toString('base64url')}.${Buffer.from(JSON.stringify(f.claims)).toString('base64url')}.`;
+  assert.equal(await status({ 'Cf-Access-Jwt-Assertion': unsigned }), 401);
+  // Host and Origin rules still apply, and the local token still works on localhost.
+  assert.equal((await f.request('POST', '/mcp', { host: 'attacker.example', headers: { 'Cf-Access-Jwt-Assertion': f.sign(f.claims) } })).status, 403);
+  assert.equal((await f.request('POST', '/mcp', { headers: { 'Cf-Access-Jwt-Assertion': f.sign(f.claims), Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await f.request('GET', '/.well-known/oauth-authorization-server')).status, 404, 'Access, not the daemon, is the authorization server');
+  const local = await f.request('POST', '/mcp', { host: '127.0.0.1', headers: { 'Cf-Ray': undefined, Authorization: `Bearer ${LOCAL_TOKEN}`, 'X-Poki-Mcp-Session': 'local' } });
+  assert.equal(local.status, 200, local.text);
+  const proxied = await f.request('POST', '/mcp', { host: '127.0.0.1', headers: { Authorization: `Bearer ${LOCAL_TOKEN}`, 'X-Poki-Mcp-Session': 'local' } });
+  assert.equal(proxied.status, 403, 'Cf-Ray marks a proxied request, so the local token is refused');
+});

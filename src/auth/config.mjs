@@ -45,7 +45,7 @@ export function remoteConfig(env = process.env, stateDir) {
   if (url.pathname !== '/' || url.search || url.hash || url.username || url.password) throw new Error('POKI_MCP_PUBLIC_URL must be an origin only, such as https://poki.example.ts.net');
   const origin = url.origin;
   const mode = env.POKI_OAUTH;
-  if (mode !== 'builtin' && mode !== 'external') throw new Error('POKI_MCP_PUBLIC_URL needs POKI_OAUTH=builtin (password and TOTP on this daemon) or POKI_OAUTH=external (tokens from another authorization server)');
+  if (!['builtin', 'external', 'cloudflare-access'].includes(mode)) throw new Error('POKI_MCP_PUBLIC_URL needs POKI_OAUTH=builtin (password and TOTP on this daemon), POKI_OAUTH=cloudflare-access (Cloudflare Access signs you in) or POKI_OAUTH=external (tokens from another authorization server)');
   Object.assign(config, {
     mode,
     publicUrl: origin,
@@ -67,6 +67,18 @@ export function remoteConfig(env = process.env, stateDir) {
       accessTtl: seconds(env, 'POKI_OAUTH_ACCESS_TTL', 3600),
       refreshTtl: seconds(env, 'POKI_OAUTH_REFRESH_TTL', 30 * 86400),
     });
+  } else if (mode === 'cloudflare-access') {
+    // Cloudflare Access is the authorization server; cloudflared on this host forwards the
+    // signed-in identity as the Cf-Access-Jwt-Assertion header, so only a loopback peer counts.
+    if (!isLoopbackBind(bind)) throw new Error('POKI_OAUTH=cloudflare-access needs POKI_MCP_BIND on loopback (127.0.0.1): only cloudflared on this host may reach the daemon');
+    const team = env.POKI_CF_ACCESS_TEAM;
+    if (!team || !/^[a-z0-9][a-z0-9-]{0,62}$/i.test(team)) throw new Error('POKI_OAUTH=cloudflare-access needs POKI_CF_ACCESS_TEAM, the team name in https://<team>.cloudflareaccess.com');
+    const aud = env.POKI_CF_ACCESS_AUD;
+    if (!aud || !/^[A-Za-z0-9]{16,128}$/.test(aud)) throw new Error('POKI_OAUTH=cloudflare-access needs POKI_CF_ACCESS_AUD, the Application Audience (AUD) tag of the Access application');
+    const subjects = list(env.POKI_OAUTH_ALLOWED_SUBJECTS);
+    if (subjects.length === 0) throw new Error('POKI_OAUTH=cloudflare-access needs POKI_OAUTH_ALLOWED_SUBJECTS: the email of the one account allowed to use this phone');
+    const issuer = `https://${team.toLowerCase()}.cloudflareaccess.com`;
+    Object.assign(config, { issuer, jwksUrl: `${issuer}/cdn-cgi/access/certs`, audience: aud, allowedSubjects: subjects, allowedAlgorithms: ['RS256'], requiredScopes: [] });
   } else {
     const issuer = env.POKI_OAUTH_ISSUER;
     if (!issuer || !/^https:\/\//.test(issuer)) throw new Error('POKI_OAUTH=external needs POKI_OAUTH_ISSUER, the https issuer URL of the authorization server');

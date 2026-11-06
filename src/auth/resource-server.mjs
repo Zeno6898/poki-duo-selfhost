@@ -52,7 +52,7 @@ export function externalVerifier(config, fetchImpl = fetch) {
     async verifyAccessToken(token) {
       try { await refresh(false); } catch (error) { throw new OAuthError(OAuthErrorCode.ServerError, error.message); }
       let claims;
-      const check = () => verifyJwt(token, { keys, issuer: config.issuer, audience: config.audience });
+      const check = () => verifyJwt(token, { keys, issuer: config.issuer, audience: config.audience, ...(config.allowedAlgorithms ? { allowedAlgorithms: config.allowedAlgorithms } : {}) });
       try { claims = check(); }
       catch (error) {
         if (!error.unknownKey) throw invalid(error instanceof JwtError ? error.message : 'Invalid token');
@@ -71,7 +71,7 @@ function authInfo(token, claims, config) {
     token, scopes, expiresAt: claims.exp,
     clientId: String(claims.client_id ?? claims.azp ?? claims.cid ?? ''),
     resource: new URL(config.resource),
-    extra: { subject: claims.sub, grant: typeof claims.sid === 'string' ? claims.sid : undefined },
+    extra: { subject: claims.sub, email: typeof claims.email === 'string' ? claims.email : undefined, grant: typeof claims.sid === 'string' ? claims.sid : undefined },
   };
 }
 

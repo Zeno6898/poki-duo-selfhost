@@ -15,7 +15,7 @@ const sessionPattern = /^[a-zA-Z0-9_-]{1,80}$/;
 
 // Resolves to a function (req, res) => { session, path, authInfo? } | undefined; undefined means
 // the request was answered here.
-export async function createFront(config, token, { authorizationServer } = {}) {
+export async function createFront(config, token, { authorizationServer, fetch: fetchImpl } = {}) {
   const expected = Buffer.from(`Bearer ${token}`);
   const validHost = localhostHostValidation();
   const validOrigin = localhostOriginValidation();
@@ -37,10 +37,26 @@ export async function createFront(config, token, { authorizationServer } = {}) {
   if (config.mode === 'local') return local;
 
   const server = config.mode === 'builtin' ? authorizationServer ?? await AuthorizationServer.create(config) : undefined;
-  const verifier = server ? builtinVerifier(config, server) : externalVerifier(config);
+  const verifier = server ? builtinVerifier(config, server) : externalVerifier(config, fetchImpl);
   const publicHostname = new URL(config.publicUrl).hostname;
   const allowedHosts = [publicHostname, ...config.allowedHosts];
   const localHosts = localhostAllowedHostnames();
+
+  // Cloudflare Access already signed the person in at the edge; the request is accepted only
+  // with a valid Access assertion from cloudflared on this host. No bearer token is involved.
+  async function cloudflareAccess(req, res, path, peerLoopback) {
+    if (!mcpPaths.includes(path)) { res.writeHead(404); res.end(); return; }
+    const origin = req.headers.origin;
+    if (!validateOriginHeader(origin, config.allowedOrigins).ok) { sendJson(res, 403, { error: 'Origin not allowed', hint: 'Add the site to POKI_MCP_ALLOWED_ORIGINS' }); return; }
+    if (!peerLoopback) { sendJson(res, 403, { error: 'Cloudflare Access requests must come through cloudflared on this machine' }); return; }
+    const assertion = req.headers['cf-access-jwt-assertion'];
+    if (typeof assertion !== 'string' || !assertion) { sendJson(res, 401, { error: 'Cloudflare Access assertion required', hint: 'Protect this hostname with a Cloudflare Access application and keep access.required on the tunnel ingress' }); return; }
+    let authInfo;
+    try { authInfo = await verifier.verifyAccessToken(assertion); }
+    catch (error) { sendJson(res, error.code === 'server_error' ? 503 : 401, { error: 'Cloudflare Access assertion rejected', detail: error.message }); return; }
+    const identity = authInfo.extra?.email ?? authInfo.extra?.subject;
+    return { session: `cfaccess-${createHash('sha256').update(String(identity)).digest('base64url').slice(0, 32).replace(/[^a-zA-Z0-9_-]/g, '_')}`, path, authInfo };
+  }
 
   async function remote(req, res, path) {
     const origin = req.headers.origin;
@@ -73,6 +89,6 @@ export async function createFront(config, token, { authorizationServer } = {}) {
     }
     let path;
     try { path = new URL(req.url, config.publicUrl).pathname; } catch { res.writeHead(400); res.end(); return; }
-    return remote(req, res, path);
+    return config.mode === 'cloudflare-access' ? cloudflareAccess(req, res, path, peerLoopback) : remote(req, res, path);
   };
 }

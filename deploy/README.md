@@ -2,7 +2,9 @@
 
 This folder runs the Poki daemon on a Linux server around the clock, so that MCP clients
 anywhere (claude.ai, Claude Code on the web or in a terminal, other agents) can drive the phone.
-The phone is a personal device, so the public endpoint accepts **only OAuth 2.1 access tokens**.
+The phone is a personal device, so the public endpoint accepts **only OAuth-authenticated
+requests**: OAuth 2.1 access tokens, or a verified Cloudflare Access identity when Access is the
+authorization server.
 The bearer token in `mcp.json` still works, but only for clients on the server itself.
 
 ```
@@ -21,7 +23,9 @@ Put these in `deploy/poki.env` (start from `poki.env.example`; the file is git-i
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `POKI_MCP_PUBLIC_URL` | unset | HTTPS origin the front serves, e.g. `https://poki.example.ts.net`. Clients connect to `<origin>/mcp`. Setting it turns on remote access and requires `POKI_OAUTH`. |
-| `POKI_OAUTH` | unset | `builtin` (this daemon signs you in) or `external` (another authorization server issues tokens). |
+| `POKI_OAUTH` | unset | `cloudflare-access` (Cloudflare Access signs you in; recommended with Cloudflare), `builtin` (this daemon signs you in; no Cloudflare needed) or `external` (another authorization server issues JWT access tokens). |
+| `POKI_CF_ACCESS_TEAM` / `POKI_CF_ACCESS_AUD` | unset | For `cloudflare-access`: the team name in `https://<team>.cloudflareaccess.com` and the Access application's AUD tag. |
+| `POKI_OAUTH_ALLOWED_SUBJECTS` | unset | For `cloudflare-access` and `external`: the email (or `sub`) of the one account allowed to use the phone, comma-separated. |
 | `POKI_MCP_BIND` | `127.0.0.1` | Listen address. A non-loopback address is refused unless remote access with OAuth is configured. Keep loopback behind a front on the same host. |
 | `POKI_MCP_TOKEN` / `POKI_MCP_TOKEN_FILE` | random per start | Stable bearer token for clients on this machine (32+ characters, `openssl rand -hex 32`). Never accepted on the public hostname or through a proxy. |
 | `POKI_MCP_ALLOWED_HOSTS` | none | Extra `Host` names to answer, comma-separated. The public hostname and localhost are always allowed. |
@@ -90,23 +94,58 @@ against `POKI_MCP_PUBLIC_URL`.
 Funnel serves on ports 443, 8443 and 10000 only. Plain `tailscale serve` (tailnet only) also
 works if every client is on your tailnet; cloud agents are not, so they need Funnel.
 
-### Cloudflare Tunnel
+### Cloudflare Tunnel with Cloudflare Access (recommended with Cloudflare)
+
+Here Cloudflare Access is the OAuth authorization server for MCP clients, and the daemon only
+checks the identity Access hands it. Access issues its own tokens to the client; cloudflared then
+forwards each request with a `Cf-Access-Jwt-Assertion` header, an RS256 JWT signed by your team.
 
 1. `cloudflared tunnel create poki`, then route a hostname: `cloudflared tunnel route dns poki poki.example.com`.
-2. In the tunnel's config:
+2. In Zero Trust → Access → Applications, add a **self-hosted** application for that hostname,
+   turn on its managed OAuth for MCP clients, and give it a policy that allows only your email.
+   Copy the application's **AUD tag**. (Check the current dashboard wording; Cloudflare renames
+   these settings from time to time.)
+3. In the tunnel's config, make the origin refuse anything Access did not sign:
 
    ```yaml
    ingress:
      - hostname: poki.example.com
        service: http://127.0.0.1:47825
+       originRequest:
+         access:
+           required: true
+           teamName: <team>
+           audTag: [<AUD tag>]
      - service: http_status:404
    ```
 
-3. Set `POKI_MCP_PUBLIC_URL=https://poki.example.com`.
+4. In `poki.env`:
 
-Do not put a Cloudflare Access login page in front of the whole hostname with `builtin`: MCP
-clients must reach `/.well-known/*`, `/register`, `/authorize` and `/token` directly. To use
-Cloudflare Access (or any other OAuth server) as the sign-in instead, use `external` below.
+   ```sh
+   POKI_MCP_PUBLIC_URL=https://poki.example.com
+   POKI_OAUTH=cloudflare-access
+   POKI_CF_ACCESS_TEAM=<team>
+   POKI_CF_ACCESS_AUD=<AUD tag>
+   POKI_OAUTH_ALLOWED_SUBJECTS=you@example.com
+   POKI_MCP_BIND=127.0.0.1
+   ```
+
+The daemon then accepts a request on the public hostname only when it comes from a loopback peer
+(cloudflared on this host) and its assertion verifies: signature against
+`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` (cached, refetched for a new key),
+issuer, AUD tag, expiry, and an allowed email. No `Authorization` header is needed. Each email
+is one device session. The mode refuses to start with a non-loopback `POKI_MCP_BIND`, and the
+daemon serves no OAuth endpoints of its own.
+
+### Cloudflare Tunnel without Access (`builtin`)
+
+Use the same tunnel without the `originRequest.access` block and without an Access application,
+and set `POKI_OAUTH=builtin`. Do not put an Access login page in front of the hostname in this
+mode: MCP clients must reach `/.well-known/*`, `/register`, `/authorize` and `/token` directly.
+
+`external` (below) is for authorization servers that issue JWT access tokens to the client. It
+does not work with Access's managed OAuth, whose client tokens are opaque; use
+`cloudflare-access` for that.
 
 ### External authorization server (`POKI_OAUTH=external`)
 
@@ -140,16 +179,18 @@ Pairing files go in `deploy/pairing/` (or `POKI_PAIRING_DIR`) and are mounted re
 Without Docker, install Node 24, Python 3 and ffmpeg, build the native tools as in `bin/setup`'s
 header, then install `deploy/poki-mcp.service` as its header describes.
 
-Check the public endpoint: `curl -i -X POST https://<host>/mcp` must answer `401` with a
-`WWW-Authenticate: Bearer resource_metadata="..."` header, and
-`curl https://<host>/.well-known/oauth-protected-resource/mcp` must name your issuer. A `403
+Check the public endpoint. With `builtin` or `external`, `curl -i -X POST https://<host>/mcp`
+must answer `401` with a `WWW-Authenticate: Bearer resource_metadata="..."` header, and
+`curl https://<host>/.well-known/oauth-protected-resource/mcp` must name your issuer. With
+`cloudflare-access`, the same `curl` must be stopped by Access before it reaches the daemon. A `403
 Local access is only for clients on this machine` means the front rewrote `Host` to localhost;
 make it pass the public hostname.
 
 ## 5. Connect clients
 
 - **claude.ai**: Settings → Connectors → Add custom connector, URL `https://<host>/mcp`. Sign in
-  on the Poki page that opens. The callback host `claude.ai` is in the default redirect list.
+  on the page that opens (Cloudflare Access, or Poki's own page with `builtin`; its default
+  redirect list includes `claude.ai`).
 - **Claude Code**: `claude mcp add --transport http poki https://<host>/mcp`, then `/mcp` to sign
   in. It uses a localhost callback, which the default list allows.
 - **On the server itself**: `node src/stdio.mjs` (or `bin/poki-mcp`) keeps using `mcp.json`.
