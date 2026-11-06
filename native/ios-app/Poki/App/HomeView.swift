@@ -25,7 +25,9 @@ struct HomeView: View {
                                 Spacer()
                                 Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
                             }
+                            .contentShape(.rect)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
                 if !model.approvals.isEmpty { approvals }
@@ -47,7 +49,6 @@ struct HomeView: View {
             }
             .navigationTitle("Poki")
             .navigationBarTitleDisplayMode(.inline)
-            .safeAreaInset(edge: .bottom) { powerButton.padding(.horizontal).padding(.bottom, 8) }
         }
     }
 
@@ -58,9 +59,12 @@ struct HomeView: View {
                 .shadow(color: Brand.blue.opacity(0.25), radius: 14, y: 6)
             Text(model.sessionOn ? "Poki is on" : "Poki is off").font(.title2.weight(.bold))
             Text(subtitle).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            powerButton.padding(.top, 8)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 12)
+        .padding(.horizontal, 20)
     }
 
     private var subtitle: String {

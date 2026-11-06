@@ -72,7 +72,7 @@ struct Detail: View {
             VStack(alignment: .leading, spacing: 6) {
                 if !state.steps.isEmpty { StepList(steps: Array(state.steps.suffix(compact ? 2 : 3))) }
                 HStack {
-                    if let app = state.app { Label(app, systemImage: "app.fill").font(.caption2).foregroundStyle(.white.opacity(0.7)).lineLimit(1) }
+                    if let app = state.app { Text("In \(app)").font(.caption2).foregroundStyle(.white.opacity(0.7)).lineLimit(1) }
                     Spacer(minLength: 0)
                     if !state.runnerPaused {
                         Button(intent: StopRunnerIntent()) { Label("Stop", systemImage: "stop.fill").font(.caption.weight(.semibold)) }

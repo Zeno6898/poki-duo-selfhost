@@ -14,7 +14,10 @@ struct ConnectView: View {
             List {
                 Section {
                     LabeledContent("Relay", value: model.relayStatus.text)
-                    LabeledContent("Device label") { Text(model.identity.label.prefix(12) + "…").font(.body.monospaced()) }
+                    LabeledContent("Device label") {
+                        if model.identity.label.isEmpty { Text("Not created yet") }
+                        else { Text(model.identity.label.prefix(12) + "…").font(.body.monospaced()) }
+                    }
                 } footer: {
                     Text("The relay passes requests to this phone while Poki is open or running in the background. It stores nothing; when the phone is offline, clients get a clear error.")
                 }
@@ -31,11 +34,24 @@ struct ConnectView: View {
                             .buttonStyle(.glassProminent)
                     }
                 }
-                if let error = model.identity.error { Section { Text(error).foregroundStyle(.red) } }
+                if let error = model.identity.error {
+                    Section {
+                        Label(Self.friendly(error), systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(.orange)
+                    }
+                }
             }
             .navigationTitle("Connect")
             .sheet(item: $shown) { secret in connector(secret) }
         }
+    }
+
+    /// Keychain errors in words. -34018 means the app's signature has no keychain access (an unsigned
+    /// or wrongly signed build); everything else shows its code.
+    static func friendly(_ error: String) -> String {
+        if error.contains("-34018") {
+            return "Poki can't use the keychain, so it has no key for the relay yet. Install Poki again with your signing tool, then open this tab."
+        }
+        return "Poki couldn't read its relay key from the keychain (\(error))."
     }
 
     private func connector(_ secret: ConnectorSecret) -> some View {
