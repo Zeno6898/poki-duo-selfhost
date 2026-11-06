@@ -134,28 +134,35 @@ async fn enter_text(
         return Ok(completed(0, submit, true, &baseline));
     }
 
-    let port = rsd
-        .services
-        .get("com.apple.coredevice.pasteboardservice")
-        .ok_or("Device has no pasteboard service")?
-        .port;
-    super::trace("pasteboard PULL");
-    // SET + Cmd+V sends the text. Snapshot restoration is best effort.
-    // Match the source without resolving promises.
-    // A delayed PULL must not block that input path, nor
-    // leave a late PULL_REPLY queued on the connection used for SET.
-    let previous_items = tokio::time::timeout(Duration::from_secs(8), async {
-        let mut snapshot_client = RemoteXpcClient::new(adapter.connect(port).await?).await?;
-        snapshot_client.do_handshake().await?;
-        complete_items(&pull(&mut snapshot_client).await?)
-    })
-    .await
-    .ok()
-    .and_then(std::result::Result::ok);
-    let snapshot_status = if previous_items.is_some() {
-        "complete"
+    // Short plain text can go in as key presses, which leaves the user's clipboard alone.
+    let keys = key_presses(text);
+    let (port, previous_items, snapshot_status) = if keys.is_some() {
+        (0, None, "not_needed")
     } else {
-        "unavailable"
+        let port = rsd
+            .services
+            .get("com.apple.coredevice.pasteboardservice")
+            .ok_or("Device has no pasteboard service")?
+            .port;
+        super::trace("pasteboard PULL");
+        // SET + Cmd+V sends the text. Snapshot restoration is best effort.
+        // Match the source without resolving promises.
+        // A delayed PULL must not block that input path, nor
+        // leave a late PULL_REPLY queued on the connection used for SET.
+        let previous_items = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut snapshot_client = RemoteXpcClient::new(adapter.connect(port).await?).await?;
+            snapshot_client.do_handshake().await?;
+            complete_items(&pull(&mut snapshot_client).await?)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok);
+        let snapshot_status = if previous_items.is_some() {
+            "complete"
+        } else {
+            "unavailable"
+        };
+        (port, previous_items, snapshot_status)
     };
     if clear_first {
         super::trace("paste clear");
@@ -203,6 +210,45 @@ async fn enter_text(
             .filter(|after| baseline.iter().any(|before| before.id == after.id))
             .collect();
     }
+    if let Some(keys) = keys {
+        super::trace("type with key presses");
+        if press_keys(keyboard, &keys).await.is_err() {
+            return Ok(clipboard_result(
+                unconfirmed("key_dispatch_unconfirmed", true, false),
+                snapshot_status,
+                "not_modified",
+            ));
+        }
+        let checked = verify(adapter, rsd, &baseline, &others, text, clear).await;
+        if !matches!(checked.status, Verification::Complete) {
+            let mut result = with_changes(
+                unconfirmed(checked.status.reason(), true, false),
+                &checked.changed,
+            );
+            result["instruction"] = format!("{} Typed with key presses: auto-capitalization, auto-correction or a non-U.S. keyboard layout can change them, so read the field before retrying.", result["instruction"].as_str().unwrap_or_default()).into();
+            return Ok(clipboard_result(keyed(result), snapshot_status, "not_modified"));
+        }
+        let characters = text.chars().count();
+        if !checked.changed.is_empty() {
+            return Ok(clipboard_result(
+                keyed(other_field_changed(
+                    completed(characters, false, false, &baseline),
+                    &checked.changed,
+                )),
+                snapshot_status,
+                "not_modified",
+            ));
+        }
+        if submit {
+            chord(keyboard, 0x28, &[]).await?;
+        }
+        return Ok(clipboard_result(
+            keyed(completed(characters, submit, false, &baseline)),
+            snapshot_status,
+            "not_modified",
+        ));
+    }
+
     let new_items = xpc!([{"types":["public.utf8-plain-text","public.plain-text","public.text"],"data":{
         "public.utf8-plain-text":{"data":text.as_bytes()},"public.plain-text":{"data":text.as_bytes()},"public.text":{"data":text.as_bytes()}
     }}]);
@@ -286,6 +332,85 @@ async fn enter_text(
         snapshot_status,
         restore_status,
     ))
+}
+
+/// Longest text typed key by key; longer text is pasted, which is one request whatever its length.
+const KEYED_TEXT_LIMIT: usize = 64;
+const SHIFT: u16 = 0xe1;
+
+/// The key presses that type `text` on a U.S. layout, or None when it should be pasted. Off unless
+/// POKI_TYPE_WITH_KEYS=1, because a phone's hardware-keyboard auto-capitalization and layout apply
+/// to these presses and the path has not yet been checked against them on a device.
+fn key_presses(text: &str) -> Option<Vec<(u16, bool)>> {
+    if std::env::var("POKI_TYPE_WITH_KEYS").ok().as_deref() != Some("1") {
+        return None;
+    }
+    keys_for(text)
+}
+fn keys_for(text: &str) -> Option<Vec<(u16, bool)>> {
+    if text.is_empty() || text.len() > KEYED_TEXT_LIMIT {
+        return None;
+    }
+    text.bytes().map(us_key).collect()
+}
+fn us_key(byte: u8) -> Option<(u16, bool)> {
+    let unshifted = b"-=[]\\;',./`";
+    let shifted = b"_+{}|:\"<>?~";
+    let usages: [u16; 11] = [0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x33, 0x34, 0x36, 0x37, 0x38, 0x35];
+    Some(match byte {
+        b'a'..=b'z' => (4 + u16::from(byte - b'a'), false),
+        b'A'..=b'Z' => (4 + u16::from(byte - b'A'), true),
+        b'1'..=b'9' => (0x1e + u16::from(byte - b'1'), false),
+        b'0' => (0x27, false),
+        b' ' => (0x2c, false),
+        _ => {
+            if let Some(at) = b"!@#$%^&*()".iter().position(|&c| c == byte) {
+                (0x1e + at as u16, true)
+            } else if let Some(at) = unshifted.iter().position(|&c| c == byte) {
+                (usages[at], false)
+            } else if let Some(at) = shifted.iter().position(|&c| c == byte) {
+                (usages[at], true)
+            } else {
+                return None;
+            }
+        }
+    })
+}
+async fn press_keys(keyboard: &mut Keyboard, keys: &[(u16, bool)]) -> Result<()> {
+    let result: Result<()> = async {
+        for &(usage, shift) in keys {
+            let key = super::KeyboardUsage::new(usage)?;
+            let pressed = if shift {
+                vec![super::KeyboardUsage::new(SHIFT)?, key]
+            } else {
+                vec![key]
+            };
+            keyboard
+                .hid
+                .set_main_keyboard_usages(&mut keyboard.service, pressed)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            keyboard
+                .hid
+                .set_main_keyboard_usages(&mut keyboard.service, [])
+                .await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+    .await;
+    // A failed press must not leave a key held down.
+    let release = keyboard
+        .hid
+        .set_main_keyboard_usages(&mut keyboard.service, [])
+        .await;
+    result?;
+    release?;
+    Ok(())
+}
+fn keyed(mut result: serde_json::Value) -> serde_json::Value {
+    result["input_method"] = "key_presses".into();
+    result
 }
 
 async fn observe(adapter: &mut AdapterHandle, rsd: &RsdHandshake) -> Result<serde_json::Value> {
@@ -871,6 +996,16 @@ mod tests {
             assert!(result["instruction"].as_str().unwrap().contains("Return was not sent"));
             assert!(result.get("needs_human_action").is_none());
         }
+    }
+
+    #[test]
+    fn short_plain_text_maps_to_us_key_presses_and_the_rest_is_pasted() {
+        assert_eq!(keys_for("aZ0 !-?"), Some(vec![(0x04, false), (0x1d, true), (0x27, false), (0x2c, false), (0x1e, true), (0x2d, false), (0x38, true)]));
+        assert_eq!(keys_for("~`\"'"), Some(vec![(0x35, true), (0x35, false), (0x34, true), (0x34, false)]));
+        assert_eq!(keys_for("café"), None);
+        assert_eq!(keys_for("line\nbreak"), None);
+        assert_eq!(keys_for(&"a".repeat(KEYED_TEXT_LIMIT + 1)), None);
+        assert_eq!(keys_for(""), None);
     }
 
     #[test]
