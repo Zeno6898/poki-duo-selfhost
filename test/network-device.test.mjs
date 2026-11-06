@@ -143,3 +143,33 @@ test('device calls go to the bridge for the network device and to idevice-tools 
   assert.equal(runs.at(-1).file.endsWith('idevice-tools'), true);
   assert.deepEqual(runs.at(-1).args, ['--udid', '00008150-ABC', 'lockdown', 'get', 'DeviceName']);
 }));
+
+test('device listings never show the remote pairing file path', () => withEnv(env, async () => {
+  const devices = new Devices();
+  devices.run = async (file, args, timeout, input) => {
+    if (file !== native) throw new Error(`unexpected ${file}`);
+    // The bridge is the only place the path goes: as its argument, never back into a listing.
+    assert.ok(args.includes(env.POKI_RP_PAIRING_FILE));
+    const { key } = JSON.parse(input);
+    return { stdout: JSON.stringify({ key, domain: null, value: key === 'DeviceName' ? 'Test Phone' : 'x' }), stderr: '' };
+  };
+  const listings = [await devices.inventory(true), await devices.describeDevices(true)];
+  assert.equal(listings[1][0].name, 'Test Phone');
+  for (const listing of listings) assert.ok(!JSON.stringify(listing).includes('rp.plist'), JSON.stringify(listing));
+}));
+
+test('get_foreground_app names a pid-only accessibility root through AppService', () => withEnv(env, async () => {
+  const devices = new Devices(), requests = [];
+  devices.target = async () => ({ id, kind: 'physical', name: 'Test Phone' });
+  devices.bridge = async request => {
+    requests.push(request);
+    if (request.op === 'ax') return { foreground: { object_id: 'o1', name: null, bundle_id: null, pid: 4242 } };
+    return { pid: 4242, running: true, executable: '/private/var/containers/Bundle/Application/A/Chat.app/Chat', bundle_id: 'local.chat', name: 'Chat' };
+  };
+  const result = JSON.parse((await devices.dispatch('get_foreground_app', {})).content[0].text);
+  assert.deepEqual(result, { object_id: 'o1', name: 'Chat', bundle_id: 'local.chat', pid: 4242, bundle_id_source: 'app_service' });
+  assert.deepEqual(requests.at(-1), { op: 'app_for_pid', pid: 4242 });
+  // A lookup that finds nothing leaves the accessibility answer as it was.
+  devices.bridge = async request => request.op === 'ax' ? { foreground: { bundle_id: null, pid: 7 } } : { pid: 7, running: false, bundle_id: null, name: null };
+  assert.deepEqual(JSON.parse((await devices.dispatch('get_foreground_app', {})).content[0].text), { bundle_id: null, pid: 7 });
+}));
