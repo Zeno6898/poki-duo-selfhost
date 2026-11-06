@@ -41,7 +41,7 @@ impl<E: std::error::Error> From<E> for Failure {
     }
 }
 
-pub const LOOPBACK_FIX: &str = "Turn on the loopback: Poki's own tunnel in Settings → VPN, or the Poki module in Surge, Loon or sing-box, or Shadowrocket's Settings → Other → \"Include route 10.7.0.1/32\".";
+pub const LOOPBACK_FIX: &str = "Turn on the loopback in your proxy app: the Poki module in Surge or Loon, loopback_address in sing-box, or Shadowrocket's Settings → Other → \"Include route 10.7.0.1/32\". Then connect to Wi-Fi.";
 pub const PAIRING_FIX: &str = "Pair again in Poki's setup.";
 pub const DEVELOPER_MODE_FIX: &str = "Turn on Developer Mode: Settings → Privacy & Security → Developer Mode, then restart the phone.";
 

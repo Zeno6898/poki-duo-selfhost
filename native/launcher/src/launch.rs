@@ -2,7 +2,11 @@
 //! and dtservicehub (run_over_rsd), and wait until WebDriverAgent answers.
 
 use crate::device::{DEVELOPER_MODE_FIX, Device, Failure, Result};
-use idevice::dvt::xctest::{TestConfig, listener::XCUITestListener, run_over_rsd};
+use idevice::{
+    ReadWrite,
+    dvt::{device_info::DeviceInfoClient, process_control::ProcessControlClient, remote_server::RemoteServerClient},
+    dvt::xctest::{TestConfig, listener::XCUITestListener, run_over_rsd},
+};
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
@@ -16,7 +20,7 @@ use tokio::{
 struct Quiet;
 impl XCUITestListener for Quiet {}
 
-pub const RUNNER_FIX: &str = "Install Poki Runner from the Poki source in AltStore, and open it once.";
+pub const RUNNER_FIX: &str = "Install Poki Runner (poki-runner-unsigned.ipa) with the same signing tool and Apple ID as Poki, then trust its developer in Settings → General → VPN & Device Management.";
 
 /// The runner: the configured bundle, else the installed user app whose id names a WebDriverAgent
 /// runner (AltStore and Sideloadly rename bundles, for example by adding the team id).
@@ -37,9 +41,13 @@ pub type Session = JoinHandle<std::result::Result<(), idevice::IdeviceError>>;
 pub async fn start(device: &mut Device, bundle: &str, ios: &str) -> Result<Session> {
     let major: u8 = ios.split('.').next().and_then(|v| v.parse().ok()).unwrap_or(17);
     let mut proxy = device.installation_proxy().await?;
-    let config = TestConfig::from_installation_proxy(&mut proxy, bundle, None)
+    let mut config = TestConfig::from_installation_proxy(&mut proxy, bundle, None)
         .await
         .map_err(|e| Failure::new(format!("cannot read the runner's install info: {e}")).fix(RUNNER_FIX))?;
+    // The runner checks for this: opened any other way, it does nothing and sends people to Poki.
+    let mut env = config.runner_env.take().unwrap_or_default();
+    env.insert("POKI_LAUNCHER".into(), "1".into());
+    config.runner_env = Some(env);
     let mut adapter = device.adapter.clone();
     let handshake = device.rsd.clone();
     Ok(tokio::spawn(async move {
@@ -81,4 +89,23 @@ pub async fn status(wda: SocketAddr, timeout: Duration) -> bool {
         Some(head[..n].starts_with(b"HTTP/1.1 200") || head[..n].starts_with(b"HTTP/1.0 200"))
     };
     matches!(tokio::time::timeout(timeout, attempt).await, Ok(Some(true)))
+}
+
+/// Ends every runner process (WebDriverAgentRunner-Runner). Returns how many were asked to end.
+pub async fn end(device: &mut Device) -> std::result::Result<usize, idevice::IdeviceError> {
+    let mut server: RemoteServerClient<Box<dyn ReadWrite>> = device.connect().await?;
+    let pids: Vec<u64> = {
+        let mut info = DeviceInfoClient::new(&mut server).await?;
+        info.running_processes()
+            .await?
+            .into_iter()
+            .filter(|p| p.name.contains("WebDriverAgentRunner") || p.real_app_name.contains("WebDriverAgentRunner"))
+            .map(|p| p.pid as u64)
+            .collect()
+    };
+    let mut control = ProcessControlClient::new(&mut server).await?;
+    for pid in &pids {
+        control.kill_app(*pid).await?;
+    }
+    Ok(pids.len())
 }
