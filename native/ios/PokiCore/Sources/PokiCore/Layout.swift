@@ -18,9 +18,16 @@ struct Layout {
     /// The elements drawn over `target`: bars, and elements later in the tree that are neither inside
     /// it nor around it and that are not big containers (half the screen or more holds things, it
     /// does not cover them).
+    ///
+    /// Not covers: a bar or a textless frame that wholly encloses the target (the control sits in it:
+    /// a Send button in an input bar or a keyboard, listed apart from it), and a textless frame with
+    /// nothing listed inside it (a transparent host view).
     func covers(_ target: Element) -> [Element] {
         all.filter { c in
             guard c.node != target.node, !c.contains(target), !target.contains(c), c.frame.intersects(target.frame) else { return false }
+            let encloses = c.frame.x <= target.frame.x + 0.5 && c.frame.y <= target.frame.y + 0.5 && c.frame.maxX >= target.frame.maxX - 0.5 && c.frame.maxY >= target.frame.maxY - 0.5
+            if encloses && (Self.bars.contains(c.type) || c.text.isEmpty) { return false }
+            if c.text.isEmpty && !all.contains(where: { c.contains($0) && !$0.text.isEmpty }) { return false }
             if Self.bars.contains(c.type) { return true }
             guard c.node > target.end, !Self.scrollers.contains(c.type) else { return false }
             return c.frame.area < 0.5 * screen.area
