@@ -52,6 +52,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "live.rs"]
+mod live;
+
 const DAEMON_USAGE: &str = "usage: poki-bridged --socket PATH --udid ID\n       poki-bridged --socket PATH --host IP --pairing-file PATH\n       poki-bridged --socket PATH --host IP --rp-pairing-file PATH [--rp-host-name NAME]";
 /// poki-native reads at most 2 MiB of request; the margin covers the `id`.
 const LINE_LIMIT: u64 = 2 * 1024 * 1024 + 4096;
@@ -70,7 +73,7 @@ pub fn main() {
         Err(error) => Err(error),
     };
     if let Err(error) = code {
-        eprintln!("poki-bridged: {error}");
+        log(&error.to_string());
         std::process::exit(if error.to_string() == ALREADY_RUNNING {
             3
         } else {
@@ -113,7 +116,7 @@ fn idle_env(name: &str, default_ms: u64) -> Option<Duration> {
 async fn run(socket: PathBuf, target: Target) -> Result<()> {
     let listener = bind(&socket).await?;
     let state = Rc::new(State::new(target));
-    eprintln!("poki-bridged: ready (pid {})", std::process::id());
+    log(&format!("ready (pid {})", std::process::id()));
     let result = serve(listener, state.clone()).await;
     state.session.lock().await.reset().await;
     let _ = std::fs::remove_file(&socket);
@@ -140,12 +143,23 @@ struct State {
     stop: watch::Sender<bool>,
     started: Instant,
     version: u64,
+    /// Accessibility reads made after the screen settles (live frames), and their arrivals.
+    prefetch: live::Prefetcher,
+    prefetch_events: Rc<watch::Sender<u64>>,
 }
 
 impl State {
     fn new(target: Target) -> Self {
+        let prefetch = live::Prefetcher::default();
+        let prefetch_events = Rc::new(watch::channel(0).0);
         Self {
-            session: Mutex::new(Session::new(target)),
+            session: Mutex::new(Session::new(
+                target,
+                prefetch.clone(),
+                prefetch_events.clone(),
+            )),
+            prefetch,
+            prefetch_events,
             stop: watch::channel(false).0,
             started: Instant::now(),
             version: executable_version(),
@@ -168,6 +182,8 @@ fn executable_version() -> u64 {
 async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let reaper = tokio::task::spawn_local(reap(state.clone()));
+    let prefetcher =
+        live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -182,6 +198,9 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
         }
     }
     reaper.abort();
+    if let Some(prefetcher) = prefetcher {
+        prefetcher.abort();
+    }
     Ok(())
 }
 
@@ -189,12 +208,40 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
 async fn reap(state: Rc<State>) {
     let input_idle = idle_env("POKI_BRIDGED_INPUT_IDLE_MS", 60_000);
     let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 1_800_000);
+    let mut reopened: Option<Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let Ok(mut session) = state.session.try_lock() else {
             continue;
         };
         let idle = session.last_used.elapsed();
+        if live::enabled() {
+            // The live screen keeps the media session open, and opens it again after an error.
+            if session.input.is_none()
+                && reopened.is_none_or(|at: Instant| at.elapsed() >= live::REOPEN_AFTER)
+            {
+                reopened = Some(Instant::now());
+                let mut timings = Timings::default();
+                match Box::pin(session.prepare_input_or_retry(false, &mut timings)).await {
+                    Ok(()) => {
+                        if let Some(input) = session.input.as_ref() {
+                            input.frames.live().decode();
+                        }
+                        log(&format!(
+                            "live frames: media session open in {} ms",
+                            timings.input_open_ms.unwrap_or(0)
+                        ));
+                    }
+                    Err(error) => {
+                        session.reset().await;
+                        log(&format!(
+                            "live frames: cannot open the media session: {error}"
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
         if input_idle.is_some_and(|limit| idle >= limit) && session.input.is_some() {
             log("input services idle; closing them");
             session.close_input().await;
@@ -208,7 +255,7 @@ async fn reap(state: Rc<State>) {
 }
 
 fn log(message: &str) {
-    eprintln!("poki-bridged: {message}");
+    eprintln!("{} poki-bridged: {message}", crate::ax::watch::stamp());
 }
 
 /// One client. Its requests are answered in order; when it disconnects, a running op is cancelled.
@@ -242,8 +289,15 @@ async fn connection(stream: UnixStream, state: Rc<State>) {
         let _ = closed_tx.send(true);
     });
     while let Some(line) = lines.recv().await {
+        if let Ok(text) = &line
+            && live::is_subscribe(text)
+        {
+            // The connection now carries the event feed until the client leaves.
+            Box::pin(live::subscribe(text, &state, closed.clone(), &mut write)).await;
+            break;
+        }
         let answer = match line {
-            Ok(line) => answer(&line, &state, closed.clone()).await,
+            Ok(line) => Box::pin(answer(&line, &state, closed.clone())).await,
             Err(error) => Some(failure(
                 Value::Null,
                 &*Box::<dyn std::error::Error + Send + Sync>::from(error),
@@ -272,6 +326,12 @@ struct Timings {
     reused_tunnel: bool,
     reused_input: bool,
     retried: bool,
+    /// When the tree answered was asked for, and whether the screen has changed since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree: Option<Value>,
+    /// Where a quick type_text spent its time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stages: Option<Value>,
     /// How an ax_tree read was served by the held subscription.
     #[serde(skip_serializing_if = "Option::is_none")]
     ax: Option<crate::ax::watch::Served>,
@@ -337,14 +397,24 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnel"] = session.link.is_some().into();
                 pong["input"] = session.input.is_some().into();
                 pong["ops"] = session.ops.into();
+                pong["frames"] = session.input.as_ref().map_or(Value::Null, |input| {
+                    let live = input.frames.live();
+                    live.report(&live.mark())
+                });
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
                     "fallbacks": session.ax_fallbacks,
                     "last_error": session.ax_last_error,
+                    "prefetch": session.input.as_ref().map(|input| {
+                        live::prefetch_json(&state.prefetch, &input.frames.live())
+                    }),
                 });
             }
             return Some(json!({"id": id, "ok": true, "pong": pong}));
+        }
+        op if live::is_live_op(op) => {
+            return Box::pin(live::answer(op, id, object, state, closed)).await;
         }
         "reset" => {
             state.session.lock().await.reset().await;
@@ -397,6 +467,17 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     })
 }
 
+/// An accessibility tree with when it was asked for (request_started_at, request_epoch) and
+/// whether the screen has changed since (current), as top-level fields.
+fn with_provenance(mut tree: Value, provenance: &Value) -> Value {
+    if let (Some(tree), Some(provenance)) = (tree.as_object_mut(), provenance.as_object()) {
+        for (key, value) in provenance {
+            tree.insert(key.clone(), value.clone());
+        }
+    }
+    tree
+}
+
 struct Link {
     device: Device,
 }
@@ -407,12 +488,16 @@ struct Input {
     /// Tasks that read and discard the RTP the phone streams to the media session's UDP sockets;
     /// the tunnel's UDP queues are unbounded.
     drains: Vec<JoinHandle<()>>,
+    /// The video: read and counted, and with POKI_LIVE_FRAMES=1 decoded (see frames.rs).
+    frames: crate::frames::Frames,
     touch: Option<Touch>,
     buttons: Option<Indigo>,
 }
 
 struct Session {
     target: Target,
+    prefetch: live::Prefetcher,
+    prefetch_events: Rc<watch::Sender<u64>>,
     link: Option<Link>,
     input: Option<Input>,
     /// The held accessibility subscription, inside the tunnel.
@@ -493,9 +578,15 @@ fn uses_touch(request: &Request) -> bool {
 }
 
 impl Session {
-    fn new(target: Target) -> Self {
+    fn new(
+        target: Target,
+        prefetch: live::Prefetcher,
+        prefetch_events: Rc<watch::Sender<u64>>,
+    ) -> Self {
         Self {
             target,
+            prefetch,
+            prefetch_events,
             link: None,
             input: None,
             ax: None,
@@ -542,7 +633,17 @@ impl Session {
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
         let request = parse(&object)?;
         let changes = !reads_only(&request);
+        // The live screen is not settled while an input runs, nor for the settle time after it.
+        let noted = changes
+            .then(|| self.input.as_ref().map(|input| input.frames.live()))
+            .flatten();
+        if let Some(live) = &noted {
+            live.note_input();
+        }
         let result = Box::pin(self.run(request, object, timings)).await;
+        if changes && let Some(input) = self.input.as_ref() {
+            input.frames.live().note_input();
+        }
         // Whatever it did, an op that may change the screen makes the held tree stale.
         if changes && let Some(watch) = self.ax.as_mut() {
             watch.invalidate();
@@ -561,7 +662,7 @@ impl Session {
         } = request
             && std::env::var("POKI_BRIDGED_AX_WATCH").as_deref() != Ok("0")
         {
-            return Box::pin(self.watched_tree(timings)).await;
+            return Box::pin(self.live_tree(timings)).await;
         }
         if matches!(
             request,
@@ -737,13 +838,15 @@ impl Session {
                 audio_udp,
                 video_udp,
             } = media;
-            let drains = [audio_udp, video_udp]
+            let drains = [audio_udp]
                 .into_iter()
                 .map(|socket| tokio::spawn(async move { while socket.recv().await.is_ok() {} }))
                 .collect();
+            let frames = crate::frames::Frames::new(video_udp, live::enabled());
             let mut input = Input {
                 client,
                 drains,
+                frames,
                 touch: None,
                 buttons: None,
             };
@@ -809,6 +912,18 @@ impl Session {
                 }
                 parse(object)?
             }
+            Request::TypeText {
+                text,
+                clear,
+                submit,
+                ..
+            } if super::paste_again::quick::enabled() => {
+                let result = Box::pin(self.quick_type(&text, clear, submit, object, timings)).await;
+                if result.is_err() {
+                    self.reset().await;
+                }
+                return result;
+            }
             request => request,
         };
         let result = Box::pin(self.input_action(request)).await;
@@ -816,6 +931,93 @@ impl Session {
             self.reset().await;
         }
         result
+    }
+
+    /// type_text with its independent steps overlapped (see quick_type.rs), using the held tree
+    /// when it is current and the live screen when it runs.
+    async fn quick_type(
+        &mut self,
+        text: &str,
+        clear: bool,
+        submit: bool,
+        object: &Map<String, Value>,
+        timings: &mut Timings,
+    ) -> Result<Value> {
+        use super::paste_again::{Target, quick};
+        let target: Option<Target> = match object.get("target") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone())?),
+        };
+        let held = self.ax.as_ref().and_then(|watch| watch.current());
+        let live = self
+            .input
+            .as_ref()
+            .map(|input| input.frames.live())
+            .filter(|live| live.decoding() && live.error().is_none());
+        let device = &self.link.as_ref().expect("connected").device;
+        let mut stages = quick::Stages::default();
+        let result = quick::paste_text(
+            &device.adapter,
+            &device.rsd,
+            held,
+            live,
+            text,
+            clear,
+            submit,
+            target.as_ref(),
+            &mut stages,
+        )
+        .await;
+        log(&format!(
+            "type_text stages: {}",
+            serde_json::to_string(&stages).unwrap_or_default()
+        ));
+        timings.stages = Some(serde_json::to_value(&stages)?);
+        result
+    }
+
+    /// The on-screen tree: a current read made when the screen settled, else the watched tree,
+    /// with when it was asked for and whether the screen has changed since.
+    async fn live_tree(&mut self, timings: &mut Timings) -> Result<Value> {
+        let live = self.live_view();
+        if let Some(live) = &live
+            && let Some(read) = Box::pin(live::prefetched(
+                &self.prefetch,
+                &self.prefetch_events,
+                live,
+                Duration::from_millis(1500),
+            ))
+            .await
+        {
+            timings.ax = Some(crate::ax::watch::Served::Prefetched);
+            let provenance = read.provenance(live);
+            timings.tree = Some(provenance.clone());
+            return Ok(with_provenance(read.tree, &provenance));
+        }
+        let requested = Instant::now();
+        let tree = Box::pin(self.watched_tree(timings)).await?;
+        let asked = self
+            .ax
+            .as_ref()
+            .and_then(|watch| watch.latest_requested())
+            .filter(|_| timings.ax != Some(crate::ax::watch::Served::Fallback))
+            .unwrap_or(requested);
+        let wall = std::time::SystemTime::now() - asked.elapsed();
+        let provenance = json!({
+            "request_started_at": crate::ax::watch::stamp_at(wall),
+            "request_epoch": live.as_ref().map(|live| live.epoch_at(asked)),
+            "current": live.as_ref().map(|live| live.unchanged_since(asked)),
+        });
+        timings.tree = Some(provenance.clone());
+        Ok(with_provenance(tree, &provenance))
+    }
+
+    /// The live screen, when it is being decoded.
+    fn live_view(&self) -> Option<crate::frames::Live> {
+        self.input
+            .as_ref()
+            .map(|input| input.frames.live())
+            .filter(|live| live.decoding() && live.error().is_none())
     }
 
     async fn contact(&mut self, x: u16, y: u16) -> Result<()> {
@@ -1074,11 +1276,22 @@ mod daemon_tests {
 
     /// The daemon over a real socket, against a target it cannot reach: the answers match what
     /// poki-native prints for the same failure, and the socket protocol works end to end.
-    #[tokio::test]
-    async fn serves_requests_over_the_socket() {
-        tokio::task::LocalSet::new()
-            .run_until(serves_requests())
-            .await;
+    /// The daemon runs on the main thread (8 MB of stack); unoptimized futures need more than the
+    /// 2 MB a test thread has, so the test gets a thread like the daemon's.
+    #[test]
+    fn serves_requests_over_the_socket() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(tokio::task::LocalSet::new().run_until(serves_requests()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     async fn serves_requests() {

@@ -23,12 +23,28 @@ mod ax {
     pub mod watch;
 }
 
+// The live screen (J1): the input media session's video, decoded in-process with libavcodec.
+#[path = "frames.rs"]
+mod frames;
+#[path = "libav.rs"]
+mod libav;
+
 #[path = "../.."]
 mod src {
     include!("../../main.rs");
 
     #[path = "bin/poki-bridged/daemon.rs"]
     pub mod daemon;
+
+    // pasteboard.rs again, with a child that runs type_text with its steps overlapped (see
+    // quick_type.rs). The child reuses the file's private checks and result builders.
+    #[path = "."]
+    mod paste_again {
+        include!("../../pasteboard.rs");
+
+        #[path = "bin/poki-bridged/quick_type.rs"]
+        pub mod quick;
+    }
 }
 
 fn main() {
