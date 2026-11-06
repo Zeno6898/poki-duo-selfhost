@@ -418,6 +418,8 @@ struct Session {
     ax_opened: u64,
     ax_fallbacks: u64,
     ax_last_error: Option<String>,
+    /// The subscription's own tunnel, with POKI_BRIDGED_AX_TUNNEL=separate.
+    ax_link: Option<Link>,
     last_used: Instant,
     ops: u64,
 }
@@ -496,6 +498,7 @@ impl Session {
             ax_opened: 0,
             ax_fallbacks: 0,
             ax_last_error: None,
+            ax_link: None,
             last_used: Instant::now(),
             ops: 0,
         }
@@ -516,6 +519,7 @@ impl Session {
     async fn reset(&mut self) {
         self.close_input().await;
         self.ax = None;
+        self.ax_link = None;
         self.link = None;
     }
 
@@ -608,7 +612,23 @@ impl Session {
             let reused = self.link.is_some();
             let result = async {
                 self.connect(timings).await?;
-                let device = &mut self.link.as_mut().expect("connected").device;
+                // With POKI_BRIDGED_AX_TUNNEL=separate the subscription gets a tunnel of its own,
+                // which input never uses.
+                let separate = std::env::var("POKI_BRIDGED_AX_TUNNEL").as_deref() == Ok("separate");
+                if separate && self.ax_link.is_none() {
+                    self.ax = None;
+                    let started = Instant::now();
+                    self.ax_link = Some(Link {
+                        device: connect_device(&self.target).await?,
+                    });
+                    timings.connect_ms = Some(timings.connect_ms.unwrap_or(0) + ms(started));
+                }
+                let link = if separate {
+                    &mut self.ax_link
+                } else {
+                    &mut self.link
+                };
+                let device = &mut link.as_mut().expect("connected").device;
                 // A read on a held subscription that is not answered soon is given up: a plain read
                 // on a new connection is answered more reliably than a renewal that hangs. A new
                 // subscription gets the time a first answer takes.
@@ -635,6 +655,7 @@ impl Session {
                         "held accessibility subscription failed ({error}); reading once without it"
                     ));
                     self.ax = None;
+                    self.ax_link = None;
                     self.ax_fallbacks += 1;
                     self.ax_last_error = Some(error.to_string());
                     timings.ax = Some(crate::ax::watch::Served::Fallback);

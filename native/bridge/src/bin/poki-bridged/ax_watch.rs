@@ -20,8 +20,9 @@
 //!   `POKI_BRIDGED_AX_MAX_AGE_MS` (default 1000). Otherwise the subscription is renewed, as poki-native
 //!   does for every read, and the read waits for its answer.
 //! - After an invalidation outside push mode, the renewal starts `POKI_BRIDGED_AX_REARM_MS`
-//!   (default 0) later in the background, so its answer, about 1.1 s on a phone over a tailnet,
-//!   overlaps the caller's settle time instead of following it.
+//!   (default 300) later in the background, so its answer is under way before the read asks. On
+//!   the phone, a renewal sent the moment an input ended (0) usually ended the subscription with a
+//!   socket error.
 //! - A tree with a second application root (the foreground changed under the subscription) is not
 //!   served; the subscription is renewed so the tree holds only the new screen.
 //!
@@ -104,7 +105,7 @@ impl Settings {
         Self {
             quiet: env_ms("POKI_BRIDGED_AX_QUIET_MS", 500),
             max_age: env_ms("POKI_BRIDGED_AX_MAX_AGE_MS", 1000),
-            rearm: env_ms("POKI_BRIDGED_AX_REARM_MS", 0),
+            rearm: env_ms("POKI_BRIDGED_AX_REARM_MS", 300),
             push: match std::env::var("POKI_BRIDGED_AX_PUSH").as_deref() {
                 Ok("on") => Push::On,
                 Ok("off") => Push::Off,
