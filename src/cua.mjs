@@ -58,17 +58,16 @@ function listable(elements, size) {
   });
 }
 
-// One read of the screen: a screenshot, then the accessibility tree; OCR of that
+// One read of the screen: a screenshot and the accessibility tree together; OCR of that
 // screenshot when the tree is empty or fails.
 async function read(ctx) {
   const started = performance.now();
-  // The screenshot first: the bridge serves one device op at a time, and a slow accessibility read
-  // must not hold the picture back.
-  const [frameResult] = await Promise.allSettled([ctx.capture()]);
+  // Both at once: the bridge runs the screenshot beside an accessibility read, so the read ends at
+  // the slower of the two, and the tree is not waited for past treeWaitMs.
   const tree = ctx.bridge({ op: 'ax', include_offscreen: false });
   tree.catch(() => {});
   const late = new Promise((_, reject) => setTimeout(() => reject(new Error(`accessibility did not answer within ${treeWaitMs} ms`)), treeWaitMs).unref?.());
-  const [treeResult] = await Promise.allSettled([Promise.race([tree, late])]);
+  const [frameResult, treeResult] = await Promise.allSettled([ctx.capture(), Promise.race([tree, late])]);
   if (frameResult.status === 'rejected') throw frameResult.reason;
   const frame = frameResult.value;
   let elements = [], source = 'accessibility', foreground, note;

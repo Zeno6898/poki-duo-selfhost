@@ -145,7 +145,7 @@ async fn enter_text(
             .ok_or("Device has no pasteboard service")?
             .port;
         super::trace("pasteboard PULL");
-        // SET + Cmd+V sends the text. Snapshot restoration is best effort.
+        // SET + Cmd+V sends the text, after the current clipboard has been saved.
         // Match the source without resolving promises.
         // A delayed PULL must not block that input path, nor
         // leave a late PULL_REPLY queued on the connection used for SET.
@@ -157,12 +157,11 @@ async fn enter_text(
         .await
         .ok()
         .and_then(std::result::Result::ok);
-        let snapshot_status = if previous_items.is_some() {
-            "complete"
-        } else {
-            "unavailable"
-        };
-        (port, previous_items, snapshot_status)
+        // The user's clipboard is never given up: when it cannot be saved first, nothing is pasted.
+        if previous_items.is_none() {
+            return Err("The clipboard could not be saved before pasting, so the text was not pasted. Type it with key presses instead.".into());
+        }
+        (port, previous_items, "complete")
     };
     if clear_first {
         super::trace("paste clear");
