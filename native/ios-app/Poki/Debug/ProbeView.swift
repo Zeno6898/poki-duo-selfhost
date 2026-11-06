@@ -18,7 +18,7 @@ struct ProbeView: View {
                         Text(loop.ipv6.isEmpty ? "no IPv6 on this interface" : "IPv6 present: \(loop.ipv6.joined(separator: ", "))")
                             .font(.caption.monospaced()).foregroundStyle(loop.ipv6.isEmpty ? Color.secondary : Color.orange)
                     } else {
-                        Text("no interface has a 10.7.0.x address: is the proxy app's tunnel on, with the loopback module enabled?").font(.caption)
+                        Label("No interface has a 10.7.0.x address. Check that your proxy app is on and its loopback module is enabled.", systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.secondary)
                     }
                 }
                 Section("Checks") {
@@ -33,7 +33,9 @@ struct ProbeView: View {
                     Button(running ? "Running…" : "Run checks") { Task { await run() } }.disabled(running)
                 }
                 Section("Background hold") {
-                    TextField("port on 10.7.0.1", text: $hold.port).keyboardType(.numberPad)
+                    LabeledContent("Port on 10.7.0.1") {
+                        TextField("49152", text: $hold.port).keyboardType(.numberPad).multilineTextAlignment(.trailing).monospacedDigit()
+                    }
                     Picker("Experiment", selection: $hold.experiment) { ForEach(Hold.Experiment.allCases) { Text($0.rawValue).tag($0) } }
                         .disabled(hold.holding)
                     HStack {
