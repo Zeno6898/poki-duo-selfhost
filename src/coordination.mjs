@@ -1,10 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { work, checkWork, stoppingReason } from './work.mjs';
+import { inputLockFromEnv, deviceKey } from './input-lock.mjs';
+import { definitions } from './tools.mjs';
+
+const readOnlyTools = new Set(definitions.filter(d => d[3]).map(d => d[0]));
 
 export const managementTools = new Set(['acquire_device', 'renew_device', 'release_device', 'cancel_device']);
 
 export class Coordination {
   leases = new Map(); operations = new Set(); revisions = new Map(); scenes = new Map(); queue = Promise.resolve();
+  // Undefined unless POKI_INPUT_LOCK=1; then each session has its own queue (see input-lock.mjs).
+  inputLock = inputLockFromEnv();
   revision(id) { return this.revisions.get(id) ?? 0; }
   changed(id) { this.revisions.set(id, this.revision(id) + 1); }
   observeFrame(id, data) { const previous = this.scenes.get(id); if (previous && !previous.equals(data)) this.changed(id); this.scenes.set(id, data); }
@@ -66,7 +72,9 @@ export class Coordination {
     const queued = performance.now();
     let started = false, abortQueued;
     const cancelledBeforeStart = new Promise((_, reject) => { abortQueued = () => { if (!started) reject(combined.reason); }; combined.addEventListener('abort', abortQueued, { once: true }); });
-    const execution = this.queue.then(() => work.run({ operation: op, signal: combined, timings: op.timings }, async () => {
+    let release;
+    const turn = this.inputLock ? this.lockedTurn(ctx, name, args, combined).then(r => { release = r; }) : this.queue;
+    const execution = turn.then(() => work.run({ operation: op, signal: combined, timings: op.timings }, async () => {
       started = true; combined.removeEventListener('abort', abortQueued);
       checkWork();
       op.timings.push({ id: 0, phase: 'queue', parent: null, elapsed_ms: Math.round((performance.now() - queued) * 100) / 100 });
@@ -78,8 +86,17 @@ export class Coordination {
         return result;
       } finally { if (combined.aborted) { const cleanup = await work.run(undefined, () => ctx.cleanup(op.devices)); if (result) result._meta = { ...result._meta, cleanup }; } }
     }));
-    op.done = Promise.race([execution, cancelledBeforeStart]).finally(() => { combined.removeEventListener('abort', abortQueued); this.operations.delete(op); });
-    this.queue = execution.catch(() => {});
+    const settled = execution.finally(() => release?.());
+    op.done = Promise.race([settled, cancelledBeforeStart]).finally(() => { combined.removeEventListener('abort', abortQueued); this.operations.delete(op); });
+    if (this.inputLock) ctx.queue = settled.catch(() => {});
+    else this.queue = execution.catch(() => {});
     return op.done;
+  }
+  // With the input lock on: wait for this session's earlier calls, then for a read slot or the
+  // device's input lock. Resolves to the release function.
+  async lockedTurn(ctx, name, args, signal) {
+    await (ctx.queue ?? Promise.resolve());
+    if (readOnlyTools.has(name)) return this.inputLock.readSlot(signal);
+    return this.inputLock.acquire(deviceKey(ctx, args), { session: ctx.label, tool: name }, signal);
   }
 }
