@@ -79,15 +79,16 @@ struct Layout {
         let list = scroller(named)
         var area = (list?.frame ?? screen).intersection(screen)
         if area.height < 80 || area.width < 80 { area = screen }
-        let over = list.map(covers) ?? all.filter { Self.bars.contains($0.type) }
-        for c in over.map(\.frame) where c.width >= 0.5 * area.width {
-            if c.centre.y > area.centre.y {
-                area.height = max(0, min(area.maxY, c.y) - area.y)
-            } else {
-                let top = min(area.maxY, max(area.y, c.maxY))
-                area.height = area.maxY - top
-                area.y = top
-            }
+        // Only what sits on the list's top or bottom edge is a bar over it. Rows an app lists beside
+        // the list instead of inside it lie across the middle and are what the finger should move.
+        let list0 = area
+        let over = (list.map(covers) ?? all.filter { Self.bars.contains($0.type) }).map(\.frame)
+            .filter { $0.width >= 0.5 * list0.width && $0.height <= 0.35 * list0.height }
+        for c in over where c.maxY >= list0.maxY - 2 && c.y > list0.y { area.height = max(0, min(area.maxY, c.y) - area.y) }
+        for c in over where c.y <= list0.y + 2 && c.maxY < list0.maxY {
+            let top = min(area.maxY, max(area.y, c.maxY))
+            area.height = area.maxY - top
+            area.y = top
         }
         let top = max(area.y, screen.height * 0.06), bottom = min(area.maxY, screen.height - 40)
         if bottom - top < 80 {
