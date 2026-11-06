@@ -113,7 +113,7 @@ final class AppModel {
         guard !sessionOn else { return }
         problem = nil
         guard let pairing = setup.pairingFile else { problem = "Pair this iPhone first (Setup)."; return }
-        guard diskImage.isReady else {
+        guard diskImage.isReady, diskImage.recheck() else {
             problem = "The developer disk image is not downloaded yet (Setup > Pair). It is needed once."
             Task { await diskImage.download() }
             return
@@ -222,6 +222,10 @@ final class AppModel {
         // Events from a launcher that was stopped for idle are old news.
         guard !runnerPaused else { return }
         if status != runner { log.add("runner", "\(status.state)\(status.detail.map { ": \($0)" } ?? "")") }
+        if status.code == "ddi_bad", runner.code != "ddi_bad" {
+            log.add("ddi", "the phone would not install the disk image: downloading it again")
+            diskImage.redownload()
+        }
         runner = status
         host.update(runner: status.coreState)
         if status.state == "failed" {

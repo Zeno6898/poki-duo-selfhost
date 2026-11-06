@@ -38,6 +38,8 @@ struct RunnerStatus: Sendable, Equatable, Decodable {
     var detail: String?
     var attempt: Int?
     var fix: String?
+    /// The launcher's short code for what to do, e.g. "ddi_bad" (download the image again).
+    var code: String?
     var pairing: String?
     static let idle = RunnerStatus(state: "idle")
 

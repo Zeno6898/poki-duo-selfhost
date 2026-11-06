@@ -14,6 +14,22 @@ final class DiskImageStore {
         if let build = try? DeveloperDiskImage.verify(AppFiles.ddiDirectory) { state = .ready(build) }
     }
 
+    /// Checks the files again (they can be damaged or removed); false starts a fresh download.
+    func recheck() -> Bool {
+        if let build = try? DeveloperDiskImage.verify(AppFiles.ddiDirectory) { state = .ready(build); return true }
+        state = .missing
+        Task { await download() }
+        return false
+    }
+
+    /// The phone would not install the image: delete it and download it again.
+    func redownload() {
+        if case .downloading = state { return }
+        try? FileManager.default.removeItem(at: AppFiles.ddiDirectory)
+        state = .missing
+        Task { await download() }
+    }
+
     var isReady: Bool { if case .ready = state { return true } else { return false } }
 
     func download() async {

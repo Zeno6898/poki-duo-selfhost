@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// What Poki did and why, for the Debug tab's Copy log: runner starts, stops and restarts (with the
 /// reason), agent steps, approvals, relay and Live Activity changes. Kept in memory (the last 600
@@ -40,8 +41,12 @@ final class AppLog {
 
     /// The whole log as text, with a header that says which phone and system it came from.
     var text: String {
-        let info = ProcessInfo.processInfo
-        let header = "Poki log, \(ISO8601DateFormatter().string(from: Date())), iOS \(info.operatingSystemVersionString)"
+        let info = Bundle.main.infoDictionary ?? [:]
+        let header = [
+            "Poki log, \(ISO8601DateFormatter().string(from: Date()))",
+            "Poki \(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?")), \(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)",
+            "Relay \(RelayIdentity.relayBase.host() ?? "?")",
+        ].joined(separator: "\n")
         return ([header] + lines).joined(separator: "\n")
     }
 

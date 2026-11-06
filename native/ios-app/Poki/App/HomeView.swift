@@ -277,9 +277,11 @@ struct Issue: Identifiable {
             let runner = model.runner
             if runner.state == "failed" {
                 let fix = runner.fix ?? ""
-                let kind: Fix = fix.contains("Install Poki Runner") || fix.contains("Pair again") ? .setup : fix.contains("Developer Mode") ? .settings : .retry
+                let kind: Fix = fix.contains("Install Poki Runner") || fix.contains("Pair again") || fix.contains("setup") ? .setup : fix.contains("Developer Mode") ? .settings : .retry
                 out.append(Issue(id: "runner", symbol: "hand.tap.fill", title: "The runner stopped",
                                  text: fix.isEmpty ? (runner.detail.map { "\($0.prefix(1).uppercased())\($0.dropFirst())." } ?? "Poki starts it again on the next agent request.") : fix, fix: kind))
+            } else if runner.state == "waiting_network", let fix = runner.fix, fix.contains("internet") {
+                out.append(Issue(id: "network", symbol: "wifi.exclamationmark", title: "Waiting for the internet", text: fix, fix: .none))
             } else if runner.state == "waiting_network" || !model.loopback.isWorking && model.loopback.state != .checking {
                 out.append(Issue(id: "loopback", symbol: "arrow.triangle.2.circlepath", title: "Loopback is off",
                                  text: model.loopback.detail, fix: .setup))

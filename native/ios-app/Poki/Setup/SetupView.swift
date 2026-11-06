@@ -161,6 +161,8 @@ struct RunnerContent: View {
             "Open **Settings > General > VPN & Device Management**, tap your Apple ID and tap **Trust**.",
             "Don't open Poki Runner yourself. Poki starts it when an agent needs the phone.",
         ])
+        Text("With a free Apple ID, apps you sign yourself expire after 7 days and only 3 can be installed at a time; Poki and Poki Runner use two. A free Apple ID also can't sign a VPN, so the loopback comes from your proxy app or LocalDevVPN.")
+            .font(.footnote).foregroundStyle(.secondary)
         SettingsButton(step: .runner)
         ConfirmRow(title: "Poki Runner is installed and trusted", isOn: $model.setup.runnerInstalled)
     }
