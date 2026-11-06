@@ -386,6 +386,13 @@ export class Devices {
         case 'get_foreground_app': {
           const tree = await this.bridge({ op:'ax', include_offscreen:false });
           if (!tree.foreground?.bundle_id && !tree.foreground?.pid) throw new Error('The accessibility service did not identify a foreground app.');
+          // Some accessibility roots carry only a pid; AppService names the app running as it.
+          if (!tree.foreground.bundle_id && (await this.target()).kind === 'physical') {
+            try {
+              const app = await this.bridge({ op: 'app_for_pid', pid: tree.foreground.pid });
+              if (app.bundle_id) return text({ ...tree.foreground, bundle_id: app.bundle_id, name: tree.foreground.name ?? app.name, bundle_id_source: 'app_service' });
+            } catch (error) { if (stopped(error)) throw error; }
+          }
           return text(tree.foreground);
         }
         case 'rotate': {

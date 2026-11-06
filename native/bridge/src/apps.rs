@@ -160,6 +160,49 @@ pub async fn list(
     Ok(json!({"apps":apps,"localized_names":{"status":status,"added_aliases":added_aliases}}))
 }
 
+/// A path from AppService without its `file://` scheme, `/private` prefix and trailing slash, so
+/// an executable path can be matched against the bundle that contains it.
+fn bare_path(path: &str) -> &str {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    let path = path.strip_prefix("/private").unwrap_or(path);
+    path.trim_end_matches('/')
+}
+
+/// The installed app whose bundle contains `executable`.
+fn app_for_executable<'a>(apps: &'a [AppListEntry], executable: &str) -> Option<&'a AppListEntry> {
+    let executable = bare_path(executable);
+    apps.iter().find(|app| {
+        let bundle = bare_path(&app.path);
+        !bundle.is_empty()
+            && executable
+                .strip_prefix(bundle)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Names the app running as `pid`, for an accessibility root that carries no bundle ID.
+pub async fn app_for_pid(
+    adapter: &mut AdapterHandle,
+    rsd: &mut RsdHandshake,
+    pid: u32,
+) -> Result<Value> {
+    let mut service = AppServiceClient::connect_rsd(adapter, rsd).await?;
+    let executable = service
+        .list_processes()
+        .await?
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.executable_url)
+        .map(|url| url.relative);
+    let Some(executable) = executable else {
+        return Ok(json!({"pid":pid,"running":false,"bundle_id":null,"name":null}));
+    };
+    let apps = installed_apps(&mut service, rsd).await?;
+    let app = app_for_executable(&apps, &executable);
+    Ok(json!({"pid":pid,"running":true,"executable":executable,
+        "bundle_id":app.map(|app| app.bundle_identifier.as_str()),"name":app.map(|app| app.name.as_str())}))
+}
+
 fn add_localized_names(apps: &mut [Value], icons: &plist::Value) -> usize {
     match icons {
         plist::Value::Array(items) => items
@@ -197,6 +240,56 @@ fn add_localized_names(apps: &mut [Value], icons: &plist::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_executable_maps_to_the_bundle_that_contains_it() {
+        let app = |bundle: &str, path: &str| AppListEntry {
+            name: bundle.into(),
+            bundle_identifier: bundle.into(),
+            path: path.into(),
+            is_removable: true,
+            is_first_party: false,
+            is_developer_app: false,
+            bundle_version: None,
+            is_internal: false,
+            is_hidden: false,
+            is_app_clip: false,
+            version: None,
+        };
+        let apps = vec![
+            app("local.empty", ""),
+            app(
+                "local.chat",
+                "file:///private/var/containers/Bundle/Application/A/Chat.app/",
+            ),
+            app(
+                "local.chatpro",
+                "/var/containers/Bundle/Application/B/ChatPro.app",
+            ),
+            app("com.apple.Preferences", "/Applications/Preferences.app"),
+        ];
+        let find =
+            |path: &str| app_for_executable(&apps, path).map(|a| a.bundle_identifier.as_str());
+        assert_eq!(
+            find("file:///private/var/containers/Bundle/Application/A/Chat.app/Chat"),
+            Some("local.chat")
+        );
+        assert_eq!(
+            find("/var/containers/Bundle/Application/A/Chat.app/Chat"),
+            Some("local.chat")
+        );
+        assert_eq!(
+            find("/private/var/containers/Bundle/Application/B/ChatPro.app/ChatPro"),
+            Some("local.chatpro")
+        );
+        assert_eq!(
+            find("/Applications/Preferences.app/Preferences"),
+            Some("com.apple.Preferences")
+        );
+        // A sibling whose name starts the same is not inside the bundle.
+        assert_eq!(find("/Applications/Preferences.appx/Preferences"), None);
+        assert_eq!(find("/usr/libexec/backboardd"), None);
+    }
 
     #[test]
     fn launch_name_resolution_prefers_exact_and_rejects_ambiguous_names() {

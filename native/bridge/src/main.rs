@@ -82,6 +82,9 @@ enum Request {
         #[serde(default)]
         include_offscreen: bool,
     },
+    AppForPid {
+        pid: u32,
+    },
     LockdownGet {
         #[serde(default)]
         domain: Option<String>,
@@ -205,6 +208,7 @@ impl Request {
                 device_ops::validate_lockdown(domain.as_deref(), key)?
             }
             Self::Screenshot { path } => device_ops::validate_screenshot(path)?,
+            Self::AppForPid { pid: 0 } => return Err("pid must be positive".into()),
             Self::Rotate { direction } => {
                 device_ops::direction(direction)?;
             }
@@ -536,6 +540,9 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
         return ax::read_tree(&mut adapter, &rsd, include_offscreen).await;
     }
     match request {
+        Request::AppForPid { pid } => {
+            return apps::app_for_pid(&mut adapter, &mut rsd, pid).await;
+        }
         Request::LockdownGet { domain, key } => {
             return device_ops::lockdown_get(&mut adapter, &mut rsd, domain.as_deref(), &key).await;
         }
@@ -581,6 +588,7 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
             | Request::UninstallApp { .. }
             | Request::AxTree { .. }
             | Request::Configuration { .. }
+            | Request::AppForPid { .. }
             | Request::LockdownGet { .. }
             | Request::Screenshot { .. }
             | Request::Rotate { .. }
@@ -923,6 +931,7 @@ mod tests {
     #[test]
     fn device_service_requests_parse_and_validate() {
         for text in [
+            r#"{"op":"app_for_pid","pid":4242}"#,
             r#"{"op":"lockdown_get","key":"DeviceName"}"#,
             r#"{"op":"lockdown_get","domain":"com.apple.mobile.iTunes","key":"ScreenScaleFactor"}"#,
             r#"{"op":"screenshot","path":"/tmp/frame.png"}"#,
@@ -955,6 +964,8 @@ mod tests {
     #[test]
     fn invalid_device_service_requests_are_rejected() {
         for text in [
+            r#"{"op":"app_for_pid","pid":0}"#,
+            r#"{"op":"app_for_pid","pid":-1}"#,
             r#"{"op":"lockdown_get"}"#,
             r#"{"op":"lockdown_get","key":""}"#,
             r#"{"op":"lockdown_get","key":"DeviceName","extra":1}"#,

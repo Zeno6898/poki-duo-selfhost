@@ -15,6 +15,7 @@ Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-fil
 | `list_apps` | None | Stream the advertised AppService application list without host CoreDevice discovery. Report an error when the capability is absent. |
 | `launch_app` | `bundle_id` or `name`, `arguments=[]`, `environment={}`, `terminate_existing=false` | Launch through the paired device's RemoteXPC AppService. An explicit bundle ID skips inventory lookup. Names use only the advertised streaming list. Return the PID for the caller's subsequent foreground check. |
 | `configuration` | `method`, `value?` | Read or set appearance, text size, Reduce Motion, Reduce Transparency, Increase Contrast and larger accessibility sizes. See [Device services](#device-services). |
+| `app_for_pid` | `pid` | Name the app running as `pid` through AppService's process list and the installed bundle paths. Returns `{pid, running, executable?, bundle_id, name}`; `bundle_id` is null when no installed bundle contains the executable. `get_foreground_app` uses it when the accessibility root has a pid but no bundle ID. |
 | `lockdown_get` | `key`, `domain?` | Read one lockdown value through `com.apple.mobile.lockdown.remote.trusted`. |
 | `screenshot` | `path` | Take a PNG screenshot through DVT and write it to a new file at the absolute `path`. |
 | `rotate` | `direction=left` | Rotate the device 90 degrees, `left` (counter-clockwise) or `right`, through `com.apple.coredevice.devicecontrol`. |
