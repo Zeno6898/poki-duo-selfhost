@@ -1,0 +1,70 @@
+# Builds the Poki iPhone app (native/ios-app) as an unsigned IPA with its two extensions (the loopback
+# packet tunnel and the Live Activity widget). It is signed when it is installed, with the user's own
+# team for the Network Extension entitlement (see native/ios-app/README.md).
+name: iOS app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev/ios-app]
+    paths: [native/ios-app/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Assets and project
+        run: |
+          native/ios-app/scripts/make-assets.sh
+          brew install xcodegen
+          xcodegen generate --spec native/ios-app/project.yml
+
+      - name: Build (iOS device SDK, unsigned)
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project native/ios-app/Poki.xcodeproj \
+            -scheme Poki -configuration Release \
+            -destination generic/platform=iOS \
+            -derivedDataPath build/app \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 | tee build/app.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " || true
+          test -d build/app/Build/Products/Release-iphoneos/Poki.app
+
+      - name: Package the IPA
+        run: |
+          set -euo pipefail
+          APP=build/app/Build/Products/Release-iphoneos/Poki.app
+          test -d "$APP/PlugIns/PokiTunnel.appex"
+          test -d "$APP/PlugIns/PokiWidgets.appex"
+          rm -rf Payload out && mkdir -p Payload out
+          ditto "$APP" Payload/Poki.app
+          find Payload -name '*.dSYM' -prune -exec rm -rf {} +
+          ditto -c -k --keepParent --norsrc Payload out/Poki-unsigned.ipa
+          (cd out && shasum -a 256 *.ipa | tee SHA256SUMS)
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/Poki.app/Info.plist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Poki-unsigned
+          path: out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-build-log
+          path: build/app.log

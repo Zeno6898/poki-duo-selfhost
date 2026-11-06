@@ -2,7 +2,7 @@
 
 The runner is the part of Poki that runs on the iPhone itself: Appium's WebDriverAgent (BSD-3-Clause,
 vendored as a submodule at `WebDriverAgent/`, pinned to v16.15.3, commit `02cb92f0`), built as the
-`WebDriverAgentRunner` UI-test host and branded as Poki (icon, display name, launch screen) by
+`WebDriverAgentRunner` UI-test host and branded as Poki Runner (its own icon from `docs/images/runner/`, display name, launch screen) by
 `branding/brand.sh`.
 
 ## Build
@@ -20,25 +20,8 @@ now AltStore with the user's Apple ID).
 
 ## Poki Probe
 
-`PokiProbe/` is a one-screen SwiftUI app that answers whether the phone can reach its own developer
-services. The primary checks connect with Network.framework to 10.7.0.1 on 62078 (lockdown) and
-49152 (RemotePairing, the port poki-wda uses), and on a random port in 50000-59999, because the
-tunnel's second connection goes to a port the phone picks (refused there means reachable, a timeout
-means not): 10.7.0.1 is the address the user's own proxy app
-reflects back to the phone (see [`deploy/proxy-modules/`](../../deploy/proxy-modules/)), so Poki
-never takes the phone's VPN slot. Secondary rows connect to 49152 on en0's Wi-Fi IPv4 address, on
-127.0.0.1 and on en0's link-local IPv6 address. Each row shows the raw result (connected, refused,
-timeout or the error) and the first bytes received. The app also shows which interface carries a
-10.7.0.x address and whether that interface has IPv6 too (it should not: tools that look for this
-loopback skip interfaces with IPv6). A "Background hold" section measures the launcher's biggest risk: it holds one
-TCP connection to 10.7.0.1 (49152 by default, any port) while the user leaves the app, and logs with
-timestamps the app's state changes, the background task's time and expiry, a once-a-second heartbeat
-whose gaps are time spent suspended, and when the connection closed. The log is also written to a
-file, so it is shown again after the app was killed. As experiments only, not for shipping, the hold
-can run with silent audio or location updates (the Info.plist declares both background modes) to
-compare against none. The app needs no special entitlement. The project is generated
-from `project.yml` with XcodeGen in the same workflow, which uploads `PokiProbe-unsigned.ipa` as the
-`PokiProbe-unsigned` artifact.
+The probe (10.7.0.1 reachability and the background hold test) is now the Debug tab of the Poki app,
+`native/ios-app/Poki/Debug/`.
 
 ## Design note: the runner dials out (not built yet)
 

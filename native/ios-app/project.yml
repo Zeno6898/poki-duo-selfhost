@@ -1,0 +1,96 @@
+# Poki, the iPhone app: setup, the built-in loopback tunnel, the Live Activity with approvals, the relay
+# connection and the debug probe, in one app. Generated with XcodeGen in the ios-app workflow (run
+# scripts/make-assets.sh first); there is no checked-in .xcodeproj. The runner (WebDriverAgent) is a
+# second bundle, built by the ios-runner workflow; see dev/ios-core docs/single-bundle.md.
+name: Poki
+options:
+  bundleIdPrefix: nz.zheha.poki
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    DEBUG_INFORMATION_FORMAT: dwarf
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  Poki:
+    type: application
+    platform: iOS
+    sources:
+      - path: Poki
+      - path: Shared
+    info:
+      path: Poki/Info.plist
+      properties:
+        CFBundleDisplayName: Poki
+        UILaunchScreen:
+          UIColorName: AccentColor
+          UIImageName: Bear
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: true
+        # Background audio keeps the launcher's connections (and with them the runner) alive while a
+        # session is on; the Live Activity shows that it is running.
+        UIBackgroundModes: [audio, location]
+        NSLocationWhenInUseUsageDescription: Poki uses location only in the Debug tab's background experiment.
+        NSLocalNetworkUsageDescription: Poki connects to this iPhone's own developer services to pair with it and to run the automation.
+        NSBonjourServices: [_remotepairing-pairable-host._tcp, _remotepairing-manual-pairing._tcp]
+        LSApplicationQueriesSchemes: [surge, loon, shadowrocket, sing-box]
+        ITSAppUsesNonExemptEncryption: false
+    entitlements:
+      path: Poki/Poki.entitlements
+      properties:
+        com.apple.security.application-groups: [group.nz.zheha.poki]
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+    dependencies:
+      - target: PokiTunnel
+      - target: PokiWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nz.zheha.poki
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+  PokiTunnel:
+    type: app-extension
+    platform: iOS
+    sources: [PokiTunnel]
+    info:
+      path: PokiTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: Poki Loopback
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: PokiTunnel/PokiTunnel.entitlements
+      properties:
+        com.apple.security.application-groups: [group.nz.zheha.poki]
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nz.zheha.poki.tunnel
+  PokiWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PokiWidgets
+      - path: Shared
+    info:
+      path: PokiWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Poki
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: PokiWidgets/PokiWidgets.entitlements
+      properties:
+        com.apple.security.application-groups: [group.nz.zheha.poki]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nz.zheha.poki.widgets

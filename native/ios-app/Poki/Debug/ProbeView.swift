@@ -47,7 +47,7 @@ struct ProbeView: View {
                     }
                 }
             }
-            .navigationTitle("Poki Probe")
+            .navigationTitle("Debug")
             .task { await run() }
         }
     }
