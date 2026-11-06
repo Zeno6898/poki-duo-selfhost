@@ -91,8 +91,8 @@ private struct LogSection: View {
             .controlSize(.large).buttonBorderShape(.capsule)
             .listRowBackground(Color.clear).listRowInsets(EdgeInsets())
             NavigationLink {
-                List(log.lines.reversed().indices, id: \.self) { i in
-                    Text(log.lines.reversed()[i]).font(.caption.monospaced()).textSelection(.enabled)
+                List(Array(log.lines.reversed().enumerated()), id: \.offset) { _, line in
+                    Text(line).font(.caption.monospaced()).textSelection(.enabled)
                 }
                 .navigationTitle("Log").navigationBarTitleDisplayMode(.inline)
                 .toolbar { Button("Clear", role: .destructive) { log.clear() } }
