@@ -182,7 +182,9 @@ Each answer is facts only: the app in front, numbered elements, what each action
   inside it as numbered `Text` elements (`(read from the picture)`), which can be tapped.
 - **No tree in time.** When the runner's tree misses the read's time (a cold app, a keyboard coming
   up: over 4 s on the CI simulator) but the screenshot came, the text Vision reads in the whole picture
-  is listed instead, numbered and tappable at its centre, under a heading that says so.
+  is listed instead, numbered and tappable at its centre, under a heading that says so. When that
+  yields nothing, the read's note says why: no text found, the text could not be read, or the reading
+  did not finish in time (with its milliseconds).
 - **Taps are hit-tested.** A numbered element is touched at its centre, or, when the centre is off
   screen or under a bar or a later element in the tree (a reply bar), at the nearest point of it that
   is free; the answer says where. No free point: `not_hittable`, nothing is sent. Points off the screen

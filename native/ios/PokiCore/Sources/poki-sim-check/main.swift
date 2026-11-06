@@ -78,6 +78,14 @@ check(same.contains("screen_changed: false"), "nothing done: screen_changed fals
 let waited = await call("wait_until settled", "do", ["actions": [["wait_until": "settled"]]])
 check(waited.contains("wait_until: the screen held still"), "wait_until settled")
 await call("swipe down to the top", "do", ["actions": [["swipe": "down"], ["swipe": "down"]]])
+// Diagnostic only: how long Vision's text recognition takes here on a whole screenshot (the fallback
+// when the tree is late gets up to 3.5 s).
+if let shot = try? await URLSession.shared.data(from: url.appendingPathComponent("screenshot")).0,
+   let b64 = (try? JSON.parse(shot))?["value"]?.string, let png = Data(base64Encoded: b64) {
+    let began = Date()
+    let texts = await Host().recognizeText(inPNG: png)
+    print("diag: Vision read \(texts.map { "\($0.count) texts" } ?? "nothing (nil)") from a \(png.count / 1024) KB screenshot in \(Int(Date().timeIntervalSince(began) * 1000)) ms\n")
+}
 // Settings' search field: typing, read back exactly.
 let list = await call("look for the search field", "look")
 let searchRef = list.split(separator: "\n").first { $0.contains("SearchField") }.flatMap { line in line.split(separator: " ").first { Int($0.trimmingCharacters(in: CharacterSet(charactersIn: "+~"))) != nil } }.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "+~")) }
@@ -85,9 +93,17 @@ if let searchRef, let ref = Int(searchRef) {
     let text = "Wi-Fi 你好 123"
     let typed = await call("type mixed text in search", "do", ["actions": [["type": .string(text), "ref": .number(Double(ref))]]])
     // The read-back can miss its time while the keyboard comes up; the next read shows the field then.
-    let after = await call("look at the field", "look")
+    // Simulator tolerance: on a fresh simulator Settings' own main loop can stop answering for a while
+    // after the first search (WDA's log: "did not confirm its main run loop is responsive"), so the
+    // check looks up to three more times. Each look's answer stays in the log and the table.
+    var reads = [typed]
+    for attempt in 1...4 {
+        let after = await call(attempt == 1 ? "look at the field" : "look at the field (\(attempt))", "look")
+        reads.append(after)
+        if !after.contains("no element tree") { break }
+    }
     // With the tree late, the text read from the picture stands in; it must show the typed text.
-    check(typed.contains("the field now reads \"\(text)\"") || after.contains("SearchField \"Search = \(text)\"") || after.contains("Text \"\(text)\""), "typed text reads back exactly")
+    check(reads.contains { $0.contains("the field now reads \"\(text)\"") || $0.contains("SearchField \"Search = \(text)\"") || $0.contains("Text \"\(text)\"") }, "typed text reads back exactly")
 } else {
     check(false, "Settings shows a search field")
 }
