@@ -58,11 +58,12 @@ class LedgerApp {
 // The real Devices with the phone replaced by the app above: dispatch, the single-step tools, the
 // World and the new tools all run as they do against a device.
 class LedgerPhone extends Devices {
-  constructor(options = {}) { super(); this.app = new LedgerApp(options); this.size = { device: 'phone-1', width: W, height: H }; this.live = options.live; this.drags = []; }
+  constructor(options = {}) { super(); this.app = new LedgerApp(options); this.size = { device: 'phone-1', width: W, height: H }; this.live = options.live; this.drags = []; this.pidOnly = options.pidOnly; }
   async inventory() { return [{ id: 'phone-1', kind: 'physical', name: 'Test Phone', state: 'Booted' }]; }
   liveScreen() { return this.live?.(this); }
   async bridge(request) {
-    if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
+    if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: this.pidOnly ? { pid: tree.foreground.pid } : tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
+    if (request.op === 'app_for_pid') { this.lookups = (this.lookups ?? 0) + 1; return request.pid === ledger.pid ? { bundle_id: ledger.bundle_id, name: 'Ledger' } : { executable: '/System/Library/CoreServices/SpringBoard.app/SpringBoard' }; }
     if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
     if (request.op === 'drag') {
       this.drags.push(request);
@@ -289,4 +290,14 @@ test('whatMoved names the container whose items shifted together', async () => {
   const after = [row, el('StaticText', 'Header', 10, 40, 100, 20), el('Cell', 'Selfies', 10, 310, 100, 100), el('Cell', 'Live', 120, 310, 100, 100), el('Cell', 'Portrait', 230, 310, 100, 100)];
   assert.deepEqual(whatMoved(before, after), { container: 'Media Types', frame: [0, 300, 390, 120], shift: { x: -110, y: 0 }, items_moved: 2, appeared: 1 });
   assert.equal(whatMoved(before, before), null);
+});
+
+test('an accessibility root with only a pid is named from the app service, once per process', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone({ pidOnly: true });
+  assert.match(body(await phone.call('observe', {})).now.summary, /^com\.apple\.springboard: /);
+  const opened = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Ledger' } }, expect: { foreground: 'local.ledger' } }));
+  assert.equal(opened.expectation, 'met');
+  assert.match(opened.now.summary, /^local\.ledger: as expected/);
+  await phone.call('observe', {});
+  assert.equal(phone.lookups, 2, 'one lookup per process');
 });

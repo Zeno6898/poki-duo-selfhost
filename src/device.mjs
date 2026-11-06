@@ -61,7 +61,7 @@ export function hidPoint(x, y, width, height) {
 
 export class Devices {
   selected; requested; frame; size; seen; elements = []; elementsAt = 0; lastInputAt = -Infinity; inBatch = false;
-  scales = new Map(); readCosts = new Map(); worlds = new Map(); captureMs = 1500; physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
+  scales = new Map(); readCosts = new Map(); worlds = new Map(); appNames = new Map(); captureMs = 1500; physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
     if (routesToBridgeDaemon(file, input)) return runThroughDaemon(args, { timeout, input });
@@ -311,6 +311,7 @@ export class Devices {
     const served = timingsSince(timings).findLast(entry => typeof entry.ax === 'string')?.ax;
     if (tree.foreground?.pid) this.lastForeground = { device: target.id, pid: tree.foreground.pid };
     if (tree.foreground && !tree.foreground.bundle_id && this.springBoard?.device === target.id && tree.foreground.pid === this.springBoard.pid) tree.foreground = { ...tree.foreground, bundle_id: springBoardId, name: 'SpringBoard' };
+    if (tree.foreground?.pid && !tree.foreground.bundle_id && target.kind === 'physical') tree.foreground = await this.nameForeground(target, tree.foreground);
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     // The app in front is part of the screen: a switch counts as a change even before its tree arrives.
@@ -324,6 +325,21 @@ export class Devices {
   screenSettled(seen) {
     const world = this.worlds.get(this.resolved?.id), frame = world?.settledFrame;
     return Boolean(frame && world.lastInput && frame.afterInput === world.lastInput.epoch && frame.epoch === world.epoch && Date.parse(seen.observedAt) >= frame.capturedMs);
+  }
+  // Some accessibility roots carry only a pid. AppService names the app running as it, once per
+  // process: a pid is not reused while the app runs. A failed lookup is retried after a while, and a
+  // slow one never holds a read up for long.
+  async nameForeground(target, foreground) {
+    const key = `${target.id} ${foreground.pid}`, known = this.appNames.get(key);
+    if (known && (known.bundle_id || Date.now() - known.at < 30000)) return known.bundle_id ? { ...foreground, bundle_id: known.bundle_id, name: foreground.name ?? known.name } : foreground;
+    let found = { at: Date.now() };
+    try {
+      const app = await deadline(1500, () => this.bridge({ op: 'app_for_pid', pid: foreground.pid }));
+      if (app.bundle_id) found = { ...found, bundle_id: app.bundle_id, name: app.name };
+      else if (springBoardExecutable.test(app.executable ?? '')) { found = { ...found, bundle_id: springBoardId, name: 'SpringBoard' }; this.springBoard = { device: target.id, pid: foreground.pid }; }
+    } catch { checkWork(); }
+    this.appNames.set(key, found);
+    return found.bundle_id ? { ...foreground, bundle_id: found.bundle_id, name: foreground.name ?? found.name } : foreground;
   }
   // A simulator's size only changes when it rotates. A physical device maps touches through its
   // current orientation, so it keeps taking a fresh frame.
