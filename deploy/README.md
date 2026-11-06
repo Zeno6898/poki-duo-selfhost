@@ -33,6 +33,7 @@ Put these in `deploy/poki.env` (start from `poki.env.example`; the file is git-i
 | `POKI_OAUTH_REDIRECT_HOSTS` | `claude.ai,claude.com,localhost,127.0.0.1,[::1]` | Redirect hosts that client registration accepts. `*.example.com` matches subdomains. |
 | `POKI_OAUTH_ACCOUNT_FILE` | `$POKI_MCP_STATE_DIR/oauth/account.json` | The one account for `builtin`. |
 | `POKI_OAUTH_ACCESS_TTL` / `POKI_OAUTH_REFRESH_TTL` | `3600` / `2592000` | Token lifetimes in seconds. |
+| `POKI_MCP_APPROVAL_MODE` | unset (`allow` in `poki.env.example`) | `allow` preapproves the sensitive tools. See [Approvals on a server](#approvals-on-a-server). |
 | `POKI_INPUT_LOCK` | unset | `1` lets several agents share the daemon: reads run side by side, input is serialized per device. |
 | `POKI_INPUT_LOCK_WAIT_MS` | `30000` | How long input waits for another session's input before failing with the holder named. |
 | `POKI_MAX_CONCURRENT_READS` | `4` | Cap on read-only calls in flight (each opens a bridge tunnel). |
@@ -192,8 +193,9 @@ On macOS the daemon asks for approval in a local dialog before sensitive tools r
 uninstall apps, open URLs, read or write the clipboard, download app containers, build and run).
 A Linux server has no such dialog, so with the default settings those tools fail closed and are
 refused. `POKI_MCP_APPROVAL_MODE=allow` preapproves them for the whole daemon. It never taps iOS
-system permission dialogs and never makes `request_human_action` succeed. Whether to set it on
-a remote deployment is the operator's decision; the example environment leaves it unset.
+system permission dialogs and never makes `request_human_action` succeed. The example
+environment sets it, because the OAuth or Access sign-in already limits the server to the one
+allowlisted account. Remove it from `poki.env` to keep those tools refused.
 
 ## Known limitations
 
