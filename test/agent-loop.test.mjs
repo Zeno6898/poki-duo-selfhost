@@ -339,3 +339,33 @@ test('a step returns at its deadline with what the World has, and a dead accessi
   assert.ok(performance.now() - slow < 4500, `a 6 s tree read held the reply for ${Math.round(performance.now() - slow)} ms`);
   assert.equal(late.sent, true);
 });
+
+test('the bridge\'s activity verdict: settled with nothing moving after the input is unchanged, with no newer picture', { timeout: 30000 }, async () => {
+  let answer = { observation: 'no_input' };
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(Date.now() - 3000).toISOString(), settled: true, ...answer });
+  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); } });
+  const phone = new LedgerPhone({ live });
+  await phone.call('observe', {});
+  answer = { observation: 'unverified', changedSinceInput: false };
+  assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } })).now.outcome, 'unchanged');
+  // Without that verdict, the same old picture proves nothing.
+  answer = { observation: 'unverified', changedSinceInput: null };
+  assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } })).now.outcome, 'unverified');
+});
+
+test('a screenshot taken in place of a stalled video is a current picture, and names the app without a tree', async () => {
+  const { frameFromAnswer } = await import('../src/live-frames.mjs');
+  const shot = await frameFromAnswer({ jpeg_base64: Buffer.from('x').toString('base64'), captured_at: new Date().toISOString(), settled: true, observation: 'after_input', video_stalled: true, source: 'screenshot', fallback_reason: 'video_stalled', foreground: { pid: 501, bundle_id: 'local.ledger' }, frame: { seq: null } });
+  assert.equal(shot.videoStalled, undefined);
+  assert.equal(shot.source, 'screenshot');
+  assert.equal(shot.foreground.bundle_id, 'local.ledger');
+  const video = await frameFromAnswer({ jpeg_base64: Buffer.from('x').toString('base64'), captured_at: new Date().toISOString(), video_stalled: true, stalled_ms: 4000, source: 'video' });
+  assert.equal(video.videoStalled, true);
+  const picture = { ...shot, jpeg: await sharp({ create: { width: 10, height: 20, channels: 3, background: 'white' } }).jpeg().toBuffer(), capturedAt: new Date().toISOString(), settled: true };
+  const { World } = await import('../src/world.mjs');
+  const world = new World({ size: { width: 10, height: 20 }, structure: async () => { throw new Error('accessibility is down'); } }, { latestFrame: async () => picture, waitSettled: async () => picture, op: async () => { throw new Error('no OCR'); } });
+  world.noteInput('tap');
+  const frame = await world.settle(1000);
+  assert.equal(frame.proven, true);
+  assert.equal((await world.read(frame, { budgetMs: 500 })).foreground.bundle_id, 'local.ledger');
+});
