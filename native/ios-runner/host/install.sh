@@ -9,7 +9,7 @@ BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.pl
 MIN="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" 2>/dev/null || echo 15.0)"
 TARGET="arm64-apple-ios$MIN"; [ "$SDK" = iphonesimulator ] && TARGET="$TARGET-simulator"
 mkdir -p "$APP/Frameworks"
-xcrun -sdk "$SDK" clang -dynamiclib -fobjc-arc -target "$TARGET" -framework UIKit -framework Foundation \
+xcrun -sdk "$SDK" clang -dynamiclib -fobjc-arc -target "$TARGET" -framework UIKit -framework Foundation -framework QuartzCore \
   -install_name @rpath/libPokiRunnerHost.dylib "$HERE/main.m" -o "$APP/Frameworks/libPokiRunnerHost.dylib"
 # The load command, first among the app's own libraries, with LIEF (a Mach-O editor).
 python3 -m venv "${TMPDIR:-/tmp}/poki-lief" && "${TMPDIR:-/tmp}/poki-lief/bin/pip" -q install lief
