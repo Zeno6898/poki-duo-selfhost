@@ -9,6 +9,7 @@ final class AppModel {
     var setup = SetupState.load() { didSet { setup.save() } }
     let identity = RelayIdentity()
     let tunnel = TunnelController()
+    let diskImage = DeveloperDiskImage()
     private(set) var runner = RunnerStatus.idle
     private(set) var relayStatus = RelayStatus.off
     private(set) var sessionOn = false
@@ -18,17 +19,24 @@ final class AppModel {
     private(set) var pairing: PairingEvent?
     private(set) var problem: String?
 
-    private let core: CoreSession
+    private let host = AppCoreHost()
+    private let core: LiveCore
     private let launcher: RunnerLauncher
     private let pairer: DevicePairing
     private let activity = ActivityController()
     private let keepAlive = KeepAlive()
     private var eventsTask: Task<Void, Never>?
 
-    init(core: CoreSession = UnlinkedCore(), launcher: RunnerLauncher = UnlinkedLauncher(), pairer: DevicePairing = UnlinkedPairing()) {
-        self.core = core; self.launcher = launcher; self.pairer = pairer
+    init() {
+        core = LiveCore(host: host)
+        let launcher = RustLauncher()
+        self.launcher = launcher
+        pairer = RustPairing()
+        host.update(key: identity.signingKey, hashes: identity.accessHashes)
+        host.onRestart { launcher.restart() }
         listenForApprovals()
         Task { await tunnel.load() }
+        if !diskImage.isReady { Task { await diskImage.download() } }
     }
 
     var deviceName: String { UIDevice.current.name }
@@ -39,6 +47,11 @@ final class AppModel {
         guard !sessionOn else { return }
         problem = nil
         guard let pairing = setup.pairingFile else { problem = "Pair this iPhone first (Setup)."; return }
+        guard diskImage.isReady else {
+            problem = "The developer disk image is not downloaded yet (Setup > Pair). It is needed once."
+            Task { await diskImage.download() }
+            return
+        }
         do { try keepAlive.start() } catch { problem = "Could not keep Poki running in the background: \(error.localizedDescription)" }
         activity.start(deviceName: deviceName)
         activity.update { $0.phase = .idle; $0.headline = "Starting" }
@@ -70,6 +83,7 @@ final class AppModel {
 
     private func runnerChanged(_ status: RunnerStatus) {
         runner = status
+        host.update(runner: status.coreState)
         if status.state == "failed" {
             activity.update { $0.phase = .problem; $0.headline = status.fix ?? status.detail ?? "The runner stopped" }
         } else if !status.isRunning {
@@ -173,6 +187,14 @@ final class AppModel {
 
     // MARK: Connectors
 
-    func addConnector(name: String) -> ConnectorSecret { identity.addSecret(name: name) }
-    func revoke(_ secret: ConnectorSecret) { identity.revoke(secret) }
+    func addConnector(name: String) -> ConnectorSecret {
+        let secret = identity.addSecret(name: name)
+        accessChanged()
+        return secret
+    }
+    func revoke(_ secret: ConnectorSecret) { identity.revoke(secret); accessChanged() }
+    private func accessChanged() {
+        host.update(key: identity.signingKey, hashes: identity.accessHashes)
+        core.accessChanged()
+    }
 }

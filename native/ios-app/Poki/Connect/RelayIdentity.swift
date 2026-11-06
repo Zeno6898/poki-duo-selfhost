@@ -28,6 +28,7 @@ final class RelayIdentity {
     init() { load() }
 
     var publicKey: Data? { key?.publicKey.rawRepresentation }
+    var signingKey: Curve25519.Signing.PrivateKey? { key }
     var accessHashes: [String] { secrets.map(\.hash) }
 
     func url(for secret: ConnectorSecret) -> URL {

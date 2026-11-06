@@ -97,6 +97,7 @@ struct PairingStep: View {
                          "Enter the PIN shown in Poki's Live Activity at the top of the screen.",
                          "Come back to Poki. The step is ticked once the pairing is saved."]) {
             pairingStatus
+            diskImageStatus
             HStack {
                 Button("Start pairing", systemImage: "dot.radiowaves.left.and.right") { model.startPairing() }.buttonStyle(.glassProminent)
                 if model.pairing != nil { Button("Cancel") { model.cancelPairing() }.buttonStyle(.glass) }
@@ -109,6 +110,19 @@ struct PairingStep: View {
         .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .xml, .data]) { result in
             do { try model.importPairingFile(from: result.get()); importError = nil }
             catch { importError = "That file is not a pairing file: \(error.localizedDescription)" }
+        }
+    }
+
+    @ViewBuilder private var diskImageStatus: some View {
+        switch model.diskImage.state {
+        case .ready: Label("Developer disk image downloaded", systemImage: "checkmark.circle").font(.footnote).foregroundStyle(.secondary)
+        case .downloading(let done): ProgressView("Downloading the developer disk image", value: done).font(.footnote)
+        case .missing: Button("Download the developer disk image", systemImage: "arrow.down.circle") { Task { await model.diskImage.download() } }.buttonStyle(.glass)
+        case .failed(let why):
+            VStack(alignment: .leading) {
+                Label("Developer disk image: \(why)", systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
+                Button("Try again") { Task { await model.diskImage.download() } }.buttonStyle(.glass)
+            }
         }
     }
 

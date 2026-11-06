@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches: [dev/ios-app]
-    paths: [native/ios-app/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
+    paths: [native/ios-app/**, native/ios/**, native/launcher/**, native/patches/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ permissions:
 jobs:
   app:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -24,6 +24,29 @@ jobs:
           XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
+
+      - name: PokiLauncher (Rust static library for the phone)
+        run: |
+          set -euo pipefail
+          # idevice at the pinned revision, with Poki's patch (run_over_rsd), as bin/setup fetches it.
+          git clone -q https://github.com/jkcoxson/idevice.git .deps/idevice
+          git -C .deps/idevice checkout -q --detach 89702099f4d7552f704f93b4526756abda319ceb
+          git -C .deps/idevice apply ../../native/patches/idevice-xctest-run-over-rsd.patch
+          rustup update stable --no-self-update && rustup default stable
+          rustup target add aarch64-apple-ios
+          cargo build --release --locked --target aarch64-apple-ios --manifest-path native/launcher/Cargo.toml
+          ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
+          nm -gU native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a 2>/dev/null | grep -E ' _poki_(launcher|pair)_' | sort -u
+
+      - name: PokiCore tests
+        run: swift test --package-path native/ios/PokiCore
+
+      - name: Developer disk image mirror answers
+        run: |
+          for f in BuildManifest.plist Image.dmg Image.dmg.trustcache; do
+            code=$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/doronz88/DeveloperDiskImage/raw/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/$f")
+            echo "$f $code"; test "$code" = 200
+          done
 
       - name: Assets and project
         run: |

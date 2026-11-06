@@ -1,9 +1,7 @@
 import Foundation
 
-// The app shell's view of PokiCore (docs/ios-core.md, section 2) and PokiLauncher (section 3).
-// PokiCore and PokiLauncher are built on dev/ios-core; until they are linked in, the shell runs against
-// these protocols, so every screen, the Live Activity and the approval path can be built and tested
-// without them. CoreAdapter.swift maps PokiCore's CoreEvent onto ShellEvent once the package is added.
+// The app shell's view of PokiCore (docs/ios-core.md, section 2) and PokiLauncher (section 3). LiveCore
+// maps PokiCore's events onto ShellEvent; RustLauncher and RustPairing call PokiLauncher's C ABI.
 
 /// What the shell shows. One-to-one with PokiCore's CoreEvent, plus the screenshot thumbnail the Live
 /// Activity draws.
@@ -75,8 +73,7 @@ struct LauncherConfig: Encodable {
     var wda_port = 8100
 }
 
-/// On-device wireless pairing (iOS 27, Settings > Privacy & Security > Developer Mode > Pair). Not in
-/// the launcher ABI v1 yet; requested from the core thread as poki_pair_start / poki_pair_cancel.
+/// On-device wireless pairing (iOS 27, Settings > Privacy & Security > Developer Mode > Pair).
 protocol DevicePairing: AnyObject {
     func start(hostName: String, saveTo: URL, onEvent: @escaping @Sendable (PairingEvent) -> Void) throws
     func cancel()
@@ -87,30 +84,4 @@ enum PairingEvent: Sendable, Equatable {
     case pin(String)
     case paired(URL)
     case failed(String)
-}
-
-/// Stand-ins used until PokiCore and PokiLauncher are linked: the screens work, nothing reaches the
-/// phone's developer services, and each says so.
-final class UnlinkedCore: CoreSession {
-    private let continuation: AsyncStream<ShellEvent>.Continuation
-    let events: AsyncStream<ShellEvent>
-    init() { (events, continuation) = AsyncStream.makeStream() }
-    func start() { continuation.yield(.relay(.offline("PokiCore is not in this build"))) }
-    func stop() { continuation.yield(.relay(.off)) }
-    func resolveApproval(id: String, approved: Bool) { continuation.yield(.approvalEnded(id: id, approved: approved)) }
-}
-
-final class UnlinkedLauncher: RunnerLauncher {
-    func start(config: LauncherConfig, onEvent: @escaping @Sendable (RunnerStatus) -> Void) throws {
-        onEvent(RunnerStatus(state: "failed", detail: "PokiLauncher is not in this build", fix: "Install a build that includes PokiLauncher."))
-    }
-    func restart() {}
-    func stop() {}
-}
-
-final class UnlinkedPairing: DevicePairing {
-    func start(hostName: String, saveTo: URL, onEvent: @escaping @Sendable (PairingEvent) -> Void) throws {
-        onEvent(.failed("On-device pairing is not in this build yet. Import a pairing file instead."))
-    }
-    func cancel() {}
 }
