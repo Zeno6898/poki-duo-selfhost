@@ -254,4 +254,16 @@ final class FaultTests: XCTestCase {
         XCTAssertEqual(body?["x"]?.double, 195)
         XCTAssertEqual(body?["y"]?.double ?? 0, 0.925 * 844, accuracy: 0.5)
     }
+
+    /// Found on the simulator: reads took 2.5 s, longer than a read inside wait_until was allowed, so
+    /// "settled" never saw two reads. Each read now gets the runner's time, and settled a second read.
+    func testWaitUntilSettledWorksWhenEachReadIsSlow() async {
+        let (core, wda, _) = makeCore { $0.readTimeout = 1.5; $0.toolDeadline = 8 }
+        _ = await core.call("look", [:])
+        let rows: [JSON] = [["type": "XCUIElementTypeButton", "label": "General", "rect": ["x": 16, "y": 100, "width": 358, "height": 44]]]
+        let root: JSON = ["type": "XCUIElementTypeApplication", "label": "Settings", "rect": ["x": 0, "y": 0, "width": 390, "height": 844], "children": .array(rows)]
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 900_000_000); return (200, ["value": root]) }
+        let result = await core.call("do", ["actions": [["wait_until": ["settled": true, "ms": 500]]]])
+        XCTAssertTrue(result.text.contains("wait_until: the screen held still after"), result.text)
+    }
 }

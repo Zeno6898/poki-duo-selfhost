@@ -341,8 +341,11 @@ extension Computer {
         let what = settled && text == nil ? "the screen held still" : "\"\(text!.prefix(40))\" \(gone ? "was gone" : "appeared")"
         var last: String?
         var reads = 0
-        while now() < limit {
-            if let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(1.5, limit - now()))) {
+        // A read takes as long as the runner needs (up to readTimeout, within the call's deadline), not
+        // the window: a phone that reads in 2.5 s still gets its answer. "Settled" compares two reads,
+        // so it gets a second one past the window when the deadline leaves room for it.
+        while now() < limit || (settled && text == nil && reads == 1 && until - now() > 1) {
+            if let seen = try? await runner.tree(timeout: Swift.max(0.3, Swift.min(config.readTimeout, until - now() - 0.3))) {
                 reads += 1
                 let elements = listable(seen.elements, screen)
                 let ms = Int(((now() - started) * 1000).rounded())
@@ -355,7 +358,7 @@ extension Computer {
                     if present != gone { return "wait_until: \(what) after \(ms) ms" }
                 }
             }
-            await sleep(seconds: Swift.min(0.25, Swift.max(0, limit - now())))
+            if now() < limit { await sleep(seconds: Swift.min(0.25, Swift.max(0, limit - now()))) }
         }
         return "wait_until: not seen within \(Int(((limit - started) * 1000).rounded())) ms that \(what) (\(reads) reads)"
     }
