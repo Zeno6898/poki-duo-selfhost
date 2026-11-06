@@ -494,7 +494,7 @@ export class Devices {
           if (name === 'request_human_action') return { ...(result.completed ? {} : { isError: true, _meta: { stop_reason: 'error' } }), ...text(result) };
           if (result.stopped || result.isError) return { isError: true, ...text(result), _meta: { stop_reason: result.stop_reason ?? (result.stopped ? 'cancelled' : 'unknown') } };
           if (name === 'wait_for') return { content: [...text(result).content, { type: 'image', data: this.frame.data.toString('base64'), mimeType: 'image/png' }] };
-          return { ...text(result), ...(unchanged ? { _meta: { stop_reason: 'no_change' } } : {}) };
+          return { ...text(result), ...(unchanged || result.screen_change ? { _meta: { ...(unchanged ? { stop_reason: 'no_change' } : {}), ...(result.screen_change ? { verdict: result.screen_change } : {}) } } : {}) };
         }
       }
     } finally { this.requested=previous; if (!sharesTarget) this.resolved=previousResolved; }
