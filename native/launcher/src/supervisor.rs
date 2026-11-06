@@ -148,7 +148,12 @@ impl Launcher {
             match outcome {
                 Some(Ok(())) => attempt = 0,
                 Some(Err(failure)) => self.fail(attempt, &failure),
-                None => return,
+                None => {
+                    // Stopped: end the runner now. Left alone it lives on for about 30 s after the
+                    // developer connection closes, with iOS's automation banner on screen.
+                    let _ = tokio::time::timeout(Duration::from_secs(6), Self::end_runner(&self.config)).await;
+                    return;
+                }
             }
             if *commands.borrow() == Command::Stop {
                 return;
@@ -159,6 +164,13 @@ impl Launcher {
                 return;
             }
         }
+    }
+
+    /// Ends the runner's process through the developer services (best effort).
+    async fn end_runner(config: &Config) {
+        let Ok(mut pairing) = Pairing::read(&config.pairing_file, config.host_name.as_deref()) else { return };
+        let Ok(mut device) = Device::open(config.device_address, &mut pairing, Duration::from_secs(4)).await else { return };
+        let _ = launch::end(&mut device).await;
     }
 
     /// One launch and the watch over it. Ok when a running runner later stopped answering.

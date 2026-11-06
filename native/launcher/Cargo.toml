@@ -11,7 +11,7 @@ name = "poki_launcher"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-idevice = { path = "../../.deps/idevice/idevice", default-features = false, features = ["aws-lc", "tcp", "core_device_proxy", "rsd", "tunnel_tcp_stack", "dvt", "installation_proxy", "remote_pairing", "cryptexd", "xctest"] }
+idevice = { path = "../../.deps/idevice/idevice", default-features = false, features = ["aws-lc", "tcp", "core_device_proxy", "rsd", "tunnel_tcp_stack", "dvt", "installation_proxy", "remote_pairing", "cryptexd", "xctest", "device_info"] }
 tokio = { version = "1.43", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
