@@ -1,0 +1,80 @@
+# Builds the on-phone pieces for iOS: PokiLauncher as an xcframework (Rust static library plus its C
+# header) and PokiCore checked for iOS. Linux tests run too, so a red build means something real.
+name: ios-core
+
+on:
+  push:
+    branches: ["dev/ios-core"]
+    paths: ["native/launcher/**", "native/ios/PokiCore/**", "native/patches/**", ".github/workflows/ios-core.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IDEVICE_COMMIT: 89702099f4d7552f704f93b4526756abda319ceb
+
+jobs:
+  launcher:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch idevice and apply Poki's patches
+        run: |
+          git init -q .deps/idevice
+          git -C .deps/idevice fetch -q --depth 1 https://github.com/jkcoxson/idevice "$IDEVICE_COMMIT"
+          git -C .deps/idevice checkout -q FETCH_HEAD
+          for patch in native/patches/*.patch; do git -C .deps/idevice apply "$PWD/$patch"; done
+      - name: Rust targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/launcher-target
+          key: launcher-${{ hashFiles('native/launcher/Cargo.lock', 'native/patches/*.patch') }}
+      - name: Tests (macOS host)
+        run: cargo test --release --manifest-path native/launcher/Cargo.toml --target-dir build/launcher-target
+      - name: Build for iPhone and the simulator
+        run: |
+          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo build --release --manifest-path native/launcher/Cargo.toml --target-dir build/launcher-target --target "$target"
+          done
+      - name: xcframework
+        run: |
+          mkdir -p build/headers
+          cp native/launcher/include/poki_launcher.h build/headers/
+          cat > build/headers/module.modulemap <<'MAP'
+          module PokiLauncher {
+              header "poki_launcher.h"
+              export *
+          }
+          MAP
+          xcodebuild -create-xcframework \
+            -library build/launcher-target/aarch64-apple-ios/release/libpoki_launcher.a -headers build/headers \
+            -library build/launcher-target/aarch64-apple-ios-sim/release/libpoki_launcher.a -headers build/headers \
+            -output build/PokiLauncher.xcframework
+          (cd build && zip -qry PokiLauncher.xcframework.zip PokiLauncher.xcframework)
+          ls -l build/PokiLauncher.xcframework.zip
+          shasum -a 256 build/PokiLauncher.xcframework.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PokiLauncher.xcframework
+          path: build/PokiLauncher.xcframework.zip
+
+  core:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests (macOS)
+        working-directory: native/ios/PokiCore
+        run: swift test
+      - name: Build for iOS
+        working-directory: native/ios/PokiCore
+        run: xcodebuild -scheme PokiCore -destination 'generic/platform=iOS' -quiet build

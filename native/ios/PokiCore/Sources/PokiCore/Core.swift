@@ -14,8 +14,10 @@ public struct CoreConfig: Sendable {
     public var readTimeout: Double
     /// How long a second tool call waits for the first before answering busy.
     public var busyWait: Double
+    /// How long a call waits for a runner that is starting (the app wakes it when a call comes in).
+    public var runnerWait: Double
 
-    public init(relayURL: URL = URL(string: "wss://pokimcp.zheha.nz/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2) {
+    public init(relayURL: URL = URL(string: "wss://pokimcp.zheha.nz/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2, runnerWait: Double = 15) {
         self.relayURL = relayURL
         self.runnerURL = runnerURL
         self.sensitive = sensitive
@@ -24,6 +26,7 @@ public struct CoreConfig: Sendable {
         self.actionCap = actionCap
         self.readTimeout = readTimeout
         self.busyWait = busyWait
+        self.runnerWait = runnerWait
     }
 }
 
