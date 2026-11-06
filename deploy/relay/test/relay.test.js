@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // Relay + fake helper + fake client in one process: bytes pass unmodified, the relay never has
 // the helper's key nor sees plaintext, unknown hostnames and bad proofs are refused, and ALPN
 // (acme-tls/1, for TLS-ALPN-01) passes through.

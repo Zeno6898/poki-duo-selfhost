@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 # Blind SNI relay. No dependencies beyond Node itself.
 FROM node:22-alpine
 WORKDIR /relay

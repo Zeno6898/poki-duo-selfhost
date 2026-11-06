@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // The helper side of the blind relay: registers a hostname by proving an Ed25519 key and hands
 // each relayed stream (raw TLS from a public client) to `onStream`, which terminates TLS with
 // the helper's own certificate (for example `tlsServer.emit('connection', socket)`).

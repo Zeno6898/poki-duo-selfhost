@@ -11,6 +11,7 @@ import { stateDir, endpointFile } from './config.mjs';
 import { warnIfNativeStale, warnIfOcrMissing } from './build-info.mjs';
 import { remoteConfig } from './auth/config.mjs';
 import { createFront } from './auth/front.mjs';
+import { relaySettings, startRelay } from './relay-client.mjs';
 
 const portIndex = process.argv.indexOf('--port');
 const port = portIndex < 0 ? 47825 : Number(process.argv[portIndex + 1]);
@@ -20,7 +21,9 @@ await warnIfOcrMissing();
 const sessions = new Map();
 const coordinator = new Coordination();
 // Remote access is opt-in (src/auth/config.mjs); with no settings this is the original local daemon.
-const remote = remoteConfig(process.env, stateDir);
+// The blind relay (POKI_RELAY_URL, src/relay-client.mjs) gives the public hostname; unset, nothing changes.
+const relay = await relaySettings(process.env, stateDir);
+const remote = remoteConfig(relay?.env ?? process.env, stateDir);
 const token = remote.token ?? randomBytes(32).toString('hex');
 const front = await createFront(remote, token);
 const active = new Set();
@@ -77,10 +80,14 @@ await rename(temporary, endpointFile);
 await chmod(endpointFile, 0o600);
 console.log(JSON.stringify({ event: 'ready', url: entry.url, endpointFile, tools: definitions.length, tool_profile: process.env.POKI_MCP_TOOLS === 'all' ? 'all' : profile(), listed_tools: listedNames().length, ...(remote.publicUrl ? { public_url: remote.resource, oauth: remote.mode } : {}), ...(coordinator.inputLock ? { input_lock: true } : {}) }));
 
+const relayed = relay ? await startRelay(relay, listener) : undefined;
+if (relayed) console.log(JSON.stringify({ event: 'relay', public_url: relay.publicUrl, hostname: relay.hostname }));
+
 let stopping = false;
 async function stop() {
   if (stopping) return;
   stopping = true;
+  relayed?.close();
   const closed = new Promise(resolve => listener.close(resolve));
   listener.closeAllConnections();
   await Promise.allSettled([...sessions.values()].map(devices => devices.close()));

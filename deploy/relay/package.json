@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Blind SNI relay for Poki helpers: routes public TLS by hostname without terminating it",
-  "license": "AGPL-3.0-or-later",
+  "license": "AGPL-3.0-only",
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js",

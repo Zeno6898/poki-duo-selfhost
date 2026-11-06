@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // Blind relay: routes public TLS connections to helpers by SNI without terminating them.
 //
 // Public side (:443): reads the ClientHello's server_name, finds the helper registered for that

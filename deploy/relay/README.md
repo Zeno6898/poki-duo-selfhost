@@ -61,3 +61,25 @@ The test runs the relay, a fake helper and a fake client in one process. It chec
 - ALPN `acme-tls/1` passes through
 - unknown hostnames are closed, and a hostname claim signed with another key is refused
 - the SNI parser handles a real ClientHello
+
+## The daemon's side
+
+The daemon has its own relay client in `src/relay-client.mjs`, fork-only. It does nothing unless `POKI_RELAY_URL` is set.
+
+| Variable | Meaning |
+|---|---|
+| `POKI_RELAY_URL` | The relay's helper side, `host:port` (port defaults to 8443). |
+| `POKI_RELAY_DOMAIN` | The relay's domain, if it is not the relay host. |
+| `POKI_RELAY_CA` | A PEM file to trust for the relay's own certificate, if it is not publicly trusted. |
+| `POKI_ACME_DIRECTORY` | Defaults to Let's Encrypt staging. Set `https://acme-v02.api.letsencrypt.org/directory` for real certificates. |
+| `POKI_ACME_EMAIL` | An optional ACME contact. |
+| `POKI_MCP_PUBLIC_URL` | Leave it unset; it is set to `https://<label>.<domain>`. If you do set it, it must be exactly that. |
+| `POKI_OAUTH` | Still required. Use `builtin` (password + TOTP on the daemon) in front of `/mcp`. |
+
+On first run the daemon creates `<stateDir>/relay/identity.key`, an Ed25519 key with mode 0600 that never leaves the machine. Its hostname follows from that key, and the daemon prints it at startup as `{"event":"relay","public_url":...}`.
+
+Each relayed stream ends its TLS in the daemon, and requests go to the same HTTP handler as local ones. The front door treats them as remote, because their peer is not loopback. Until ACME has issued a certificate, the daemon serves a self-signed one, so registration can be tested.
+
+ACME answers TLS-ALPN-01 through the relay: a ClientHello with ALPN `acme-tls/1` gets the RFC 8737 challenge certificate. The issued certificate and its key are written to `<stateDir>/relay/cert.pem` and `key.pem`, and the account key to `acme-account.key`, all mode 0600. The certificate is renewed when fewer than 30 days remain; the daemon checks every 12 h and retries hourly on failure. If the relay is unreachable, the daemon still starts and keeps reconnecting with backoff of up to 60 s.
+
+Tests: `node --test test/relay-client.test.mjs` runs the in-process relay with a fake ACME server that checks every JWS and validates TLS-ALPN-01 through the relay. It also starts the real daemon behind the relay and checks that OAuth guards `/mcp` at the relay hostname.
