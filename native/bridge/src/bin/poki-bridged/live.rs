@@ -79,6 +79,7 @@ pub async fn answer(
                 let wait = number(&object, "wait_ms", 3000);
                 let mut answer = picture(&live, &object, wait).await?;
                 answer["tree"] = tree_summary(&state.prefetch, &live);
+                answer["foreground"] = foreground_json(state);
                 Ok(answer)
             }
             "wait_settled" => {
@@ -93,6 +94,7 @@ pub async fn answer(
                 answer["settled"] = settled.into();
                 answer["waited_ms"] = ms(waiting).into();
                 answer["tree"] = tree_summary(&state.prefetch, &live);
+                answer["foreground"] = foreground_json(state);
                 Ok(answer)
             }
             "ocr_region" | "ocr_frame" => read_text(&live, op, &object).await,
@@ -384,6 +386,105 @@ async fn read_text(live: &Live, op: &str, object: &Map<String, Value>) -> Result
         "ocr_ms": reading.ms,
         "total_ms": started.elapsed().as_millis() as u64,
     }))
+}
+
+/// The foreground app: from the newest accessibility tree (an op's or the prefetch's), with its
+/// bundle id from app_for_pid when the tree has none. Resolved in the background and cached by
+/// pid, so ping and latest_frame never wait for it.
+#[derive(Default)]
+pub struct Foreground {
+    pub(crate) noted: Option<(Instant, Value)>,
+    pub(crate) known: std::collections::HashMap<u64, Value>,
+    wanted: Option<u64>,
+    failed: Option<(u64, Instant)>,
+}
+
+pub type ForegroundCell = Rc<std::cell::RefCell<Foreground>>;
+
+thread_local! {
+    static FOREGROUND_WANTED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
+}
+
+/// Notes the foreground app of a tree an op read.
+pub fn note_tree(cell: &ForegroundCell, tree: &Value) {
+    if let Some(app) = tree.get("foreground_app").filter(|app| app.is_object()) {
+        cell.borrow_mut().noted = Some((Instant::now(), app.clone()));
+    }
+}
+
+/// {pid, bundle_id, name, seen_ms_ago, via} or null when no tree was read yet.
+pub fn foreground_json(state: &State) -> Value {
+    let prefetched = state.prefetch.borrow().ready.as_ref().and_then(|read| {
+        read.tree
+            .get("foreground_app")
+            .filter(|app| app.is_object())
+            .map(|app| (read.requested, app.clone()))
+    });
+    let mut f = state.foreground.borrow_mut();
+    let Some((at, app)) = [f.noted.clone(), prefetched]
+        .into_iter()
+        .flatten()
+        .max_by_key(|(at, _)| *at)
+    else {
+        return Value::Null;
+    };
+    let pid = app.get("pid").and_then(Value::as_u64);
+    let mut answer = json!({
+        "pid": pid,
+        "bundle_id": app.get("bundle_id").cloned().unwrap_or(Value::Null),
+        "name": app.get("name").cloned().unwrap_or(Value::Null),
+        "seen_ms_ago": at.elapsed().as_millis() as u64,
+        "via": "tree",
+    });
+    if let Some(pid) = pid {
+        if let Some(known) = f.known.get(&pid) {
+            if answer["bundle_id"].is_null() {
+                answer["bundle_id"] = known["bundle_id"].clone();
+                answer["via"] = "app_for_pid".into();
+            }
+            if answer["name"].is_null() {
+                answer["name"] = known["name"].clone();
+            }
+        } else if answer["bundle_id"].is_null() {
+            let retry = f
+                .failed
+                .is_none_or(|(failed, at)| failed != pid || at.elapsed() > Duration::from_secs(10));
+            if retry {
+                f.wanted = Some(pid);
+                FOREGROUND_WANTED.with(|wanted| wanted.notify_one());
+            }
+            answer["resolving"] = true.into();
+        }
+    }
+    answer
+}
+
+/// Looks up the pids foreground_json asks for, one at a time, on the held tunnel.
+pub async fn resolve_foreground(state: Rc<State>) {
+    let wanted = FOREGROUND_WANTED.with(Rc::clone);
+    loop {
+        wanted.notified().await;
+        let Some(pid) = state.foreground.borrow_mut().wanted.take() else {
+            continue;
+        };
+        if state.foreground.borrow().known.contains_key(&pid) {
+            continue;
+        }
+        let answer = async {
+            let mut session = state.session.lock().await;
+            session.connect(&mut Timings::default()).await?;
+            let link = session.link.as_mut().expect("connected");
+            apps::app_for_pid(&mut link.device.adapter, &mut link.device.rsd, pid as u32).await
+        }
+        .await;
+        let mut f = state.foreground.borrow_mut();
+        match answer {
+            Ok(app) if app["running"] == true => {
+                f.known.insert(pid, app);
+            }
+            Ok(_) | Err(_) => f.failed = Some((pid, Instant::now())),
+        }
+    }
 }
 
 /// The newest picture and what the screen is doing, waiting up to `wait_ms` for a first picture.
