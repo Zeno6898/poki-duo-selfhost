@@ -182,7 +182,9 @@ Each answer is facts only: the app in front, numbered elements, what each action
   inside it as numbered `Text` elements (`(read from the picture)`), which can be tapped.
 - **No tree in time.** When the runner's tree misses the read's time (a cold app, a keyboard coming
   up: over 4 s on the CI simulator) but the screenshot came, the text Vision reads in the whole picture
-  is listed instead, numbered and tappable at its centre, under a heading that says so.
+  is listed instead, numbered and tappable at its centre, under a heading that says so. When that
+  yields nothing, the read's note says why: no text found, the text could not be read, or the reading
+  did not finish in time (with its milliseconds).
 - **Taps are hit-tested.** A numbered element is touched at its centre, or, when the centre is off
   screen or under a bar or a later element in the tree (a reply bar), at the nearest point of it that
   is free; the answer says where. No free point: `not_hittable`, nothing is sent. Points off the screen
@@ -230,6 +232,36 @@ Each answer is facts only: the app in front, numbered elements, what each action
   keyboard's looping slide-to-type introduction. A call that finds the runner `.starting` (restarting, or woken from idle by
   the app) waits for it, checking every 250 ms for up to `runnerWait` (15 s) within its deadline, then
   goes on; a `.failed` runner is answered at once with its fix.
+- Buttons (Home, lock, volume) get 8 s and a slow answer does not count as a runner miss. WDA's
+  `/wda/homescreen` waits for SpringBoard to come up and go idle before it answers: about 3 s on the CI
+  simulator (a 3 s timeout failed there), and it holds WDA's main thread the same way on a phone, where
+  SpringBoard's transition animation runs at full length. 8 s is a ceiling, not a wait: on the
+  simulator Home answered in 0.6 to 2.9 s.
+
+### Measured on the CI simulator (run 42258166342)
+
+iOS simulator on a GitHub macos-15 runner, WebDriverAgent 16.15.3, Settings. One run, every check
+passing; numbers are milliseconds for the whole MCP call. The phone is expected to be faster (no
+virtualisation, Neural Engine for Vision) but has not been measured with these builds.
+
+| call | ms | of which |
+|---|---:|---|
+| look, warm | 833 to 1308 (tool 1218 to 1446) | tree + screenshot read |
+| swipe / drag | 2745 to 3016 | gesture sent 1.0 to 1.4 s, 350 ms pause, read 0.9 to 1.1 s |
+| scroll_to Privacy | 1285 | |
+| no-op wait (300 ms) | 1033 | |
+| wait_until settled | 2803 | at least two reads |
+| Home | 4247 | sent 648 ms, 700 ms pause, read 2.5 s (SpringBoard) |
+| type "Wi-Fi 你好 123" | 17044 | typed and read back in 4.5 s; the read after it hit the keyboard's slow first tree (4.6 s) and Vision ran out of time (3.9 s) |
+| launch Settings fresh | 14946 | cold app: no tree within 4 s |
+| Vision on a whole screenshot | 4069 | 18 texts, no Neural Engine on the runner |
+
+Floor against the budget (look under 1.5 s; a do step under 1 s plus settle): a warm look meets it
+(0.8 to 1.3 s read). A gesture step does not on the simulator: WDA takes 1.0 to 1.4 s to send a
+swipe or drag (its synthesised touch runs its full duration on the main thread), before the settle
+pause and the read. The first read after a keyboard or a cold launch is over 4 s on the simulator
+and falls back to the picture.
+
 - One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what
   the first is doing.
 

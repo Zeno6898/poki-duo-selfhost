@@ -182,12 +182,14 @@ extension Computer {
         if let name = action["button"]?.text {
             let n = name.lowercased()
             switch n {
-            case "lock", "power": _ = try await runner.call("POST", "/wda/lock", [:], timeout: 3)
+            // WDA waits for SpringBoard after a button (about 3 s on the simulator): these get the time a
+            // gesture gets, and a slow answer is not taken as a sign that the runner is gone.
+            case "lock", "power": _ = try await runner.call("POST", "/wda/lock", [:], timeout: 8, countsAsMiss: false)
             // WDA serves the Home button only outside a session ("Unhandled endpoint" inside one).
-            case "home": _ = try await runner.raw("POST", "/wda/homescreen", [:], timeout: 3)
+            case "home": _ = try await runner.raw("POST", "/wda/homescreen", [:], timeout: 8, countsAsMiss: false)
             default:
                 guard let wda = Self.buttons[n] else { throw ActionFailure(message: "button \(name) has no equivalent; use home, lock, volume_up or volume_down", delivery: .notSent) }
-                _ = try await runner.call("POST", "/wda/pressButton", ["name": .string(wda)], timeout: 3)
+                _ = try await runner.call("POST", "/wda/pressButton", ["name": .string(wda)], timeout: 8, countsAsMiss: false)
             }
             return ("button", "button \(name)")
         }

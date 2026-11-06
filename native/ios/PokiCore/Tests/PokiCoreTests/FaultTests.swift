@@ -255,6 +255,20 @@ final class FaultTests: XCTestCase {
         XCTAssertEqual(body?["y"]?.double ?? 0, 0.925 * 844, accuracy: 0.5)
     }
 
+    /// Found on the simulator: with no tree and nothing read from the picture, the answer listed no
+    /// elements and did not say why. It now says whether the text reading found nothing, failed or ran out of time.
+    func testWithoutATreeAnEmptyPictureReadIsSaidSo() async {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.5 }
+        _ = await core.call("look", [:])
+        host.texts.value = []
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 5_000_000_000); return (200, ["value": .null]) }
+        let look = await core.call("look", [:])
+        XCTAssertTrue(look.text.contains("no text found in the picture"), look.text)
+        host.texts.value = nil
+        let again = await core.call("look", [:])
+        XCTAssertTrue(again.text.contains("text could not be read from the picture"), again.text)
+    }
+
     /// Found on the simulator: reads took 2.5 s, longer than a read inside wait_until was allowed, so
     /// "settled" never saw two reads. Each read now gets the runner's time, and settled a second read.
     func testWaitUntilSettledWorksWhenEachReadIsSlow() async {

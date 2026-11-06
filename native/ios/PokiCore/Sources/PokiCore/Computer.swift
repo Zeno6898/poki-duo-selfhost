@@ -132,14 +132,27 @@ final class Computer: @unchecked Sendable {
             // Vision's accurate model (needed for Chinese and Japanese) on a whole screenshot takes up to
             // a few seconds on a slow machine.
             let left = min(3.5, until - now() - 0.6)
-            if left >= 0.3, let texts = (try? await withDeadline(left, "reading text from the picture", { await host.recognizeText(inPNG: png) })) ?? nil, !texts.isEmpty {
-                shown = texts.map { t in
-                    Element(type: "Text", label: t.text, value: nil, identifier: nil,
-                            frame: Rect(x: t.box.x * screen.width, y: t.box.y * screen.height, width: t.box.width * screen.width, height: t.box.height * screen.height),
-                            depth: 0, fromPicture: true)
-                }.sorted { ($0.frame.y, $0.frame.x) < ($1.frame.y, $1.frame.x) }
-                pictureOnly = true
+            // Say why nothing came of it, so a slow or failing recogniser is told apart from an empty screen.
+            var outcome = "no time left to read text from the picture"
+            if left >= 0.3 {
+                let began = now()
+                do {
+                    let texts = try await withDeadline(left, "reading text from the picture", { await host.recognizeText(inPNG: png) })
+                    let ms = Int(((now() - began) * 1000).rounded())
+                    if let texts, !texts.isEmpty {
+                        shown = texts.map { t in
+                            Element(type: "Text", label: t.text, value: nil, identifier: nil,
+                                    frame: Rect(x: t.box.x * screen.width, y: t.box.y * screen.height, width: t.box.width * screen.width, height: t.box.height * screen.height),
+                                    depth: 0, fromPicture: true)
+                        }.sorted { ($0.frame.y, $0.frame.x) < ($1.frame.y, $1.frame.x) }
+                        pictureOnly = true
+                    }
+                    outcome = texts == nil ? "text could not be read from the picture" : "no text found in the picture (\(ms) ms)"
+                } catch {
+                    outcome = "reading text from the picture did not finish within \(Int(((now() - began) * 1000).rounded())) ms"
+                }
             }
+            if !pictureOnly { notes.append(outcome) }
         }
 
         // Numbers: an element still there keeps its number (same text and frame first, then same text).
