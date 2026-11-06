@@ -337,11 +337,12 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnel"] = session.link.is_some().into();
                 pong["input"] = session.input.is_some().into();
                 pong["ops"] = session.ops.into();
-                pong["ax"] = session
-                    .ax
-                    .as_ref()
-                    .map(|w| w.stats())
-                    .unwrap_or(Value::Null);
+                pong["ax"] = json!({
+                    "watch": session.ax.as_ref().map(|w| w.stats()),
+                    "opened": session.ax_opened,
+                    "fallbacks": session.ax_fallbacks,
+                    "last_error": session.ax_last_error,
+                });
             }
             return Some(json!({"id": id, "ok": true, "pong": pong}));
         }
@@ -412,6 +413,11 @@ struct Session {
     input: Option<Input>,
     /// The held accessibility subscription, inside the tunnel.
     ax: Option<crate::ax::watch::Watch>,
+    /// Subscriptions opened, and reads that gave one up and read without it, since the daemon
+    /// started; the last reason.
+    ax_opened: u64,
+    ax_fallbacks: u64,
+    ax_last_error: Option<String>,
     last_used: Instant,
     ops: u64,
 }
@@ -487,6 +493,9 @@ impl Session {
             link: None,
             input: None,
             ax: None,
+            ax_opened: 0,
+            ax_fallbacks: 0,
+            ax_last_error: None,
             last_used: Instant::now(),
             ops: 0,
         }
@@ -600,19 +609,21 @@ impl Session {
             let result = async {
                 self.connect(timings).await?;
                 let device = &mut self.link.as_mut().expect("connected").device;
+                // A read on a held subscription that is not answered soon is given up: a plain read
+                // on a new connection is answered more reliably than a renewal that hangs. A new
+                // subscription gets the time a first answer takes.
+                let mut cap =
+                    idle_env("POKI_BRIDGED_AX_CAP_MS", 1500).unwrap_or(Duration::from_secs(20));
                 if self.ax.is_none() {
                     let settings = crate::ax::watch::Settings::from_env();
                     self.ax = Some(
                         crate::ax::watch::Watch::open(&mut device.adapter, &device.rsd, settings)
                             .await?,
                     );
+                    self.ax_opened += 1;
+                    cap = cap.max(Duration::from_secs(3));
                 }
-                let (tree, served) = self
-                    .ax
-                    .as_mut()
-                    .expect("open")
-                    .read(Duration::from_secs(20))
-                    .await?;
+                let (tree, served) = self.ax.as_mut().expect("open").read(cap).await?;
                 timings.ax = Some(served);
                 Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(tree)
             }
@@ -624,6 +635,9 @@ impl Session {
                         "held accessibility subscription failed ({error}); reading once without it"
                     ));
                     self.ax = None;
+                    self.ax_fallbacks += 1;
+                    self.ax_last_error = Some(error.to_string());
+                    timings.ax = Some(crate::ax::watch::Served::Fallback);
                     if let Some(link) = self.link.as_mut()
                         && let Ok(tree) =
                             ax::read_tree(&mut link.device.adapter, &link.device.rsd, false).await

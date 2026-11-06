@@ -20,7 +20,8 @@
 //!   `POKI_BRIDGED_AX_MAX_AGE_MS` (default 1000). Otherwise the subscription is renewed, as poki-native
 //!   does for every read, and the read waits for its answer.
 //! - After an invalidation outside push mode, the renewal starts `POKI_BRIDGED_AX_REARM_MS`
-//!   (default 300) later in the background, so the answer is under way before the read asks.
+//!   (default 0) later in the background, so its answer, about 1.1 s on a phone over a tailnet,
+//!   overlaps the caller's settle time instead of following it.
 //! - A tree with a second application root (the foreground changed under the subscription) is not
 //!   served; the subscription is renewed so the tree holds only the new screen.
 //!
@@ -103,7 +104,7 @@ impl Settings {
         Self {
             quiet: env_ms("POKI_BRIDGED_AX_QUIET_MS", 500),
             max_age: env_ms("POKI_BRIDGED_AX_MAX_AGE_MS", 1000),
-            rearm: env_ms("POKI_BRIDGED_AX_REARM_MS", 300),
+            rearm: env_ms("POKI_BRIDGED_AX_REARM_MS", 0),
             push: match std::env::var("POKI_BRIDGED_AX_PUSH").as_deref() {
                 Ok("on") => Push::On,
                 Ok("off") => Push::Off,
@@ -171,6 +172,8 @@ pub enum Served {
     Renewed,
     /// The latest tree, because nothing arrived in the quiet time after the change (push mode).
     Unchanged,
+    /// The held subscription failed or was not answered in time; the daemon read without it.
+    Fallback,
 }
 
 impl Inner {
@@ -717,6 +720,23 @@ mod tests {
             let (tree, served, _) = timed(&mut watch).await;
             assert_eq!((tree.as_str(), served), ("Third app", Served::Renewed));
             assert_eq!(phone.subscriptions.get(), 2);
+            phone.task.abort();
+        });
+    }
+
+    #[test]
+    fn an_unanswered_read_gives_up_at_its_cap() {
+        local(async {
+            let (mut watch, phone) = connect(Push::Off).await;
+            phone.answer(&[1], "One");
+            timed(&mut watch).await;
+            watch.invalidate();
+            // The renewal is never answered.
+            let started = Instant::now();
+            let error = watch.read(Duration::from_millis(200)).await.unwrap_err();
+            let ms = started.elapsed().as_millis();
+            assert!(error.to_string().contains("did not arrive"), "{error}");
+            assert!((190..400).contains(&ms), "{ms} ms");
             phone.task.abort();
         });
     }
