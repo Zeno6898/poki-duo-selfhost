@@ -132,6 +132,8 @@ jobs:
       - name: Summary
         if: always()
         run: |
+          tail -40 build/wda.log 2>/dev/null || true
+          ls ~/Library/Logs/DiagnosticReports 2>/dev/null | grep -i poki | while read f; do head -60 ~/Library/Logs/DiagnosticReports/"$f"; done || true
           { echo '## look/do on the simulator'; echo; sed -n '/^| call/,$p' build/sim-check.txt 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

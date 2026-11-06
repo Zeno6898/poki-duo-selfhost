@@ -7,6 +7,9 @@ import PokiCore
 import ImageIO
 import UniformTypeIdentifiers
 
+// Every line out at once: a crash must not take the last steps' output with it.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 final class Host: CoreHost, @unchecked Sendable {
     struct NoKey: Error {}
     func signingKey() throws -> RelayKey { throw NoKey() }
