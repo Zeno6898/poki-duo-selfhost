@@ -1,4 +1,5 @@
 import * as actAndObserve from './act-and-observe.mjs';
+import * as cua from './cua.mjs';
 import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
@@ -44,14 +45,17 @@ Arguments of common steps: launch_app {bundle_id or name}; tap_text {text}; tap 
 export const definitions = catalog.tools.map(tool => [tool.name, [tool.description, guidance[tool.name]].filter(Boolean).join('\n\n'), z.fromJSONSchema(tool.inputSchema), readOnly.has(tool.name)]);
 definitions.push(['poki_mcp_status', 'Report Poki MCP version, current Git commit, native bridge build time, tool count, connected-device count, selected device, and approval mode for this session.', z.object({}), true]);
 if (actAndObserve.registered()) { definitions.push(actAndObserve.definition); defaultTools.add(actAndObserve.name); }
+// The computer-use profile's tools (cua.mjs): look and do.
+for (const [name, description, schema, readOnlyHint] of cua.definitions) definitions.push([name, description, z.fromJSONSchema(schema), readOnlyHint]);
+const listedFor = name => ({ agent: agentTools, cua: cua.tools })[name] ?? defaultTools;
 
 // The tools a tools/list answer names under this process's settings.
-export const listedNames = (env = process.env) => env.POKI_MCP_TOOLS === 'all' ? definitions.map(([name]) => name) : definitions.map(([name]) => name).filter(name => (profile(env) === 'agent' ? agentTools : defaultTools).has(name));
+export const listedNames = (env = process.env) => env.POKI_MCP_TOOLS === 'all' ? definitions.map(([name]) => name) : definitions.map(([name]) => name).filter(name => listedFor(profile(env)).has(name));
 
 export function createServer(call) {
-  const agent = profile() === 'agent';
-  const listed = agent ? agentTools : defaultTools;
-  const server = new McpServer({ name: 'poki-mcp', version }, { instructions: agent ? agentInstructions : instructions });
+  const agent = profile() === 'agent', computerUse = profile() === 'cua';
+  const listed = listedFor(profile());
+  const server = new McpServer({ name: 'poki-mcp', version }, { instructions: computerUse ? cua.instructions : agent ? agentInstructions : instructions });
   for (const [name, description, inputSchema, readOnlyHint] of definitions) {
     server.registerTool(name, { description, inputSchema, annotations: { readOnlyHint } }, async (args, extra) => {
       const elicit = extra.mcpReq?.elicitInput;

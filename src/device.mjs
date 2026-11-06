@@ -20,6 +20,7 @@ import { actAndObserve } from './act-and-observe.mjs';
 import { liveScreenFor, enabled as liveFramesEnabled } from './live-frames.mjs';
 import { World } from './world.mjs';
 import * as agentLoop from './agent-loop.mjs';
+import * as cua from './cua.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -565,6 +566,8 @@ export class Devices {
         }
         // Without await, the finally below restores the device state while the first step is still looking up its device.
         case 'batch_commands': return await runBatch(this, args);
+        case 'look': return await cua.look(this, args);
+        case 'do': return await cua.act(this, args);
         case 'observe': return await agentLoop.observe(this, args);
         case 'act': return await agentLoop.act(this, args);
         case 'run': return await agentLoop.run(this, args);
