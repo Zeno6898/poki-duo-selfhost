@@ -147,8 +147,10 @@ limited to 4 kB, so the app writes the thumbnail to its app group and the Live A
 there.
 
 The app shell maps `events` to the Live Activity and resolves approvals from the Live Activity's
-buttons (App Intents). PokiCore never touches the screen for an approval: while one is pending, every
-`do` returns `not_sent` with `approval_pending`, so the automation cannot press the approval itself.
+buttons (App Intents). The automation can never grant an approval. A `do` with other actions first
+withdraws the pending request, before anything of it is sent, so a tap on the Live Activity's Approve
+button lands on a request that is already gone. Only the same actions, sent again, wait for the
+decision.
 
 ### Tools
 
