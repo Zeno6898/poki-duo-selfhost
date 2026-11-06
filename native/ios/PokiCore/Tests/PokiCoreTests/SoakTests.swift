@@ -126,6 +126,9 @@ final class SoakTests: XCTestCase {
             slowest = max(slowest, took)
             XCTAssertLessThan(took, limit, "call \(i) \(name) \(args.serialized()) took \(took) s: \(result.text.prefix(200))")
             XCTAssertFalse(result.text.isEmpty, "call \(i) answered nothing")
+            // Every step has its own deadline, so the outer backstop ("did not finish … what was sent
+            // is unknown") must never be what answers: the agent always gets facts.
+            XCTAssertFalse(result.text.contains("did not finish within") && result.text.hasPrefix("error:"), "call \(i) \(name) \(args.serialized()) hit the backstop after \(String(format: "%.2f", took)) s: \(result.text.prefix(200))")
             if took > config.toolDeadline + 0.5 { print("soak: call \(i) \(name) \(args.serialized()) took \(String(format: "%.2f", took)) s: \(result.text.prefix(300))") }
             if result.isError { errors += 1 }
             let first = result.text.split(separator: "\n").first.map(String.init) ?? ""
