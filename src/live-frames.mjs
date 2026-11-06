@@ -31,6 +31,8 @@ export async function frameFromAnswer(answer, { rgb = false } = {}) {
     ...(answer.frame ? { identity: answer.frame } : {}),
     ...(Number.isInteger(answer.frame?.seq ?? answer.epoch) ? { epoch: answer.frame?.seq ?? answer.epoch } : {}),
     ...(answer.observation ? { observation: answer.observation } : {}),
+    // Packets arrive but nothing decodes: the picture is older than the screen.
+    ...(answer.video_stalled ? { videoStalled: true, stalledMs: answer.stalled_ms ?? null } : {}),
   };
   if (rgb && jpeg) frame.rgb = await sharp(jpeg).removeAlpha().raw().toBuffer();
   return frame;
@@ -41,7 +43,7 @@ export async function frameFromAnswer(answer, { rgb = false } = {}) {
 // source of pictures: until a settled event has been seen since (re)connecting, and after a gap in the
 // feed or a new media session, `known` is false and callers ask the daemon as before.
 export class LiveFeed {
-  known = false; moving = false; settled; input; generation; seq; connected = false; closed = false;
+  known = false; moving = false; stalled = false; settled; input; generation; seq; connected = false; closed = false;
   constructor(path, { connect = createConnection, backoffMs = [200, 500, 1000, 2000] } = {}) {
     this.path = path; this.connect = connect; this.backoffMs = backoffMs; this.attempt = 0;
   }
@@ -80,6 +82,8 @@ export class LiveFeed {
       case 'changed': this.moving = true; break;
       case 'settled': this.settled = { epoch: event.frame?.seq ?? event.epoch, capturedAt: event.captured_at, quietMs: event.quiet_ms }; this.moving = false; this.known = true; break;
       case 'media': if (event.state !== 'open') this.known = false; break;
+      // A stalled video says nothing about the screen until pictures flow and it settles again.
+      case 'video': this.stalled = event.state === 'stalled'; if (this.stalled) { this.known = false; this.stalledAt = event.at; } break;
     }
   }
   // Still on the picture numbered `epoch`, with no input or change since it.
@@ -101,6 +105,11 @@ export class LiveScreen {
     return JSON.parse(stdout);
   }
   feed() { return this.liveFeed ??= new LiveFeed(socketPath(this.args, this.env)); }
+  // The daemon's own verdict on the connection: { ok, reasons: [video_stalled | media_closed | ...] }.
+  async status() {
+    const { pong } = await this.daemon.ping(1000);
+    return pong?.health ?? { ok: true, reasons: [] };
+  }
   async latestFrame({ maxWidth = 600, quality = 5, waitMs = 3000, rgb = false } = {}) {
     return frameFromAnswer(await this.op({ op: 'latest_frame', max_width: Math.round(maxWidth), quality, wait_ms: waitMs }, waitMs + 5000), { rgb });
   }
