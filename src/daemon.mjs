@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, writeFile, readFile, unlink, rename, chmod } from 'node:fs/promises';
 import { once } from 'node:events';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
-import { createServer, definitions } from './tools.mjs';
+import { createServer, definitions, profile, listedNames } from './tools.mjs';
 import { withCallLog } from './call-log.mjs';
 import { Coordination } from './coordination.mjs';
 import { Devices } from './device.mjs';
@@ -75,7 +75,7 @@ const temporary = `${endpointFile}.${process.pid}.tmp`;
 await writeFile(temporary, JSON.stringify(entry, null, 2), { mode: 0o600, flag: 'wx' });
 await rename(temporary, endpointFile);
 await chmod(endpointFile, 0o600);
-console.log(JSON.stringify({ event: 'ready', url: entry.url, endpointFile, tools: definitions.length, ...(remote.publicUrl ? { public_url: remote.resource, oauth: remote.mode } : {}), ...(coordinator.inputLock ? { input_lock: true } : {}) }));
+console.log(JSON.stringify({ event: 'ready', url: entry.url, endpointFile, tools: definitions.length, tool_profile: process.env.POKI_MCP_TOOLS === 'all' ? 'all' : profile(), listed_tools: listedNames().length, ...(remote.publicUrl ? { public_url: remote.resource, oauth: remote.mode } : {}), ...(coordinator.inputLock ? { input_lock: true } : {}) }));
 
 let stopping = false;
 async function stop() {
