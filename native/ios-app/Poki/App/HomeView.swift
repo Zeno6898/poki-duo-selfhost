@@ -16,7 +16,7 @@ struct HomeView: View {
                     ForEach(model.approvals, id: \.id) { ApprovalCard(approval: $0) }
                     if model.sessionOn, !model.runnerPaused, model.activityText != "Idle" || !model.recentSteps.isEmpty { NowCard() }
                     if !model.setupComplete { SetupCard(openSetup: openSetup) }
-                    if let problem = model.problem ?? model.activityProblem { ProblemCard(text: problem) }
+                    ForEach(Issue.current(model)) { IssueCard(issue: $0, openSetup: openSetup) }
                     StepsCard()
                     if model.sessionOn { RunnerCard() }
                 }
@@ -251,13 +251,86 @@ private struct SetupCard: View {
     private var next: SetupStep? { SetupStep.allCases.first { !model.isDone($0) } }
 }
 
-private struct ProblemCard: View {
+/// Something that keeps agents from using the phone, with the one thing the person has to do.
+struct Issue: Identifiable {
+    enum Fix { case setup, settings, retry, none }
+    var id: String
+    var symbol: String
+    var title: String
     var text: String
+    var fix: Fix
+
+    var button: String? {
+        switch fix {
+        case .setup: "Open Setup"
+        case .settings: "Open Settings"
+        case .retry: "Try again"
+        case .none: nil
+        }
+    }
+
+    @MainActor static func current(_ model: AppModel) -> [Issue] {
+        var out: [Issue] = []
+        if model.sessionOn {
+            let runner = model.runner
+            if runner.state == "failed" {
+                let fix = runner.fix ?? ""
+                let kind: Fix = fix.contains("Install Poki Runner") || fix.contains("Pair again") ? .setup : fix.contains("Developer Mode") ? .settings : .retry
+                out.append(Issue(id: "runner", symbol: "hand.tap.fill", title: "The runner stopped",
+                                 text: fix.isEmpty ? (runner.detail.map { "\($0.prefix(1).uppercased())\($0.dropFirst())." } ?? "Poki starts it again on the next agent request.") : fix, fix: kind))
+            } else if runner.state == "waiting_network" || !model.loopback.isWorking && model.loopback.state != .checking {
+                out.append(Issue(id: "loopback", symbol: "arrow.triangle.2.circlepath", title: "Loopback is off",
+                                 text: model.loopback.detail, fix: .setup))
+            }
+            if case .offline = model.relayStatus {
+                out.append(Issue(id: "relay", symbol: "wifi.exclamationmark", title: "Agents can't reach this iPhone",
+                                 text: "Poki is offline. Check that the phone has internet; Poki reconnects by itself.", fix: .none))
+            }
+            if model.background.denied {
+                out.append(Issue(id: "location", symbol: "location.slash.fill", title: "Poki can't stay on in the background",
+                                 text: "Allow location access for Poki (Settings > Poki > Location > Always). Poki uses it only to keep running; it never records where you are.", fix: .settings))
+            }
+        }
+        if let problem = model.problem {
+            out.append(Issue(id: "problem", symbol: "exclamationmark.triangle.fill", title: "Needs attention", text: problem, fix: problem.contains("Pair") || problem.contains("disk image") ? .setup : .none))
+        }
+        if let problem = model.activityProblem {
+            out.append(Issue(id: "activity", symbol: "rectangle.badge.xmark", title: "Live Activity is off", text: problem, fix: .settings))
+        }
+        return out
+    }
+}
+
+private struct IssueCard: View {
+    @Environment(AppModel.self) private var model
+    var issue: Issue
+    var openSetup: () -> Void
+
     var body: some View {
         Card {
-            Label { Text(text).font(.subheadline).fixedSize(horizontal: false, vertical: true) } icon: {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: issue.symbol).font(.body.weight(.semibold)).foregroundStyle(.orange)
+                    .frame(width: 34, height: 34).background(.orange.opacity(0.14), in: .circle)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(issue.title).font(.headline)
+                    Text(issue.text).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let button = issue.button {
+                        Button(button) { act() }
+                            .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small).tint(.orange)
+                            .padding(.top, 4)
+                    }
+                }
+                Spacer(minLength: 0)
             }
+        }
+    }
+
+    private func act() {
+        switch issue.fix {
+        case .setup: openSetup()
+        case .settings: if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+        case .retry: model.runnerPaused ? model.wakeRunner() : model.restartRunner()
+        case .none: break
         }
     }
 }

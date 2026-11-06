@@ -242,6 +242,7 @@ final class AppModel {
             lastAgentActivity = Date()
             activityText = summary
             log.add("agent", "started: \(summary)")
+            if problem?.hasPrefix("An approval ran out") == true { problem = nil }
             activity.update { state in
                 if state.approval == nil {
                     if state.phase != .working || state.since == nil { state.since = Date() }
@@ -275,6 +276,7 @@ final class AppModel {
         case .approvalEnded(let id, _):
             approvals.removeAll { $0.id == id }
             log.add("approval", "ended \(id): \(approved.map { $0 ? "approved" : "denied" } ?? "expired or replaced")")
+            if approved == nil { problem = "An approval ran out before you answered, so that step was not done. The agent can ask again." }
             ApprovalNotice.clear(id)
             activity.update { state in
                 if state.approval?.id == id { state.approval = nil; state.phase = .working; state.headline = approved == true ? "Approved. Continuing" : "Not allowed" }
