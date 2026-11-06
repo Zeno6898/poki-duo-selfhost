@@ -26,8 +26,10 @@
 //! - A tree with a second application root (the foreground changed under the subscription) is not
 //!   served; the subscription is renewed so the tree holds only the new screen.
 //!
-//! `POKI_BRIDGED_AX_PUSH=on|off` forces the mode; the default `auto` decides from what the phone
-//! does. Any read or write error ends the watch; the daemon then reads once as poki-native does and
+//! `POKI_BRIDGED_AX_PUSH=on` turns push mode on; the default (`auto`, `off`) never does. Auto
+//! used to switch to push mode after one tree that arrived unasked, and then served the old tree
+//! as unchanged after every input the phone did not answer: on Nov 6 a Mail tree was served for
+//! 40 s after Clock opened. The phone has never been seen pushing a change. Any read or write error ends the watch; the daemon then reads once as poki-native does and
 //! opens a new watch on the next read.
 use super::*;
 use std::{
@@ -320,7 +322,9 @@ impl Watch {
         match self.settings.push {
             Push::On => true,
             Push::Off => false,
-            Push::Auto => self.inner.state.borrow().pushed > 0,
+            // Never inferred: an old tree must not be served as unchanged after an input on the
+            // strength of one late answer (see the module notes). `pushed` is still counted.
+            Push::Auto => false,
         }
     }
 
@@ -815,19 +819,25 @@ mod tests {
         });
     }
 
+    /// Nov 6: one unasked tree switched auto mode to push, and from then on the old tree was
+    /// served as unchanged after every unanswered input. A read after an input that the phone
+    /// does not answer is an error, never the tree from before the input.
     #[test]
-    fn a_tree_nobody_asked_for_switches_auto_mode_to_push() {
+    fn a_tree_nobody_asked_for_does_not_make_old_trees_current_after_an_input() {
         local(async {
             let (mut watch, phone) = connect(Push::Auto).await;
-            phone.answer(&[1], "One");
+            phone.answer(&[1], "Mail");
             timed(&mut watch).await;
-            assert_eq!(watch.stats()["push_mode"], json!(false));
             tokio::time::sleep(Duration::from_millis(200)).await;
-            phone.push(&[1], "Two").await;
+            phone.push(&[1], "Mail").await;
             tokio::time::sleep(Duration::from_millis(30)).await;
             assert_eq!(watch.stats()["pushed"], json!(1));
-            assert_eq!(watch.stats()["push_mode"], json!(true));
-            assert_eq!(timed(&mut watch).await.0, "Two");
+            assert_eq!(watch.stats()["push_mode"], json!(false));
+            // An input (launch_app Clock); the phone answers nothing.
+            watch.invalidate();
+            assert!(watch.current().is_none(), "no current tree after an input");
+            let error = watch.read(Duration::from_millis(300)).await.unwrap_err();
+            assert!(error.to_string().contains("did not arrive"), "{error}");
             phone.task.abort();
         });
     }

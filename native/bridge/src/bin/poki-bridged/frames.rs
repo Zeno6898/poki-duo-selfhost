@@ -839,7 +839,15 @@ impl Live {
         } else {
             screen.activity.map(|a| a.at)
         };
-        moved.is_none_or(|moved| moved <= at)
+        // Pixels vouch for the screen only up to the newest picture: a stalled or lagging
+        // decoder proves nothing about the time after it.
+        let pixels_cover = !decoding
+            || (screen.stalled_since.is_none()
+                && screen
+                    .latest
+                    .is_some_and(|l| screen.activity.is_none_or(|a| l.0 >= a.at)));
+        pixels_cover
+            && moved.is_none_or(|moved| moved <= at)
             && screen.last_input.is_none_or(|input| input <= at)
             && !screen.closed
     }
@@ -1173,7 +1181,10 @@ async fn receive<S: Datagrams>(
         // nothing it can use. Report it stale, and past RECOVER_AFTER ask for a new session.
         if keyed {
             let mut s = screen.lock().unwrap();
-            let progress = s.last_decoded_at.into_iter().chain(keyed_at).max();
+            // The newest picture's age is its unit's arrival, not when it was decoded: a decoder
+            // that keeps giving pictures from a backlog seconds deep is as stale as one that gives
+            // none (Nov 6: 8.8 s old pictures while the decoder still produced some).
+            let progress = s.latest.map(|l| l.0).into_iter().chain(keyed_at).max();
             let age = progress.map(|at| now.duration_since(at));
             if age.is_some_and(|age| age >= STALL_AFTER) && s.stalled_since.is_none() {
                 s.counters.stalls += 1;
@@ -1278,6 +1289,11 @@ fn decode_loop(
         }
         while let Ok(job) = queue.try_recv() {
             pending.push_back(job);
+        }
+        // The media session closed: its queue is worth nothing, and a new session has its own
+        // decoder. (Views of this one may live on and keep the channel open.)
+        if screen.lock().unwrap().closed {
+            break;
         }
         let job = pending.pop_front().expect("one job");
         let more_units = pending.iter().any(|job| matches!(job, Job::Unit(..)));
@@ -1384,8 +1400,11 @@ fn decode_loop(
                     screen.latest = Some((arrived, wall, size.0, size.1));
                     screen.last_decoded_at = Some(decoded_at);
                     screen.counters.units_without_picture_run = 0;
-                    screen.stalled_since = None;
-                    screen.restart_requested = false;
+                    // Only a picture that shows the screen now ends a stall. A reopen asked for
+                    // stays asked for until the daemon takes it (take_restart_request).
+                    if arrived.elapsed() < STALL_AFTER {
+                        screen.stalled_since = None;
+                    }
                     screen.epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
                     let epoch = screen.epoch;
                     if let Some(latest) = latest.as_mut() {
@@ -1444,13 +1463,14 @@ fn decode_loop(
     }
 }
 
-/// Lowers this thread's CPU priority (POKI_LIVE_DECODE_NICE, default 10; 0 leaves it); the
+/// Lowers this thread's CPU priority (POKI_LIVE_DECODE_NICE, default 0 = unchanged: at 10 the
+/// decoder fell behind under load on us-light and AX was no faster); the
 /// niceness it has now.
 fn lower_priority() -> Option<i32> {
     let nice: i32 = std::env::var("POKI_LIVE_DECODE_NICE")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(0);
     #[cfg(target_os = "linux")]
     {
         unsafe extern "C" {
@@ -1878,17 +1898,21 @@ mod tests {
                     live.state(Duration::ZERO).stalled_since.is_some(),
                     "stalled"
                 );
-                assert!(
-                    live.take_restart_request(),
-                    "the session should be reopened"
-                );
+                // Nov 6: a picture that came out meanwhile cleared the request before the daemon
+                // took it, so the reopen was asked for again and again and never done. It stays
+                // asked for until taken.
                 let after = counters(|c| c.decoded);
                 send(0, false).await;
                 decoded(after + 1).await;
                 assert!(
                     live.state(Duration::ZERO).stalled_since.is_none(),
-                    "a picture clears it"
+                    "a current picture ends the stall"
                 );
+                assert!(
+                    live.take_restart_request(),
+                    "the reopen is still asked for after a picture"
+                );
+                assert!(!live.take_restart_request(), "taken once");
                 drop(tx);
             });
     }
@@ -1942,7 +1966,7 @@ mod tests {
                 );
                 #[cfg(target_os = "linux")]
                 if std::env::var("POKI_LIVE_DECODE_NICE").is_err() {
-                    assert_eq!(live.screen.lock().unwrap().decoder_nice, Some(10));
+                    assert!(live.screen.lock().unwrap().decoder_nice.is_some());
                 }
                 tokio::time::sleep(Duration::from_millis(1000)).await;
                 assert!(live.wait_settled(settle, Duration::from_millis(500)).await);

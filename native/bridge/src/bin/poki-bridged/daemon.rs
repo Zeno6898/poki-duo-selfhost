@@ -294,15 +294,7 @@ async fn reap(state: Rc<State>) {
         if live::enabled() {
             // A stream that stays stuck after a key frame request: reopen the media session on
             // the same tunnel.
-            if session
-                .input
-                .as_ref()
-                .is_some_and(|input| input.frames.live().take_restart_request())
-            {
-                log(
-                    "live frames: video stalled and no key frame came; reopening the media session",
-                );
-                session.close_input().await;
+            if session.restart_media_if_asked().await {
                 reopened = None;
             }
             // The live screen keeps the media session open, and opens it again after an error,
@@ -502,6 +494,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnel"] = session.link.is_some().into();
                 pong["input"] = session.input.is_some().into();
                 pong["ops"] = session.ops.into();
+                pong["media_reopens"] = session.media_reopens.into();
                 pong["frames"] = session.input.as_ref().map_or(Value::Null, |input| {
                     let live = input.frames.live();
                     live.report(&live.mark())
@@ -525,6 +518,14 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     // A packet was lost: pictures may show errors until the session reopens.
                     reasons.push("picture_damaged");
                 }
+                if live::ax_unavailable(&state.prefetch) {
+                    // The newest accessibility read failed: no tree shows the screen.
+                    reasons.push("ax_unavailable");
+                }
+                let foreground = live::foreground_json(state);
+                if foreground["stale"] == json!(true) {
+                    reasons.push("foreground_stale");
+                }
                 if let Some(down) = &session.tunnel_down {
                     reasons.push(if down.state == "wifi_required" {
                         "wifi_required"
@@ -542,7 +543,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnels"] =
                     json!({"opened": session.tunnels_opened, "lost": session.tunnels_lost});
                 pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
-                pong["foreground"] = live::foreground_json(state);
+                pong["foreground"] = foreground;
                 pong["decode_mode"] = if live::decode_off() {
                     "off"
                 } else {
@@ -690,6 +691,8 @@ struct Session {
     ax_link: Option<Link>,
     last_used: Instant,
     ops: u64,
+    /// Media sessions closed because their stream asked for a new one.
+    media_reopens: u64,
     /// Why the last tunnel attempt failed, while there is no tunnel.
     tunnel_down: Option<TunnelDown>,
     tunnels_opened: u64,
@@ -831,6 +834,7 @@ impl Session {
             tunnels_opened: 0,
             tunnels_lost: 0,
             ops: 0,
+            media_reopens: 0,
             foreground: live::ForegroundCell::default(),
         }
     }
@@ -935,10 +939,34 @@ impl Session {
         }
     }
 
+    /// Reopens the media session when its stream asked for it (stuck, or pictures too old);
+    /// whether it was closed. Called before every op as well as by the reaper, which cannot run
+    /// while ops hold the session (Nov 6: asked for again and again for 40 s, never done).
+    async fn restart_media_if_asked(&mut self) -> bool {
+        if !self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.frames.live().take_restart_request())
+        {
+            return false;
+        }
+        log(
+            "live frames: the newest picture is too old while units arrive; reopening the media session",
+        );
+        self.close_input().await;
+        self.media_reopens += 1;
+        true
+    }
+
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
         let request = parse(&object)?;
         let changes = !reads_only(&request);
         let tree = matches!(request, Request::AxTree { .. });
+        self.restart_media_if_asked().await;
+        if changes {
+            // The foreground known before an input is not known after it.
+            self.foreground.borrow_mut().last_input = Some(Instant::now());
+        }
         // The live screen is not settled while an input runs, nor for the settle time after it.
         let noted = changes
             .then(|| self.input.as_ref().map(|input| input.frames.live()))
