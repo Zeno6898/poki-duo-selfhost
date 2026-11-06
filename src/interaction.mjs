@@ -69,6 +69,15 @@ function tooMany(value, found) {
   return `Expected one match for ${JSON.stringify(value)}; found ${found.length}. Nothing was tapped. Use tap with x and y to choose one: ${JSON.stringify(brief)}`;
 }
 
+// The frame of the scrolling element a caller named, as it is on screen now.
+async function containerBox(ctx, label) {
+  const { elements } = await readStructure(ctx, justReadMs);
+  const found = matching(elements, label, true), candidates = found.length ? found : matching(elements, label);
+  if (!candidates.length) throw new Error(`No visible container matches ${JSON.stringify(label)}. Nothing was scrolled. Give x and y inside the list instead.`);
+  const element = candidates.sort((a, b) => area(b) - area(a))[0];
+  return element.frame ?? element;
+}
+
 // A failed accessibility read counts as an empty tree, so OCR still gets its turn.
 async function readStructure(ctx, maxAge) {
   try { return await ctx.structure(maxAge); }
@@ -128,6 +137,39 @@ async function locate(ctx, find, describe, mustHold) {
     if (last.length) throw new Error(`The target kept moving for ${patienceMs / 1000} seconds. Nothing was sent to it. Look at the screen before retrying.`);
     throw new Error(describe.missing(seen));
   }
+}
+
+// Which scrolling container moved between two reads of the screen: the labelled elements that kept
+// their identity and shifted by the same amount, and the smallest element that holds them and did not
+// move itself. Items a list reuses for new content show as appeared inside it.
+const identity = e => `${e.type ?? e.role ?? ''}|${e.label ?? e.text ?? e.value ?? ''}`;
+const area = e => { const f = e.frame ?? e; return f.width * f.height; };
+export function whatMoved(before, after) {
+  const named = list => { const counts = new Map(); for (const e of list) counts.set(identity(e), (counts.get(identity(e)) ?? 0) + 1); return new Map(list.filter(e => (e.label ?? e.text ?? e.value) && counts.get(identity(e)) === 1).map(e => [identity(e), e])); };
+  const was = named(before.filter(visible)), now = named(after.filter(visible));
+  const groups = new Map();
+  for (const [key, e] of now) {
+    const old = was.get(key);
+    if (!old) continue;
+    const a = old.frame ?? old, b = e.frame ?? e, dx = Math.round(b.x - a.x), dy = Math.round(b.y - a.y);
+    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) continue;
+    const shift = `${Math.round(dx / 2) * 2},${Math.round(dy / 2) * 2}`;
+    groups.set(shift, [...(groups.get(shift) ?? []), { old, e, dx, dy }]);
+  }
+  const appeared = [...now.keys()].filter(key => !was.has(key)).map(key => now.get(key));
+  const moved = [...groups.values()].sort((a, b) => b.length - a.length)[0] ?? [];
+  const items = moved.length ? moved.flatMap(m => [m.old, m.e]) : appeared;
+  if (!items.length) return null;
+  const holds = c => items.every(e => covers(c, center(e))) && !items.includes(c);
+  const stayed = c => { const old = was.get(identity(c)); if (!old) return false; const a = old.frame ?? old, b = c.frame ?? c; return Math.abs(a.x - b.x) < 2 && Math.abs(a.y - b.y) < 2; };
+  const container = after.filter(e => visible(e) && (e.type ?? e.role) !== 'Application' && holds(e) && stayed(e)).sort((a, b) => area(a) - area(b))[0];
+  const box = container ? container.frame ?? container : undefined;
+  return {
+    container: container ? (container.label ?? container.text ?? container.type ?? container.role ?? null) : null,
+    ...(box ? { frame: [box.x, box.y, box.width, box.height].map(Math.round) } : {}),
+    ...(moved.length ? { shift: { x: moved[0].dx, y: moved[0].dy }, items_moved: moved.length } : {}),
+    ...(appeared.length ? { appeared: appeared.length } : {}),
+  };
 }
 
 const describeElement = element => {
@@ -255,8 +297,11 @@ export async function interaction(ctx, name, args) {
     let result = await readComplete();
     let matches = matching(result.elements, value, exact);
     if (!matches.length && result.source === 'accessibility') {
-      result = await read({ source:'ocr', max_elements:Number.MAX_SAFE_INTEGER }, true);
-      matches = matching(result.elements, value, exact);
+      // OCR only adds what accessibility cannot see; without the helper the accessibility answer stands.
+      try {
+        result = await read({ source:'ocr', max_elements:Number.MAX_SAFE_INTEGER }, true);
+        matches = matching(result.elements, value, exact);
+      } catch (error) { if (stopped(error) || !result.elements.length) throw error; }
     }
     return { ...result, matches };
   };
@@ -274,30 +319,44 @@ export async function interaction(ctx, name, args) {
     });
     case 'scroll': {
       const f = await frame();
-      const x = (args.x ?? f.width / 2) / f.width, y = (args.y ?? f.height / 2) / f.height;
+      const box = args.container ? await containerBox(ctx, args.container) : undefined;
+      const x = (args.x ?? (box ? box.x + box.width / 2 : f.width / 2)) / f.width, y = (args.y ?? (box ? box.y + box.height / 2 : f.height / 2)) / f.height;
       const horizontal = ['left', 'right'].includes(args.direction);
       const direction = ['down', 'right'].includes(args.direction) ? -1 : 1;
       const clamp = n => Math.max(0, Math.min(1, n));
-      return ctx.input({ op: 'drag',
-        x1: clamp(x - (horizontal ? direction * .15 : 0)) * (f.width - 1),
-        y1: clamp(y - (horizontal ? 0 : direction * .15)) * (f.height - 1),
-        x2: clamp(x + (horizontal ? direction * .15 : 0)) * (f.width - 1),
-        y2: clamp(y + (horizontal ? 0 : direction * .15)) * (f.height - 1),
-        duration_ms: 350, hold_ms: 0,
+      // A page is most of the container's extent, dragged slowly and held before lifting, so the list
+      // moves by the drag alone and does not coast past items.
+      const half = args.pages ? (horizontal ? (box?.width ?? f.width) / f.width : (box?.height ?? f.height) / f.height) * .4 : .15;
+      const drag = () => ctx.input({ op: 'drag',
+        x1: clamp(x - (horizontal ? direction * half : 0)) * (f.width - 1),
+        y1: clamp(y - (horizontal ? 0 : direction * half)) * (f.height - 1),
+        x2: clamp(x + (horizontal ? direction * half : 0)) * (f.width - 1),
+        y2: clamp(y + (horizontal ? 0 : direction * half)) * (f.height - 1),
+        duration_ms: args.pages ? 600 : 350, hold_ms: 0, ...(args.pages ? { end_hold_ms: 250 } : {}),
       });
+      let result;
+      for (let page = 0; page < (args.pages ?? 1); page++) {
+        if (page) await pause(300);
+        result = await drag();
+        if (result.isError || result.stopped) break;
+      }
+      return { ...result, ...(box ? { container: args.container } : {}), ...(args.pages ? { pages: args.pages } : {}) };
     }
     case 'scroll_to': {
-      let previous;
+      let previous, first;
       const maximum = Math.min(args.max_scrolls ?? args.max_swipes ?? 10, 50);
+      // Sideways lists page and snap: a short drag may not move them, and a fling skips items.
+      const pages = ['left', 'right'].includes(args.direction) ? 1 : undefined;
       for (let count = 0; count <= maximum; count++) {
         const result = await findText(args.text, args.exact);
+        first ??= result.elements;
         const matches = result.matches;
-        if (matches.length) return { found: true, scrolls: count, elements: matches, source: result.source };
+        if (matches.length) return { found: true, scrolls: count, elements: matches, source: result.source, ...(count ? { moved: whatMoved(first, result.elements) } : {}) };
         const signature = JSON.stringify(result.elements.filter(visible).flatMap(e => [e.label, e.text, e.value].filter(t => typeof t === 'string')));
         const unchanged = signature === previous;
         if (count === maximum || unchanged) throw new Error(`Text ${JSON.stringify(args.text)} was not found after ${count} scrolls${unchanged ? '; visible content stopped changing' : ''}.`);
         previous = signature;
-        await interaction(ctx, 'scroll', { ...args, direction: args.direction ?? 'down' });
+        await interaction(ctx, 'scroll', { ...args, direction: args.direction ?? 'down', ...(pages ? { pages } : {}) });
         await pause(200);
       }
       break;
