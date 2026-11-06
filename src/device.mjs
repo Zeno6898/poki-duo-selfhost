@@ -9,7 +9,7 @@ import sharp from 'sharp';
 import { root, stateDir, idevice } from './config.mjs';
 import { definitions } from './tools.mjs';
 import { platformTool, inventorySimulators, simulatorModels, readSettings, closePlatform } from './platform.mjs';
-import { interaction, promptWarning, readScreen, describeScreen, screenChanged, justReadMs } from './interaction.mjs';
+import { interaction, promptWarning, readScreen, describeScreen, screenChanged, justReadMs, confirmAfterMs, launchWithinMs, launchPollMs } from './interaction.mjs';
 import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
@@ -260,7 +260,9 @@ export class Devices {
     if (tree.foreground?.pid) this.lastForeground = { device: target.id, pid: tree.foreground.pid };
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
-    const signature = JSON.stringify(elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; }));
+    // The app in front is part of the screen: a switch counts as a change even before its tree arrives.
+    const front = [tree.foreground?.pid ?? null, tree.foreground?.bundle_id ?? null];
+    const signature = JSON.stringify([front, ...elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; })]);
     return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, at: performance.now() };
   }
   // A simulator's size only changes when it rotates. A physical device maps touches through its
@@ -288,10 +290,14 @@ export class Devices {
     if (target.kind === 'simulator' || cost === undefined) return readbackMs;
     return Math.min(maxReadbackMs, Math.max(readbackMs, 3 * cost + settleMs));
   }
+  // How long an "unchanged" waits for a lagging screen before it is believed (see confirmUnchanged).
+  confirmation() { return this.expectsForeground ? { intervalMs: launchPollMs, withinMs: launchWithinMs } : { intervalMs: confirmAfterMs, withinMs: confirmAfterMs }; }
+  confirmationBudget(before) { return before === undefined ? 0 : this.confirmation().withinMs + this.readCost() + 100; }
   async readback(before) {
     try {
       const target = await this.target();
-      const { signature, screen } = await deadline(this.observationBudget(target), () => readScreen(this));
+      const confirmation = this.confirmation();
+      const { signature, screen } = await deadline(this.observationBudget(target) + this.confirmationBudget(before), () => readScreen(this, { before, confirmation }));
       return { screen, ...screenChange(before, signature) };
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
@@ -309,7 +315,7 @@ export class Devices {
   // A batch step reports only whether its touch changed the screen; the batch ends with the screen itself.
   async changedSince(before) {
     try {
-      const changed = await deadline(this.observationBudget(await this.target()), () => screenChanged(this, before));
+      const changed = await deadline(this.observationBudget(await this.target()) + this.confirmationBudget(before), () => screenChanged(this, before, this.confirmation()));
       return changed === undefined ? screenChange() : { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
     } catch {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
@@ -459,7 +465,7 @@ export class Devices {
         case 'batch_commands': return await runBatch(this, args);
         default: {
           const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
-          this.beforeInput = undefined;
+          this.beforeInput = undefined; this.expectsForeground = false;
           // A batch step may reuse the read its predecessor just took of the same screen.
           const before = looks || touches ? await this.readBefore(this.inBatch ? this.reuseMs() : 0) : undefined;
           let result = await interaction(this,name,args);
