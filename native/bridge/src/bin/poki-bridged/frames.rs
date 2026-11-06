@@ -988,3 +988,137 @@ mod tests {
             });
     }
 }
+
+/// A screen fed with encoded pictures instead of the phone's stream, for tests of what reacts to
+/// the screen (prefetch, type_text's fast return). It runs the daemon's own decoder thread.
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+
+    pub struct FakeScreen {
+        pub live: Live,
+        jobs: mpsc::Sender<Job>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeScreen {
+        /// None without libavcodec.
+        pub fn start() -> Option<Self> {
+            libav::available().ok()?;
+            let screen = Arc::new(Mutex::new(Screen {
+                decoding_since: Some(Instant::now()),
+                ..Screen::default()
+            }));
+            let (jobs, queue) = mpsc::channel();
+            let (notify, changed) = tokio::sync::watch::channel(0u64);
+            let notify = Arc::new(notify);
+            let thread = {
+                let (screen, notify) = (screen.clone(), notify.clone());
+                let ready = Arc::new(AtomicBool::new(false));
+                std::thread::Builder::new()
+                    .name("poki-frames".into())
+                    .spawn(move || decode_loop(queue, screen, notify, ready))
+                    .ok()?
+            };
+            Some(Self {
+                live: Live {
+                    screen,
+                    jobs: jobs.clone(),
+                    changed,
+                    notify,
+                },
+                jobs,
+                thread: Some(thread),
+            })
+        }
+
+        /// Sends one access unit and waits for its picture.
+        pub async fn show(&self, unit: &[u8]) {
+            let before = self.live.screen.lock().unwrap().counters.decoded;
+            let sent = Instant::now();
+            self.jobs.send(Job::Unit(unit.to_vec(), sent)).unwrap();
+            while self.live.screen.lock().unwrap().counters.decoded == before {
+                assert!(sent.elapsed() < Duration::from_secs(2), "no picture");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    impl Drop for FakeScreen {
+        fn drop(&mut self) {
+            // The decoder thread ends once every Live clone is gone.
+            self.live.screen.lock().unwrap().closed = true;
+            self.thread.take();
+        }
+    }
+
+    /// A picture drawn by ffmpeg: a white `size` screen with the `draw` filters on it. None without
+    /// ffmpeg (or its drawtext).
+    pub fn draw(name: &str, size: &str, draw: &str) -> Option<std::path::PathBuf> {
+        let path =
+            std::env::temp_dir().join(format!("poki-fake-{}-{name}.png", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("color=c=white:s={size}"))
+            .args(["-vf", draw, "-frames:v", "1"])
+            .arg(&path)
+            .status();
+        made.is_ok_and(|s| s.success()).then_some(path)
+    }
+
+    /// The pictures as an HEVC stream like the phone's, one access unit per picture. None
+    /// without ffmpeg and libx265.
+    pub fn encode(pictures: &[std::path::PathBuf]) -> Option<Vec<Vec<u8>>> {
+        let dir = std::env::temp_dir().join(format!(
+            "poki-fake-{}-{}",
+            std::process::id(),
+            pictures.len()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        for (i, picture) in pictures.iter().enumerate() {
+            std::fs::copy(picture, dir.join(format!("{i:03}.png"))).ok()?;
+        }
+        let file = dir.join("screen.hevc");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-framerate",
+                "30",
+                "-i",
+            ])
+            .arg(dir.join("%03d.png"))
+            .args(["-c:v", "libx265", "-pix_fmt", "yuv420p", "-x265-params"])
+            .arg("bframes=0:keyint=1:aud=1:repeat-headers=1:log-level=none")
+            .args(["-f", "hevc"])
+            .arg(&file)
+            .status();
+        let stream = std::fs::read(&file).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        if !made.is_ok_and(|s| s.success()) {
+            return None;
+        }
+        let stream = stream?;
+        let starts: Vec<usize> = nal_units(&stream)
+            .filter(|(_, kind)| *kind == 35)
+            .map(|(at, _)| at)
+            .chain([stream.len()])
+            .collect();
+        Some(
+            starts
+                .windows(2)
+                .map(|w| stream[w[0]..w[1]].to_vec())
+                .collect(),
+        )
+    }
+}

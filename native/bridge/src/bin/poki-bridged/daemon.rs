@@ -184,6 +184,10 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let reaper = tokio::task::spawn_local(reap(state.clone()));
     let prefetcher =
         live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
+    // Load the OCR models before the first type_text or ocr_region needs them.
+    if live::enabled() {
+        tokio::task::spawn_local(async { crate::ocr::shared().warm().await });
+    }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -256,6 +260,10 @@ async fn reap(state: Rc<State>) {
 
 fn log(message: &str) {
     eprintln!("{} poki-bridged: {message}", crate::ax::watch::stamp());
+}
+
+pub(crate) fn log_line(message: &str) {
+    log(message);
 }
 
 /// One client. Its requests are answered in order; when it disconnects, a running op is cancelled.
@@ -342,6 +350,14 @@ fn ms(since: Instant) -> u64 {
 }
 
 fn success(id: Value, output: &Value, timings: Timings) -> Value {
+    // Background type_text read-backs that disagreed with their fast answer.
+    let warnings = super::paste_again::quick::take_warnings();
+    let mut output = output.clone();
+    if !warnings.is_empty()
+        && let Some(object) = output.as_object_mut()
+    {
+        object.insert("warnings".into(), warnings.into());
+    }
     // poki-native prints the result with `println!("{result}")`.
     json!({"id": id, "ok": true, "stdout": output.to_string(), "timings": timings})
 }
@@ -406,6 +422,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     "opened": session.ax_opened,
                     "fallbacks": session.ax_fallbacks,
                     "last_error": session.ax_last_error,
+                    "ocr": crate::ocr::shared().stats(),
                     "prefetch": session.input.as_ref().map(|input| {
                         live::prefetch_json(&state.prefetch, &input.frames.live())
                     }),
