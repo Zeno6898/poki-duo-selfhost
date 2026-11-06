@@ -17,6 +17,7 @@ import { version, buildInfo, requireCurrentCode, ocrStatus, ocrMissing, ocrPath 
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
 import { routes as routesToBridgeDaemon, runThroughDaemon } from './bridge-daemon.mjs';
 import { actAndObserve } from './act-and-observe.mjs';
+import { liveScreenFor, enabled as liveFramesEnabled } from './live-frames.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -28,6 +29,9 @@ const platformTools = new Set(['start_simulator', 'shut_down_simulator', 'start_
 // the reads it has just measured, up to a cap.
 const springBoardId = 'com.apple.springboard', springBoardExecutable = /(?:^|\/)SpringBoard(?:\.app\/SpringBoard)?$/;
 const settleMs = 600, readbackMs = 5000, maxReadbackMs = 12000;
+// With the live screen (POKI_LIVE_FRAMES=1) the wait after an input ends when poki-bridged sees the
+// picture settle, up to this long.
+const liveSettleTimeoutMs = Number(process.env.POKI_LIVE_SETTLE_TIMEOUT_MS) || 4000;
 const reportsScreen = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'swipe', 'drag', 'scroll', 'pinch', 'type_text', 'fill', 'press_key', 'press_button', 'go_back', 'handle_alert', 'system_gesture']);
 // These exist to act on a control, so the reply says when nothing was seen to change after one.
 const touchesControl = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'go_back', 'handle_alert']);
@@ -188,6 +192,8 @@ export class Devices {
     checkWork();
     const started = new Date().toISOString();
     const target = await this.target();
+    const live = await this.liveFrame(target);
+    if (live) return live;
     const cache = join(stateDir, 'frames');
     await mkdir(cache, { recursive: true, mode: 0o700 });
     const path = join(cache, `${randomUUID()}.png`);
@@ -206,6 +212,39 @@ export class Devices {
       this.size = { device: target.id, width, height };
       return this.frame;
     } finally { await unlink(path).catch(() => {}); }
+  }
+  // The live screen for a physical device, when it is on.
+  liveScreen(target = this.resolved) {
+    return target?.kind === 'physical' ? liveScreenFor(nativeArgs(target)) : undefined;
+  }
+  // A screenshot from poki-bridged's newest decoded picture: no capture round trip, and it carries
+  // when the picture arrived. Undefined when the live screen is off or has no picture, so the caller
+  // takes an ordinary screenshot.
+  async liveFrame(target) {
+    const screen = this.liveScreen(target);
+    if (!screen) return undefined;
+    let picture;
+    try { picture = await screen.latestFrame({ maxWidth: 4096, waitMs: 1500 }); } catch (error) { if (stopped(error)) throw error; return undefined; }
+    if (!picture.jpeg) return undefined;
+    // The video can be smaller than the screen, so its size says nothing about points: the first
+    // screenshot of a session is an ordinary one, which gives the point size this one is scaled to.
+    if (this.size?.device !== target.id) return undefined;
+    const scale = await this.scale(target), { width, height } = this.size;
+    const data = await sharp(picture.jpeg).resize(width, height).png().toBuffer();
+    this.coordinator.observeFrame(target.id, data);
+    if (this.frame?.revision !== this.coordinator.revision(target.id) || this.frame?.device !== target.id || this.frame?.width !== width || this.frame?.height !== height || !this.frame.data.equals(data)) { this.elements=[]; this.elementsAt=0; }
+    this.frame = { id: randomUUID(), device: target.id, revision: this.coordinator.revision(target.id), width, height, scale, data, original: picture.jpeg, at: Date.now(), capture_started_at: picture.capturedAt, capture_completed_at: picture.capturedAt, source: 'live', live: { age_ms: picture.ageMs, settled: picture.settled, quiet_ms: picture.quietMs } };
+    return this.frame;
+  }
+  // The pictures' verdict on the last input replaces the accessibility one: a tree can lag the screen,
+  // a decoded picture cannot. Leaves the result as it is when the live screen did not answer.
+  withPixels(result) {
+    const settled = this.lastSettle;
+    if (!settled || settled.input !== this.lastInputAt || settled.changedSinceInput === null || settled.changedSinceInput === undefined) return result;
+    const changed = settled.changedSinceInput;
+    const lagging = result.screen_change === 'unchanged' && changed;
+    return { ...result, screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed, screen_change_source: 'pixels',
+      frame: { captured_at: settled.capturedAt, settled: settled.settled, waited_ms: settled.waitedMs, change: settled.lastChange }, ...(lagging ? { accessibility_lagging: true } : {}) };
   }
   async viewport() {
     const target = await this.target();
@@ -302,7 +341,15 @@ export class Devices {
       const target = await this.target();
       const confirmation = this.confirmation();
       const { signature, screen } = await deadline(this.observationBudget(target) + this.confirmationBudget(before), () => readScreen(this, { before, confirmation }));
-      return { screen, ...screenChange(before, signature) };
+      const result = this.withPixels({ screen, ...screenChange(before, signature) });
+      // The picture moved but the tree still shows the old page: read the text off the new picture instead.
+      if (result.accessibility_lagging) {
+        try {
+          const ocr = await this.recognize({ source: 'ocr', max_elements: Number.MAX_SAFE_INTEGER });
+          if (ocr.elements?.length) result.screen = { ...describeScreen(this.seen, ocr.elements, 'ocr'), from_picture: true };
+        } catch (error) { if (stopped(error)) throw error; }
+      }
+      return result;
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
       // Input clears the last read, so one left now was taken after the action: report it rather than nothing.
@@ -318,6 +365,8 @@ export class Devices {
   }
   // A batch step reports only whether its touch changed the screen; the batch ends with the screen itself.
   async changedSince(before) {
+    // With the live screen the pictures answer once the screen settles; no tree is read.
+    if (this.liveScreen()) { await this.settle(); const answer = this.withPixels(screenChange()); if (answer.screen_change_source) return answer; }
     try {
       const changed = await deadline(this.observationBudget(await this.target()) + this.confirmationBudget(before), () => screenChanged(this, before, this.confirmation()));
       return changed === undefined ? screenChange() : { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
@@ -328,6 +377,16 @@ export class Devices {
   }
   // Lets the app react to the last input, so a read shows the new page rather than the old one.
   async settle() {
+    const screen = Number.isFinite(this.lastInputAt) ? this.liveScreen() : undefined;
+    if (screen) {
+      // Settled is seen, not timed: poki-bridged answers when the picture has stopped changing.
+      if (this.lastSettle?.input === this.lastInputAt) return;
+      try {
+        const picture = await screen.waitSettled({ timeoutMs: liveSettleTimeoutMs, maxWidth: 64 });
+        this.lastSettle = { input: this.lastInputAt, ...picture, jpeg: undefined };
+        return;
+      } catch (error) { if (stopped(error)) throw error; }
+    }
     const remaining = this.lastInputAt + settleMs - performance.now();
     if (remaining > 0) await pause(remaining);
   }
@@ -392,7 +451,7 @@ export class Devices {
       if (name === 'act_and_observe') return await actAndObserve(this, args, (tool, values) => definitions.find(d => d[0] === tool)[2].parse(values));
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
-        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), ocr: await ocrStatus(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
+        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), ocr: await ocrStatus(), live_frames: liveFramesEnabled() ? (this.resolved?.kind === 'physical' ? await this.liveScreen().health() : { enabled: true, device: null }) : { enabled: false }, registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
         case 'list_devices': return text({ devices: await this.describeDevices(args.include_all_simulators), ...(args.include_all_simulators ? { simulator_models: await simulatorModels() } : {}) });
         case 'select_device': {
           this.requested = args.device;
@@ -476,14 +535,16 @@ export class Devices {
           const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
           this.beforeInput = undefined; this.expectsForeground = false;
           // A batch step may reuse the read its predecessor just took of the same screen.
-          const before = looks || touches ? await this.readBefore(this.inBatch ? this.reuseMs() : 0) : undefined;
+          // The live screen compares pictures instead, so it needs no tree before the action.
+          const live = Boolean(this.liveScreen(await this.target()));
+          const before = (looks || touches) && !live ? await this.readBefore(this.inBatch ? this.reuseMs() : 0) : undefined;
           let result = await interaction(this,name,args);
           if(result===undefined) throw new Error(`No implementation for ${name}`);
           const delivered = result.sent === true && !result.isError && !result.stopped;
           // A target that had to be waited for is compared with the screen it was found on, not the one before the wait.
           const sentTo = this.beforeInput ?? before, signature = sentTo?.elements.length ? sentTo.signature : undefined;
           if (looks && delivered) result = { ...result, ...await this.readback(signature) };
-          else if (touches && delivered && signature !== undefined) result = { ...result, ...await this.changedSince(signature) };
+          else if (touches && delivered && (signature !== undefined || live)) result = { ...result, ...await this.changedSince(signature) };
           // The input layers answer screen_change_verified false before anything is read, which means not looked at, not unchanged.
           if (result.screen_change === undefined && result.screen_change_verified === false && !this.inBatch) result = { ...result, screen_change: 'unknown' };
           const unchanged = touches && result.screen_change === 'unchanged' && !result.stopped;
