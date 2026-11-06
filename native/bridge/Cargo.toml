@@ -6,7 +6,7 @@ publish = false
 license = "AGPL-3.0-only"
 
 [dependencies]
-idevice = { path = "../../.deps/idevice/idevice", default-features = false, features = ["aws-lc", "usbmuxd", "tcp", "core_device", "display_stream", "core_device_proxy", "rsd", "tunnel_tcp_stack", "dvt", "location_simulation", "afc", "installation_proxy", "springboardservices", "remote_pairing"] }
+idevice = { path = "../../.deps/idevice/idevice", default-features = false, features = ["aws-lc", "usbmuxd", "tcp", "core_device", "display_stream", "core_device_proxy", "rsd", "tunnel_tcp_stack", "dvt", "location_simulation", "afc", "installation_proxy", "springboardservices", "remote_pairing", "diagnostics_relay", "notification_proxy"] }
 tokio = { version = "1.43", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

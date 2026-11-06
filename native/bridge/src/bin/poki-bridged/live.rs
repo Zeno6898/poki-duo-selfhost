@@ -102,6 +102,7 @@ pub async fn answer(
                 let mut answer = picture(state, &live, &object, wait).await?;
                 answer["tree"] = tree_summary(&state.prefetch, &live);
                 answer["foreground"] = foreground_json(state);
+                answer["device_state"] = state.device.borrow().json();
                 Ok(answer)
             }
             "wait_settled" => {
@@ -117,6 +118,7 @@ pub async fn answer(
                 answer["waited_ms"] = ms(waiting).into();
                 answer["tree"] = tree_summary(&state.prefetch, &live);
                 answer["foreground"] = foreground_json(state);
+                answer["device_state"] = state.device.borrow().json();
                 Ok(answer)
             }
             "ocr_region" | "ocr_frame" => read_text(&live, op, &object).await,
