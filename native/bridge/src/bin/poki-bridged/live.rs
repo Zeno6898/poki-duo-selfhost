@@ -56,7 +56,18 @@ pub fn is_live_op(op: &str) -> bool {
 
 /// Opens the media session when it is not open and starts decoding; a view of the screen.
 async fn live(state: &State, timings: &mut Timings) -> Result<Live> {
-    let mut session = state.session.lock().await;
+    // Another op holds the session (an accessibility read takes over a second): the open media
+    // session's view serves meanwhile.
+    let mut session = match state.session.try_lock() {
+        Ok(session) => session,
+        Err(_) => {
+            let view = state.live_view.borrow().clone();
+            if let Some(view) = view.filter(|view| !view.state(Duration::ZERO).closed) {
+                return Ok(view);
+            }
+            state.session.lock().await
+        }
+    };
     session.last_used = Instant::now();
     session.restart_media_if_asked().await;
     if let Err(error) = Box::pin(session.prepare_input_or_retry(false, timings)).await {
@@ -67,6 +78,7 @@ async fn live(state: &State, timings: &mut Timings) -> Result<Live> {
     if !decode_off() {
         live.decode();
     }
+    *state.live_view.borrow_mut() = Some(live.clone());
     match live.error() {
         Some(error) => Err(error.into()),
         None => Ok(live),
@@ -509,10 +521,16 @@ pub async fn resolve_foreground(state: Rc<State>) {
             continue;
         }
         let answer = async {
-            let mut session = state.session.lock().await;
-            session.connect(&mut Timings::default()).await?;
-            let link = session.link.as_mut().expect("connected");
-            apps::app_for_pid(&mut link.device.adapter, &mut link.device.rsd, pid as u32).await
+            let (mut adapter, mut rsd) = match state.read_lane() {
+                Some(lane) => lane,
+                None => {
+                    let mut session = state.session.lock().await;
+                    session.connect(&mut Timings::default()).await?;
+                    let link = session.link.as_ref().expect("connected");
+                    (link.device.adapter.clone(), link.device.rsd.clone())
+                }
+            };
+            apps::app_for_pid(&mut adapter, &mut rsd, pid as u32).await
         }
         .await;
         let mut f = state.foreground.borrow_mut();
@@ -565,14 +583,22 @@ async fn screenshot_picture(
     let quality = number(object, "quality", 5).clamp(2, 31) as u32;
     let requested = Instant::now();
     let png = {
-        let mut session = state.session.lock().await;
-        session.last_used = Instant::now();
+        // On the lane when there is a tunnel: beside an accessibility read, not after it.
+        let (mut adapter, mut rsd) = match state.read_lane() {
+            Some(lane) => lane,
+            None => {
+                let mut session = state.session.lock().await;
+                session.last_used = Instant::now();
+                if let Err(error) = session.connect(&mut Timings::default()).await {
+                    session.recover().await;
+                    return Err(format!("screenshot failed: {error}").into());
+                }
+                let link = session.link.as_ref().expect("connected");
+                (link.device.adapter.clone(), link.device.rsd.clone())
+            }
+        };
         let shot = async {
-            session.connect(&mut Timings::default()).await?;
-            let link = session.link.as_mut().expect("connected");
-            let mut server =
-                RemoteServerClient::connect_rsd(&mut link.device.adapter, &mut link.device.rsd)
-                    .await?;
+            let mut server = RemoteServerClient::connect_rsd(&mut adapter, &mut rsd).await?;
             server.read_message(0).await?;
             let png = ScreenshotClient::new(&mut server)
                 .await?
@@ -584,7 +610,7 @@ async fn screenshot_picture(
         match shot {
             Ok(png) => png,
             Err(error) => {
-                session.recover().await;
+                state.session.lock().await.recover().await;
                 return Err(format!("screenshot failed: {error}").into());
             }
         }
