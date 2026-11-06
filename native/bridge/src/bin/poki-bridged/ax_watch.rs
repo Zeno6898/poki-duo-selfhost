@@ -79,9 +79,12 @@ fn log_line(message: &str) {
 
 /// The time now in UTC, as 2026-11-06T02:58:16.123Z, for the daemon's log lines.
 pub(crate) fn stamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    stamp_at(std::time::SystemTime::now())
+}
+
+/// A time in UTC, as 2026-11-06T02:58:16.123Z.
+pub(crate) fn stamp_at(at: std::time::SystemTime) -> String {
+    let now = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let (secs, millis) = (now.as_secs(), now.subsec_millis());
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
     let days = (secs / 86_400) as i64 + 719_468;

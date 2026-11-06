@@ -52,6 +52,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "live.rs"]
+mod live;
+
 const DAEMON_USAGE: &str = "usage: poki-bridged --socket PATH --udid ID\n       poki-bridged --socket PATH --host IP --pairing-file PATH\n       poki-bridged --socket PATH --host IP --rp-pairing-file PATH [--rp-host-name NAME]";
 /// poki-native reads at most 2 MiB of request; the margin covers the `id`.
 const LINE_LIMIT: u64 = 2 * 1024 * 1024 + 4096;
@@ -189,12 +192,40 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
 async fn reap(state: Rc<State>) {
     let input_idle = idle_env("POKI_BRIDGED_INPUT_IDLE_MS", 60_000);
     let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 1_800_000);
+    let mut reopened: Option<Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let Ok(mut session) = state.session.try_lock() else {
             continue;
         };
         let idle = session.last_used.elapsed();
+        if live::enabled() {
+            // The live screen keeps the media session open, and opens it again after an error.
+            if session.input.is_none()
+                && reopened.is_none_or(|at: Instant| at.elapsed() >= live::REOPEN_AFTER)
+            {
+                reopened = Some(Instant::now());
+                let mut timings = Timings::default();
+                match Box::pin(session.prepare_input_or_retry(false, &mut timings)).await {
+                    Ok(()) => {
+                        if let Some(input) = session.input.as_ref() {
+                            input.frames.live().decode();
+                        }
+                        log(&format!(
+                            "live frames: media session open in {} ms",
+                            timings.input_open_ms.unwrap_or(0)
+                        ));
+                    }
+                    Err(error) => {
+                        session.reset().await;
+                        log(&format!(
+                            "live frames: cannot open the media session: {error}"
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
         if input_idle.is_some_and(|limit| idle >= limit) && session.input.is_some() {
             log("input services idle; closing them");
             session.close_input().await;
@@ -337,6 +368,10 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnel"] = session.link.is_some().into();
                 pong["input"] = session.input.is_some().into();
                 pong["ops"] = session.ops.into();
+                pong["frames"] = session.input.as_ref().map_or(Value::Null, |input| {
+                    let live = input.frames.live();
+                    live.report(&live.mark())
+                });
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
@@ -345,6 +380,9 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 });
             }
             return Some(json!({"id": id, "ok": true, "pong": pong}));
+        }
+        op if live::is_live_op(op) => {
+            return Box::pin(live::answer(op, id, object, state, closed)).await;
         }
         "reset" => {
             state.session.lock().await.reset().await;
@@ -407,6 +445,8 @@ struct Input {
     /// Tasks that read and discard the RTP the phone streams to the media session's UDP sockets;
     /// the tunnel's UDP queues are unbounded.
     drains: Vec<JoinHandle<()>>,
+    /// The video: read and counted, and with POKI_LIVE_FRAMES=1 decoded (see frames.rs).
+    frames: crate::frames::Frames,
     touch: Option<Touch>,
     buttons: Option<Indigo>,
 }
@@ -542,7 +582,17 @@ impl Session {
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
         let request = parse(&object)?;
         let changes = !reads_only(&request);
+        // The live screen is not settled while an input runs, nor for the settle time after it.
+        let noted = changes
+            .then(|| self.input.as_ref().map(|input| input.frames.live()))
+            .flatten();
+        if let Some(live) = &noted {
+            live.note_input();
+        }
         let result = Box::pin(self.run(request, object, timings)).await;
+        if changes && let Some(input) = self.input.as_ref() {
+            input.frames.live().note_input();
+        }
         // Whatever it did, an op that may change the screen makes the held tree stale.
         if changes && let Some(watch) = self.ax.as_mut() {
             watch.invalidate();
@@ -737,13 +787,15 @@ impl Session {
                 audio_udp,
                 video_udp,
             } = media;
-            let drains = [audio_udp, video_udp]
+            let drains = [audio_udp]
                 .into_iter()
                 .map(|socket| tokio::spawn(async move { while socket.recv().await.is_ok() {} }))
                 .collect();
+            let frames = crate::frames::Frames::new(video_udp, live::enabled());
             let mut input = Input {
                 client,
                 drains,
+                frames,
                 touch: None,
                 buttons: None,
             };

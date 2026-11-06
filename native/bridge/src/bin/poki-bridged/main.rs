@@ -23,6 +23,12 @@ mod ax {
     pub mod watch;
 }
 
+// The live screen (J1): the input media session's video, decoded in-process with libavcodec.
+#[path = "frames.rs"]
+mod frames;
+#[path = "libav.rs"]
+mod libav;
+
 #[path = "../.."]
 mod src {
     include!("../../main.rs");
