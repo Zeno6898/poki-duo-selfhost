@@ -158,7 +158,7 @@ export function describeScreen(seen, elements = seen.elements, source = 'accessi
 // read it, because OCR text alone cannot say whether anything moved. Over a slow connection one read
 // can take seconds, so the reads stop when another would not finish inside the caller's deadline, and
 // the last one is reported with screen_stable false rather than lost.
-export async function readScreen(ctx) {
+export async function readScreen(ctx, { before, confirmation } = {}) {
   await ctx.settle();
   const started = performance.now();
   const cost = () => ctx.readCost?.() ?? 0;
@@ -173,6 +173,10 @@ export async function readScreen(ctx) {
     seen = next;
     if (same) { stable = true; break; }
   }
+  if (before !== undefined && seen.elements.length && seen.signature === before) {
+    const confirmed = await confirmUnchanged(ctx, before, seen, confirmation);
+    if (confirmed !== seen) { seen = confirmed; stable = false; }
+  }
   const compared = seen.elements.length > 0;
   const elements = compared ? seen.elements : (await ctx.recognize({ source: 'ocr', max_elements: Number.MAX_SAFE_INTEGER })).elements;
   return {
@@ -183,16 +187,38 @@ export async function readScreen(ctx) {
 
 // Whether the screen differs from the one an input was sent to. One differing read settles it; a
 // matching read is confirmed by a second, the same two reads readScreen needs to call a screen still.
-export async function screenChanged(ctx, before) {
+export async function screenChanged(ctx, before, confirmation) {
   await ctx.settle();
+  let seen;
   for (let read = 0; read < 2; read++) {
     if (read) await pause(pollMs);
-    const seen = await readStructure(ctx, 0);
+    seen = await readStructure(ctx, 0);
     if (!seen.elements.length) return undefined;
     if (seen.signature !== before) return true;
   }
-  return false;
+  return (await confirmUnchanged(ctx, before, seen, confirmation)).signature !== before;
 }
+
+// Two matching reads can still be the old screen: an app opening from the Home Screen keeps
+// reporting the Home Screen's tree for a moment after the touch. So "unchanged" waits once more,
+// and longer, polling, when the touch was on an app icon. It costs time only when nothing changed.
+export const confirmAfterMs = 700, launchWithinMs = 2500, launchPollMs = 300;
+async function confirmUnchanged(ctx, before, seen, { intervalMs = confirmAfterMs, withinMs = confirmAfterMs } = {}) {
+  const started = performance.now(), cost = ctx.readCost?.() ?? 0;
+  while (seen.signature === before && performance.now() - started < withinMs) {
+    if (remaining() < intervalMs + cost) break;
+    await pause(intervalMs);
+    const next = await readStructure(ctx, 0);
+    if (next.elements.length) seen = next;
+  }
+  return seen;
+}
+
+// An app icon is a touch that should bring another app to the front.
+const opensApp = (element, seen) => {
+  const role = element.type ?? element.role ?? '';
+  return /^(?:AX|XCUIElementType)?Icon$/i.test(role) || seen?.foreground?.bundle_id === 'com.apple.springboard' && /^(?:AX|XCUIElementType)?Button$/i.test(role);
+};
 
 export async function interaction(ctx, name, args) {
   const frame = () => ctx.screenSize();
@@ -201,6 +227,7 @@ export async function interaction(ctx, name, args) {
       await ctx.viewport();
       const e = ctx.elements.find(e => e.ref === a.ref.toLowerCase());
       if (!e || Date.now() - ctx.elementsAt > 30000) throw new Error('Element ref is stale. Use tap_text with its label, or call list_elements again.');
+      ctx.expectsForeground = opensApp(e, ctx.seen);
       const f = e.frame ?? e;
       return { x: f.x + f.width / 2, y: f.y + f.height / 2 };
     }
@@ -232,6 +259,7 @@ export async function interaction(ctx, name, args) {
     case 'tap': case 'double_tap': case 'long_press': return tap(args, name);
     case 'tap_text': {
       const element = await locate(ctx, elements => matching(elements, args.text, args.exact), { missing: seen => missingText(args.text, seen), many: found => tooMany(args.text, found) });
+      ctx.expectsForeground = opensApp(element, ctx.seen);
       return ctx.input({ op: 'tap', ...center(element), duration_ms: 50 });
     }
     case 'swipe': case 'drag': return ctx.input({

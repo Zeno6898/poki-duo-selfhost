@@ -93,3 +93,24 @@ test('a screenshot says it was not saved to the device Photos library', { timeou
  const shot=await f.call('take_screenshot');
  assert.ok(shot.content.some(c=>c.type==='text'&&/not saved to the device's Photos library/.test(c.text)));
 });
+
+// On the phone an app opening from the Home Screen kept reporting the Home Screen's tree for two reads.
+test('a screen that only lags behind the touch is not called unchanged', { timeout: 60000 }, async t => {
+ const f=await fixture(t);
+ await f.set({label:'Settings',afterInput:{label:'General',staleReads:2,staleLabel:'Settings'}});
+ const lagging=value(await f.call('tap_text',{text:'Settings'}));
+ assert.equal(lagging.screen_change,'changed',JSON.stringify(lagging));assert.equal(lagging.instruction,undefined);
+ assert.ok(lagging.screen.text.includes('Button: General'));
+ // An app icon is given longer to bring its app to the front.
+ await f.set({label:'Settings',role:'Icon',afterInput:{label:'General',staleReads:5,staleLabel:'Settings'}});
+ assert.equal(value(await f.call('tap_text',{text:'Settings'})).screen_change,'changed');
+ // Anything else gets one more look, not a long wait.
+ await f.set({label:'Settings',afterInput:{label:'General',staleReads:5,staleLabel:'Settings'}});
+ assert.equal(value(await f.call('tap_text',{text:'Settings'})).screen_change,'unchanged');
+});
+
+test('a different app in front counts as a change even when its tree has not arrived', { timeout: 30000 }, async t => {
+ const f=await fixture(t);await f.set({launched:true,afterInput:{foregroundPid:999}});
+ const receipt=value(await f.call('tap',{x:10,y:10}));
+ assert.equal(receipt.screen_change,'changed',JSON.stringify(receipt));
+});
