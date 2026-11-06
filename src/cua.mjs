@@ -31,6 +31,7 @@
 // POKI_CUA_ACTION_CAP_MS (4000). A locked or dark phone, or Poki's own app in front, stops dispatching.
 import sharp from 'sharp';
 import { pause, stopped } from './work.mjs';
+import { wdaContext } from './cua-wda.mjs';
 
 const settleAfterMs = { tap: 450, type: 250, key: 300, swipe: 600, drag: 600, button: 700, launch: 900, wait: 0 };
 const imageWidth = 300, lineLimit = 120;
@@ -308,11 +309,17 @@ async function readAndReply(ctx, options) {
   return reply(ctx, seen, options);
 }
 
+// The device the tools drive: the bridge by default, or WebDriverAgent on the phone
+// (POKI_CUA_BACKEND=wda, POKI_WDA_URL), with the same answers either way.
+const backend = ctx => process.env.POKI_CUA_BACKEND === 'wda' ? wdaContext(ctx) : ctx;
+
 export async function look(ctx, args = {}) {
+  ctx = backend(ctx);
   return readAndReply(ctx, { full: args.full });
 }
 
 export async function act(ctx, args = {}) {
+  ctx = backend(ctx);
   const memory = state(ctx), actions = args.actions ?? [], done = [];
   // A number that is not in the latest read is refused before anything is sent, with the list now.
   const stale = actions.flatMap(refsIn).filter(ref => !memory.refs.has(ref));
