@@ -1,6 +1,7 @@
 mod apps;
 mod ax;
 mod configuration;
+mod ddi;
 mod device_ops;
 mod gesture;
 mod installation;
@@ -101,6 +102,12 @@ enum Request {
         action: String,
         #[serde(default)]
         text: Option<String>,
+    },
+    DdiStatus,
+    InstallDdi {
+        dir: String,
+        #[serde(default)]
+        force: bool,
     },
     Location {
         action: String,
@@ -209,6 +216,7 @@ impl Request {
             }
             Self::Screenshot { path } => device_ops::validate_screenshot(path)?,
             Self::AppForPid { pid: 0 } => return Err("pid must be positive".into()),
+            Self::InstallDdi { dir, .. } => ddi::validate_dir(dir)?,
             Self::Rotate { direction } => {
                 device_ops::direction(direction)?;
             }
@@ -424,6 +432,9 @@ async fn main() {
         }
         let limit = if matches!(request, Request::InstallApp { .. }) {
             180
+        } else if matches!(request, Request::InstallDdi { .. }) {
+            // A 16 MB upload through the tunnel plus a round trip to Apple's signing server.
+            300
         } else {
             90
         };
@@ -549,6 +560,10 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
         Request::Screenshot { path } => {
             return device_ops::screenshot(&mut adapter, &mut rsd, &path).await;
         }
+        Request::DdiStatus => return ddi::status(&mut adapter, &mut rsd).await,
+        Request::InstallDdi { dir, force } => {
+            return ddi::install(&mut adapter, &mut rsd, &dir, force).await;
+        }
         Request::Rotate { direction } => {
             return device_ops::rotate(&mut adapter, &mut rsd, &direction).await;
         }
@@ -591,6 +606,8 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
             | Request::AppForPid { .. }
             | Request::LockdownGet { .. }
             | Request::Screenshot { .. }
+            | Request::DdiStatus
+            | Request::InstallDdi { .. }
             | Request::Rotate { .. }
             | Request::Pasteboard { .. }
             | Request::Location { .. }
@@ -946,6 +963,9 @@ mod tests {
             r#"{"op":"configuration","method":"set_appearance","value":"dark"}"#,
             r#"{"op":"configuration","method":"set_text_size","value":"large"}"#,
             r#"{"op":"configuration","method":"set_reduce_motion","value":true}"#,
+            r#"{"op":"ddi_status"}"#,
+            r#"{"op":"install_ddi","dir":"/var/lib/poki/ddi/Xcode_iOS_DDI_Cryptex"}"#,
+            r#"{"op":"install_ddi","dir":"/var/lib/poki/ddi","force":true}"#,
         ] {
             assert!(request(text).is_ok(), "{text}");
         }
@@ -967,6 +987,9 @@ mod tests {
             r#"{"op":"app_for_pid","pid":0}"#,
             r#"{"op":"app_for_pid","pid":-1}"#,
             r#"{"op":"lockdown_get"}"#,
+            r#"{"op":"install_ddi"}"#,
+            r#"{"op":"install_ddi","dir":"ddi"}"#,
+            r#"{"op":"install_ddi","dir":"/ddi","extra":1}"#,
             r#"{"op":"lockdown_get","key":""}"#,
             r#"{"op":"lockdown_get","key":"DeviceName","extra":1}"#,
             r#"{"op":"screenshot","path":"frame.png"}"#,

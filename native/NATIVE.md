@@ -21,6 +21,8 @@ Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-fil
 | `rotate` | `direction=left` | Rotate the device 90 degrees, `left` (counter-clockwise) or `right`, through `com.apple.coredevice.devicecontrol`. |
 | `pasteboard` | `action`, `text?` | `get` the general pasteboard's text, list its `items`, or `set` it to `text`. |
 | `location` | `action`, `latitude?`, `longitude?` | `clear` the simulated location, or `set` it and hold it until the process ends. |
+| `ddi_status` | none | Whether the device offers `com.apple.coredevice.displayservice`, and which developer disk image cryptex is installed. See [Device services](#device-services). |
+| `install_ddi` | `dir`, `force=false` | Personalize and install the Cryptex1 developer disk image in `dir` through `cryptexd`. See [Device services](#device-services). |
 | `tap` | `x`, `y`, `duration_ms=50` | Contact, hold, and release one finger. |
 | `double_tap` | `x`, `y`, `duration_ms=50` | Tap twice within one session, 80 milliseconds apart. |
 | `long_press` | `x`, `y`, `duration_ms=600` | Hold for the requested duration. |
@@ -44,6 +46,8 @@ These ops replace the `idevice-tools` subcommands Poki uses for the same jobs. E
 | | `{"op":"pasteboard","action":"set","text":"..."}` | `{"copied":true,"bytes"}`. The text is at most 1 MiB. |
 | `location` | `{"op":"location","action":"clear"}` | `{"cleared":true}`. |
 | | `{"op":"location","action":"set","latitude":37.33,"longitude":-122.03}` | One line, `{"location_set":true,"latitude","longitude"}`, once the device accepts the location. The process then keeps running and sends the location again every 5 seconds, as `idevice-tools location_simulation set` does, because the device drops a simulated location when its instruments connection closes. The caller ends it with SIGTERM and then sends `clear`. The 90-second limit does not apply to this request. Latitude is -90..90 and longitude -180..180. Needs a mounted developer disk image. |
+| `ddi_status` | `{"op":"ddi_status"}` | `{"displayservice","cryptexd","services","installed"}`. `displayservice` and `cryptexd` say whether the tunnel's RSD services include `com.apple.coredevice.displayservice` and `com.apple.security.cryptexd.remote`; `services` is how many services it lists; `installed` is `{"identifier","version"}` for an installed `com.apple.MobileAsset.DDI` cryptex, or `null`. |
+| `install_ddi` | `{"op":"install_ddi","dir":"/abs/Xcode_iOS_DDI_Cryptex"}`, optionally `"force":true` | `{"installed","already_available","identifier?","version?"}`. `dir` is an absolute path to an unpacked Cryptex1 `Restore` directory (`BuildManifest.plist` and the four payloads it names). Without `force`, a device that already offers displayservice is left alone and the op answers `{"installed":false,"already_available":true}`. Otherwise it reads the personalization identifiers and cryptex nonce through `cryptexd`, asks Apple's signing server (`gs.apple.com`, HTTP) for a `Cryptex1,Ticket`, and installs the image, as `idevice-tools cryptexd install-ddi` does. A device's RSD services are fixed when the tunnel opens, so the caller checks for displayservice with a new `ddi_status` call. The limit for this request is 300 seconds. |
 
 `pasteboard` reads with the `allResolved` policy, as `idevice-tools pasteboard paste` and `items` do; `type_text` keeps its own snapshot logic, described below. Pasteboard data is neither logged nor written to files.
 
