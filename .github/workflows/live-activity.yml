@@ -1,0 +1,109 @@
+# The Live Activity's screenshots: builds the Poki app for the iOS Simulator and photographs every
+# phase of the Live Activity, both as the app's own preview (the widget's views at the system's sizes)
+# and as a real Live Activity on the simulator's Dynamic Island and Lock Screen, including the expanded
+# island an alert opens.
+name: Live Activity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev/live-activity]
+    paths: [native/ios-app/**, .github/workflows/live-activity.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: PokiLauncher for the simulator
+        run: |
+          set -euo pipefail
+          git clone -q https://github.com/jkcoxson/idevice.git .deps/idevice
+          git -C .deps/idevice checkout -q --detach 89702099f4d7552f704f93b4526756abda319ceb
+          git -C .deps/idevice apply ../../native/patches/idevice-xctest-run-over-rsd.patch
+          rustup update stable --no-self-update && rustup default stable
+          rustup target add aarch64-apple-ios-sim
+          cargo build --release --locked --target aarch64-apple-ios-sim --manifest-path native/launcher/Cargo.toml
+
+      - name: Assets and project
+        run: |
+          native/ios-app/scripts/make-assets.sh
+          brew install xcodegen
+          xcodegen generate --spec native/ios-app/project.yml
+
+      - name: Build for the simulator
+        run: |
+          set -o pipefail
+          # Signed ad hoc, so the App Group (the thumbnail file) and Live Activities work.
+          xcodebuild build \
+            -project native/ios-app/Poki.xcodeproj -scheme Poki -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO ARCHS=arm64 2>&1 | tee build/sim.log | grep -E "error:|warning: .*Activity|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+
+      - name: Screenshots
+        run: |
+          set -uo pipefail
+          APP=build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys;r=[x for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["platform"]=="iOS"];print(r[-1]["identifier"])')
+          TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys;d=[x for x in json.load(sys.stdin)["devicetypes"] if x["name"].startswith("iPhone") and "Pro" in x["name"] and "Max" not in x["name"]];print(d[-1]["identifier"])')
+          echo "runtime $RUNTIME, device $TYPE"
+          UDID=$(xcrun simctl create poki-la "$TYPE" "$RUNTIME")
+          boot() { xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b > /dev/null; xcrun simctl ui "$UDID" appearance dark; }
+          boot
+          open -a Simulator --args -CurrentDeviceUDID "$UDID" || true
+          sleep 5
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 || true
+          mkdir -p shots/preview shots/real
+          shot() { xcrun simctl io "$UDID" screenshot "$1" > /dev/null 2>&1 || echo "no screenshot $1"; }
+          # 1. The app's preview of each phase.
+          for s in start working approval done ready idle problem pairing code setup; do
+            xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
+            xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityState "$s" > /dev/null
+            sleep 3
+            shot "shots/preview/$s.png"
+          done
+          # 2. Real Live Activities: compact island, the alert's expanded island, then the Lock Screen.
+          for s in working approval code done setup; do
+            xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
+            xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityDemo "$s" > /dev/null
+            sleep 2
+            xcrun simctl launch "$UDID" com.apple.Preferences > /dev/null
+            sleep 2
+            shot "shots/real/$s-compact.png"
+            # The alert goes out six seconds after the start.
+            sleep 2.3; shot "shots/real/$s-alert-1.png"
+            sleep 0.8; shot "shots/real/$s-alert-2.png"
+            sleep 0.8; shot "shots/real/$s-alert-3.png"
+            # Lock the simulator (Device > Lock, Cmd-L) for the Lock Screen view.
+            osascript -e 'tell application "Simulator" to activate' -e 'delay 0.5' -e 'tell application "System Events" to keystroke "l" using command down' 2>&1 || echo "lock keystroke failed"
+            sleep 2
+            shot "shots/real/$s-lock.png"
+            xcrun simctl shutdown "$UDID"; boot
+          done
+          ls -R shots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-activity-shots
+          path: shots/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-activity-build-log
+          path: build/sim.log
