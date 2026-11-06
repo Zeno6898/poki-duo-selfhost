@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches: [dev/ios-runner]
-    paths: [native/ios-runner/host/**, native/ios-runner/patches/**, .github/workflows/runner-host-check.yml]
+    paths: [native/ios-runner/host/**, native/ios-runner/branding/**, native/ios-runner/patches/**, .github/workflows/runner-host-check.yml]
 
 permissions:
   contents: read
@@ -43,27 +43,40 @@ jobs:
           echo "executable: $BIN"; ls -la "$BIN"
           otool -L "$BIN"
           echo "--- defined classes in the executable"; nm -gU "$BIN" | grep -i objc_class || true
-          echo "--- undefined symbols"; nm -u "$BIN" | head -40
+          echo "--- undefined symbols"; nm -u "$BIN"
+          echo "--- strings"; strings "$BIN" | grep -i -E 'xct|automation|test' | head -60
           echo "--- Info.plist"; plutil -p "$PRODUCTS/$RUNNER/Info.plist"
           PLAT="$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer"
           for f in $(find "$PLAT/Library" -name '*.framework' -maxdepth 3) ; do
             b="$f/$(basename "$f" .framework)"; [ -f "$b" ] && nm -gU "$b" 2>/dev/null | grep -q 'XCTRunnerAppDelegate' && echo "XCTRunnerAppDelegate in $f"
           done; true
+      - name: Tell the test Poki started it (POKI_LAUNCHER=1, as the launcher does)
+        run: |
+          python3 - "$(ls build/wda/Build/Products/*.xctestrun | head -1)" <<'PY'
+          import plistlib, sys
+          path = sys.argv[1]
+          with open(path, "rb") as f: run = plistlib.load(f)
+          targets = [t for c in run.get("TestConfigurations", []) for t in c.get("TestTargets", [])]
+          targets += [v for k, v in run.items() if isinstance(v, dict) and "TestBundlePath" in v]
+          for t in targets:
+              for key in ("EnvironmentVariables", "TestingEnvironmentVariables"):
+                  t.setdefault(key, {})["POKI_LAUNCHER"] = "1"
+          with open(path, "wb") as f: plistlib.dump(run, f)
+          print("targets:", len(targets))
+          PY
       - name: Stock host, started as a test
         run: |
-          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" TEST_RUNNER_POKI_LAUNCHER=1 > stock.log 2>&1 &
-          for i in $(seq 1 90); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "stock: WDA answered after $i s"; break; }; sleep 1; done
+          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" > stock.log 2>&1 &
+          for i in $(seq 1 120); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "stock: WDA answered after $i s"; break; }; sleep 1; done
           curl -s -m 2 localhost:8100/status | head -c 300; echo
           pkill -f test-without-building || true; sleep 5; tail -20 stock.log
-      - name: Poki host in place of XCTRunner
+      - name: With PokiRunnerHost, started as a test
         run: |
-          APP="$PRODUCTS/$RUNNER"; BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
-          cp "$BIN" stock-executable
-          xcrun -sdk iphonesimulator clang -fobjc-arc -target arm64-apple-ios15.0-simulator -framework UIKit -framework Foundation \
-            native/ios-runner/host/main.m -o "$BIN"
-          codesign -f -s - "$APP"
-          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" TEST_RUNNER_POKI_LAUNCHER=1 > poki.log 2>&1 &
-          ok=0; for i in $(seq 1 90); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "poki host: WDA answered after $i s"; ok=1; break; }; sleep 1; done
+          APP="$PRODUCTS/$RUNNER"
+          native/ios-runner/host/install.sh "$APP" iphonesimulator
+          codesign -f -s - "$APP/Frameworks/libPokiRunnerHost.dylib" && codesign -f -s - "$APP"
+          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" > poki.log 2>&1 &
+          ok=0; for i in $(seq 1 120); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "poki host: WDA answered after $i s"; ok=1; break; }; sleep 1; done
           curl -s -m 2 localhost:8100/status | head -c 300; echo
           mkdir -p shots; xcrun simctl io "$UDID" screenshot shots/as-test-home.png || true
           xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" || true
