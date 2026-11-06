@@ -211,6 +211,7 @@ pub async fn subscribe(
         let start = live.state(settle);
         let (mut change_seen, mut input_seen) = (start.last_change.map(|c| c.0), start.last_input);
         let mut settled_for = start.settled.then_some(start.quiet_since);
+        let mut stalled = false;
         let mut last_settled_at: Option<Instant> = start.settled.then(Instant::now);
         loop {
             watcher.mark_unchanged();
@@ -261,6 +262,14 @@ pub async fn subscribe(
                     event["epoch"] = live.state(settle).epoch.into();
                     events.push(event);
                 }
+            }
+            if now.stalled_since.is_some() != stalled {
+                stalled = now.stalled_since.is_some();
+                events.push(json!({
+                    "event": "video",
+                    "state": if stalled { "stalled" } else { "flowing" },
+                    "epoch": now.epoch,
+                }));
             }
             if now.closed {
                 events.push(json!({"event": "media", "state": "closed"}));
@@ -399,6 +408,9 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
         "picture_after_input": state.last_input.map(|input| jpeg.arrived > input),
         // Upstream's rule: after an action, a frame not proven newer than it is unverified.
         "observation": observation(jpeg.epoch, state.last_input_epoch),
+        // Packets arrive but nothing decodes: this picture is older than the screen.
+        "video_stalled": state.stalled_since.is_some(),
+        "stalled_ms": state.stalled_since.map(ago),
         "frame": live.identity(jpeg.epoch, jpeg.wall, state.latest.map_or(jpeg.width, |l| l.2), state.latest.map_or(jpeg.height, |l| l.3)),
         "screen_change_verified": false,
     });
