@@ -37,6 +37,8 @@ jobs:
             -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda \
             CODE_SIGNING_ALLOWED=NO | grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " || true
           test -d "$PRODUCTS/$RUNNER"
+      - name: Brand as Poki (as the device build does)
+        run: BRAND_PLATFORM=iphonesimulator native/ios-runner/branding/brand.sh "$PRODUCTS/$RUNNER" docs/images/poki-icon.png docs/images/runner/AppIcon-1024.png > /dev/null
       - name: Where XCTRunner's pieces live
         run: |
           BIN="$PRODUCTS/$RUNNER/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PRODUCTS/$RUNNER/Info.plist")"
@@ -92,6 +94,7 @@ jobs:
           xcrun simctl io "$UDID" screenshot shots/by-hand.png
           if curl -s -m 2 localhost:8100/status > /dev/null; then echo "by hand: WDA is up (a test started)"; byhand=bad; else echo "by hand: no test, WDA is not up"; byhand=ok; fi
           xcrun simctl spawn "$UDID" launchctl list | grep -i webdriver || true
+          xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'eventMessage CONTAINS "PokiRunnerHost"' | tail -40 || true
           echo "POKI_HOST_BYHAND=$byhand" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         if: always()

@@ -1,8 +1,9 @@
 // PokiRunnerHost: a small library loaded into Poki Runner (Xcode's XCTRunner host) before its own code.
 // Started by Poki (through testmanagerd, with the XCTest session in the environment) it does nothing
-// and XCTRunner runs as always. Opened by hand from the home screen, it takes over before XCTRunner's
-// main: no test, no UI Automation, no passcode prompt; one screen that sends the person to Poki.
+// and XCTRunner runs as always. Opened by hand from the home screen, XCTRunner's app delegate does
+// nothing: no test, no UI Automation, no passcode prompt; one screen that sends the person to Poki.
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
 static BOOL PokiStartedByTestManager(void) {
   NSDictionary<NSString *, NSString *> *env = NSProcessInfo.processInfo.environment;
@@ -91,11 +92,39 @@ static UIColor *PokiBlue(void) { return [UIColor colorWithRed:0x20/255.0 green:0
 }
 @end
 
-/// Runs before XCTRunner's main (dyld runs a library's initializers first) and, opened by hand, never
-/// returns to it.
-__attribute__((constructor)) static void PokiRunnerHostTakeOver(int argc, char **argv, char **envp) {
+static BOOL PokiYes(id self, SEL _cmd, ...) { return YES; }
+static id PokiNothing(id self, SEL _cmd, ...) { return nil; }
+
+static UISceneConfiguration *PokiSceneConfiguration(id self, SEL _cmd, UIApplication *application, UISceneSession *session, UISceneConnectionOptions *options) {
+  UISceneConfiguration *config = [[UISceneConfiguration alloc] initWithName:@"Poki" sessionRole:session.role];
+  config.delegateClass = PokiRunnerSceneDelegate.class;
+  config.storyboard = nil;
+  return config;
+}
+
+/// Runs when the library loads, before XCTRunner's main. Opened by hand, XCTRunner's app delegate is
+/// emptied (every method it has does nothing) and its scenes get Poki's screen, so XCTRunner starts
+/// no test session; started by Poki, nothing changes. (Running a whole app from here instead would
+/// hold dyld's lock and hang.)
+__attribute__((constructor)) static void PokiRunnerHostTakeOver(void) {
   if (PokiStartedByTestManager()) { return; }
-  @autoreleasepool {
-    exit(UIApplicationMain(argc, argv, nil, NSStringFromClass(PokiRunnerAppDelegate.class)));
+  Class delegate = objc_getClass("_XCTRunnerAppDelegate") ?: objc_getClass("XCTRunnerAppDelegate");
+  if (!delegate) { NSLog(@"PokiRunnerHost: no XCTRunner app delegate"); return; }
+  unsigned int count = 0;
+  Method *methods = class_copyMethodList(delegate, &count);
+  for (unsigned int i = 0; i < count; i++) {
+    SEL name = method_getName(methods[i]);
+    const char *types = method_getTypeEncoding(methods[i]);
+    NSLog(@"PokiRunnerHost: XCTRunner delegate method %@ %s", NSStringFromSelector(name), types);
+    if (types[0] == 'v' || types[0] == '@' || types[0] == 'c' || types[0] == 'B' || types[0] == 'q' || types[0] == 'Q' || types[0] == 'i') {
+      BOOL yes = sel_isEqual(name, @selector(application:didFinishLaunchingWithOptions:)) || sel_isEqual(name, @selector(application:willFinishLaunchingWithOptions:));
+      method_setImplementation(methods[i], yes ? (IMP)PokiYes : (IMP)PokiNothing);
+    }
   }
+  free(methods);
+  SEL configure = @selector(application:configurationForConnectingSceneSession:options:);
+  if (!class_addMethod(delegate, configure, (IMP)PokiSceneConfiguration, "@@:@@@")) {
+    class_replaceMethod(delegate, configure, (IMP)PokiSceneConfiguration, "@@:@@@");
+  }
+  NSLog(@"PokiRunnerHost: opened by hand, %u XCTRunner methods emptied", count);
 }

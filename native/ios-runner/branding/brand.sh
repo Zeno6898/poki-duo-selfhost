@@ -28,7 +28,7 @@ cat > "$CAT/LaunchBear.imageset/Contents.json" <<'JSON'
 JSON
 
 MIN="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PLIST" 2>/dev/null || echo 15.0)"
-xcrun actool "$CAT" --compile "$APP" --platform iphoneos --minimum-deployment-target "$MIN" \
+xcrun actool "$CAT" --compile "$APP" --platform "${BRAND_PLATFORM:-iphoneos}" --minimum-deployment-target "$MIN" \
   --app-icon AppIcon --output-partial-info-plist "$WORK/partial.plist" \
   --target-device iphone --target-device ipad --output-format human-readable-text --notices --warnings
 # The icon keys from actool replace any the runner had.
