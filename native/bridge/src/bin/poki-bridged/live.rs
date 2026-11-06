@@ -40,6 +40,13 @@ pub fn enabled() -> bool {
     std::env::var("POKI_LIVE_FRAMES").as_deref() == Ok("1")
 }
 
+/// POKI_LIVE_DECODE=off: the media session stays open (input needs it, and the packet clock
+/// reads it) but nothing is decoded; every picture comes from the screenshot service. For
+/// servers that cannot spare the decoder's CPU (over a core while the phone streams).
+pub fn decode_off() -> bool {
+    std::env::var("POKI_LIVE_DECODE").as_deref() == Ok("off")
+}
+
 pub fn is_live_op(op: &str) -> bool {
     matches!(
         op,
@@ -56,7 +63,9 @@ async fn live(state: &State, timings: &mut Timings) -> Result<Live> {
         return Err(error);
     }
     let live = session.input.as_ref().expect("open").frames.live();
-    live.decode();
+    if !decode_off() {
+        live.decode();
+    }
     match live.error() {
         Some(error) => Err(error.into()),
         None => Ok(live),
@@ -73,11 +82,23 @@ pub async fn answer(
     let started = Instant::now();
     let mut timings = Timings::default();
     let work = async {
-        let live = live(state, &mut timings).await?;
+        let live = match live(state, &mut timings).await {
+            Ok(live) => live,
+            // No media session: a picture can still come from the screenshot service.
+            Err(error) if matches!(op, "latest_frame" | "wait_settled") => {
+                log(&format!(
+                    "{op}: media session not available ({error}); taking a screenshot"
+                ));
+                let mut answer = screenshot_picture(state, None, &object, "media_closed").await?;
+                answer["foreground"] = foreground_json(state);
+                return Ok(answer);
+            }
+            Err(error) => return Err(error),
+        };
         match op {
             "latest_frame" => {
                 let wait = number(&object, "wait_ms", 3000);
-                let mut answer = picture(&live, &object, wait).await?;
+                let mut answer = picture(state, &live, &object, wait).await?;
                 answer["tree"] = tree_summary(&state.prefetch, &live);
                 answer["foreground"] = foreground_json(state);
                 Ok(answer)
@@ -90,7 +111,7 @@ pub async fn answer(
                     .map_or_else(settle_time, Duration::from_millis);
                 let waiting = Instant::now();
                 let settled = live.wait_settled(settle, timeout).await;
-                let mut answer = picture(&live, &object, 0).await?;
+                let mut answer = picture(state, &live, &object, 0).await?;
                 answer["settled"] = settled.into();
                 answer["waited_ms"] = ms(waiting).into();
                 answer["tree"] = tree_summary(&state.prefetch, &live);
@@ -487,13 +508,169 @@ pub async fn resolve_foreground(state: Rc<State>) {
     }
 }
 
+/// Why the newest decoded picture should not be served, if it should not.
+fn video_unusable(live: &Live) -> Option<&'static str> {
+    if decode_off() {
+        return Some("decode_off");
+    }
+    let state = live.state(settle_time());
+    if state.stalled_since.is_some() {
+        Some("video_stalled")
+    } else if live.damaged() {
+        Some("picture_damaged")
+    } else if state.latest.is_none() {
+        Some("no_picture")
+    } else if !state.picture_current
+        && state
+            .latest
+            .is_some_and(|l| l.0.elapsed() > Duration::from_secs(1))
+    {
+        Some("decode_backlog")
+    } else {
+        None
+    }
+}
+
+/// One picture from the screenshot service on the held tunnel (about 0.8 s on an iPhone 17 Pro),
+/// as a JPEG answer shaped like a video one, with source=screenshot and why it was taken.
+async fn screenshot_picture(
+    state: &State,
+    live: Option<&Live>,
+    object: &Map<String, Value>,
+    reason: &str,
+) -> Result<Value> {
+    use idevice::dvt::{remote_server::RemoteServerClient, screenshot::ScreenshotClient};
+    let width = number(object, "max_width", 600).clamp(64, 4096) as u32;
+    let quality = number(object, "quality", 5).clamp(2, 31) as u32;
+    let requested = Instant::now();
+    let png = {
+        let mut session = state.session.lock().await;
+        session.last_used = Instant::now();
+        let shot = async {
+            session.connect(&mut Timings::default()).await?;
+            let link = session.link.as_mut().expect("connected");
+            let mut server =
+                RemoteServerClient::connect_rsd(&mut link.device.adapter, &mut link.device.rsd)
+                    .await?;
+            server.read_message(0).await?;
+            let png = ScreenshotClient::new(&mut server)
+                .await?
+                .take_screenshot()
+                .await?;
+            Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(png)
+        }
+        .await;
+        match shot {
+            Ok(png) => png,
+            Err(error) => {
+                session.recover().await;
+                return Err(format!("screenshot failed: {error}").into());
+            }
+        }
+    };
+    let received = Instant::now();
+    let wall = std::time::SystemTime::now();
+    let encoding = Instant::now();
+    let (jpeg, out_width, out_height, png_width, png_height) =
+        tokio::task::spawn_blocking(move || crate::libav::png_to_jpeg(&png, width, quality))
+            .await
+            .map_err(|e| e.to_string())??;
+    let encode_ms = encoding.elapsed().as_secs_f64() * 1000.0;
+    let ago = |at: Instant| at.elapsed().as_millis() as u64;
+    let state_now = live.map(|live| live.state(settle_time()));
+    let last_input = state_now.as_ref().and_then(|s| s.last_input);
+    let mut frame = match live {
+        Some(live) => live.identity(0, wall, png_width, png_height),
+        None => json!({
+            "generation": Value::Null,
+            "captured_at": stamp_at(wall),
+            "size": [png_width, png_height],
+            "orientation": if png_width > png_height { "landscape" } else { "portrait" },
+            "scale": Value::Null,
+        }),
+    };
+    frame["seq"] = Value::Null;
+    frame["source"] = "screenshot".into();
+    frame["damaged"] = false.into();
+    let mut answer = json!({
+        "source": "screenshot",
+        "fallback_reason": reason,
+        // Taken between the request and the reply; captured_at is the reply.
+        "captured_at": stamp_at(wall),
+        "age_ms": ago(received),
+        "screenshot_ms": received.duration_since(requested).as_millis() as u64,
+        "width": out_width,
+        "height": out_height,
+        "bytes": jpeg.len(),
+        "encode_ms": (encode_ms * 10.0).round() / 10.0,
+        "picture_after_input": last_input.map(|input| requested > input),
+        // The screenshot was asked for after the input: it shows the screen after it.
+        "observation": match last_input {
+            None => "no_input",
+            Some(input) if requested > input => "after_input",
+            Some(_) => "unverified",
+        },
+        "frame": frame,
+        "screen_change_verified": false,
+    });
+    if let Some(state) = state_now {
+        let extra = json!({
+            "settled": state.settled,
+            "quiet_ms": state.quiet_since.map(ago),
+            "latest_epoch": state.epoch,
+            "last_input_epoch": state.last_input_epoch,
+            "last_input_ms_ago": state.last_input.map(ago),
+            "changed_since_input": state.changed_since_input,
+            "units_since_input": state.last_input.map(|_| state.units_since_input),
+            "moving": state.moving,
+            "ms_since_unit": state.activity.map(|a| ago(a.at)),
+            "animating_region": crate::frames::animating_json(state.animating_region),
+            "video_stalled": state.stalled_since.is_some(),
+            "decoding": state.decoding,
+        });
+        if let (Value::Object(answer), Value::Object(extra)) = (&mut answer, extra) {
+            answer.extend(extra);
+        }
+    }
+    match object.get("path").and_then(Value::as_str) {
+        Some(path) => {
+            std::fs::write(path, &jpeg)?;
+            answer["path"] = path.into();
+        }
+        None => answer["jpeg_base64"] = base64(&jpeg).into(),
+    }
+    Ok(answer)
+}
+
 /// The newest picture and what the screen is doing, waiting up to `wait_ms` for a first picture.
-async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Result<Value> {
+/// `source`: "auto" (default) serves the decoded picture unless it is stalled, damaged, behind
+/// or missing, and takes a screenshot then; "video" never takes one; "screenshot" always does.
+async fn picture(
+    state: &State,
+    live: &Live,
+    object: &Map<String, Value>,
+    wait_ms: u64,
+) -> Result<Value> {
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    if source == "screenshot" {
+        return screenshot_picture(state, Some(live), object, "requested").await;
+    }
+    if source == "auto" && decode_off() {
+        return screenshot_picture(state, Some(live), object, "decode_off").await;
+    }
     let settle = settle_time();
-    if live.state(settle).latest.is_none() {
+    if live.state(settle).latest.is_none() && !decode_off() {
         let since = Instant::now() - Duration::from_secs(3600);
         live.wait_picture_after(since, Duration::from_millis(wait_ms.max(1)))
             .await;
+    }
+    if source == "auto"
+        && let Some(reason) = video_unusable(live)
+    {
+        return screenshot_picture(state, Some(live), object, reason).await;
     }
     let width = number(object, "max_width", 600).clamp(64, 4096) as u32;
     let quality = number(object, "quality", 5).clamp(2, 31) as u32;
@@ -584,6 +761,33 @@ pub const REOPEN_AFTER: Duration = Duration::from_secs(3);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoded picture is served only when it shows the screen; otherwise a screenshot is
+    /// taken, and why is said.
+    #[test]
+    fn a_missing_picture_is_a_reason_for_a_screenshot() {
+        let Some(screen) = crate::frames::fake::FakeScreen::start() else {
+            println!("skipped: no libavcodec");
+            return;
+        };
+        let Some(units) = crate::frames::fake::draw("unusable", "320x640", "null")
+            .and_then(|picture| crate::frames::fake::encode(&[picture]))
+        else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        if decode_off() {
+            assert_eq!(video_unusable(&screen.live), Some("decode_off"));
+            return;
+        }
+        assert_eq!(video_unusable(&screen.live), Some("no_picture"));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(screen.show(&units[0]));
+        assert_eq!(video_unusable(&screen.live), None);
+    }
 
     #[test]
     fn a_frame_is_after_an_input_only_when_its_number_is_newer() {

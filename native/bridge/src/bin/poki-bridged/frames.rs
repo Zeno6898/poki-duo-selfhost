@@ -666,6 +666,11 @@ impl Live {
         }
     }
 
+    /// A packet was lost since the last key unit: pictures may show errors.
+    pub fn damaged(&self) -> bool {
+        self.screen.lock().unwrap().damaged_since.is_some()
+    }
+
     /// Whether resynchronizing failed and the media session should be reopened; clears it.
     pub fn take_restart_request(&self) -> bool {
         std::mem::take(&mut self.screen.lock().unwrap().restart_requested)
