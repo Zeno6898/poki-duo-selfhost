@@ -223,7 +223,11 @@ Each answer is facts only: the app in front, numbered elements, what each action
   (up to 15 s): WDA serves every request on its main thread, so one slow read (a cold app's first
   tree, a keyboard coming up) makes the requests queued behind it time out too. A runner that answers
   the probe is busy, keeps its session and is not restarted; one that answers nothing is restarted.
-  (Found on the CI simulator, where the first tree after a launch or a keyboard took over 4 s.) A call that finds the runner `.starting` (restarting, or woken from idle by
+  (Found on the CI simulator, where the first tree after a launch or a keyboard took over 4 s.)
+- Each session sets WDA's `accessibilityDeadline` to 2 s: a tree read of an app whose event loop does
+  not answer in that time fails at once instead of holding WDA's main thread (and every request queued
+  behind it, screenshots and Home included) for half a minute. Seen on the simulator with the
+  keyboard's looping slide-to-type introduction. A call that finds the runner `.starting` (restarting, or woken from idle by
   the app) waits for it, checking every 250 ms for up to `runnerWait` (15 s) within its deadline, then
   goes on; a `.failed` runner is answered at once with its fix.
 - One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what

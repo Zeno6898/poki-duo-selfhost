@@ -91,7 +91,13 @@ public final class Runner: @unchecked Sendable {
     /// to `animationCoolOffTimeout` (2 s) and before each event until it is idle for up to
     /// `waitForIdleTimeout` (10 s); an app that never stops animating (a feed with videos) used all of
     /// both on every drag. Poki pauses briefly itself and the model reads the screen after.
-    static let sessionSettings: JSON = ["animationCoolOffTimeout": 0, "waitForIdleTimeout": 0.5]
+    ///
+    /// `accessibilityDeadline` (WDA #1210, off by default): before reading an app's tree WDA checks
+    /// that the app's event loop answers within this time, and fails the read if not. Without it a
+    /// read of an app that never goes idle (a looping animation over the keyboard on the simulator)
+    /// blocks WDA's main thread, and with it every request behind it, screenshots and Home included,
+    /// for half a minute.
+    static let sessionSettings: JSON = ["animationCoolOffTimeout": 0, "waitForIdleTimeout": 0.5, "accessibilityDeadline": 2]
 
     /// One request outside the session. `countsAsMiss: false` for a request that may rightly take long
     /// (a gesture): its timeout is not taken as a sign that the runner is gone.
