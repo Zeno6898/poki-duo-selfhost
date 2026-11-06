@@ -122,7 +122,8 @@ extension Computer {
             }
             // What the field holds now, so the model sees at once whether the text arrived whole.
             let reads = await fieldValue(timeout: min(1.5, max(0.3, until - now() - 0.2)))
-            let readBack = reads.map { hidden ? "; the field now holds \($0.count) characters" : "; the field now reads \"\($0.count > 200 ? String($0.prefix(190)) + "…" : $0)\"" } ?? ""
+            let readBack = reads.map { hidden ? "; the field now holds \($0.count) characters" : "; the field now reads \"\($0.count > 200 ? String($0.prefix(190)) + "…" : $0)\"" }
+                ?? "; the field could not be read back (no focused field answered in time), so check the elements or the picture"
             return ("type", "\(describe(action)) (\(via))\(readBack)")
         }
         if let key = action["key"]?.text {

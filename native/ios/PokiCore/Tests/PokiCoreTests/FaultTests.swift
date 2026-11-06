@@ -197,4 +197,34 @@ final class FaultTests: XCTestCase {
         _ = await core.call("look", [:])
         XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, 1, wda.sent.joined(separator: ", "))
     }
+
+    /// WDA serves requests one at a time, so a slow read makes the next ones time out too. That runner
+    /// is busy: it keeps its session and is not restarted while it still answers /status.
+    func testABusyRunnerIsNotRestartedWhileItStillAnswersStatus() async throws {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.3 }
+        core.runner.probeTimeout = 0.5
+        _ = await core.call("look", [:])
+        let slow: FakeWDA.Route = { _ in try await Task.sleep(nanoseconds: 2_000_000_000); return (200, ["value": .null]) }
+        for key in ["GET /source", "GET /screenshot", "GET /wda/activeAppInfo"] { wda.set(key, slow) }
+        let sessions = wda.sent.filter { $0 == "POST /session" }.count
+        _ = await core.call("look", [:])
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertEqual(host.restarts.value, 0, "a busy runner is left to finish")
+        XCTAssertGreaterThanOrEqual(wda.sent.filter { $0 == "GET /status" }.count, 1, "it was asked whether it is there")
+        wda.source([("Button", "General")])
+        for key in ["GET /screenshot", "GET /wda/activeAppInfo"] { wda.set(key) { _ in (200, ["value": .null]) } }
+        _ = await core.call("look", [:])
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, sessions, "the session is kept")
+    }
+
+    func testAWedgedRunnerThatAnswersNothingIsRestartedAfterTheProbe() async throws {
+        let (core, wda, host) = makeCore { $0.readTimeout = 0.3 }
+        core.runner.probeTimeout = 0.3
+        _ = await core.call("look", [:])
+        let stuck: FakeWDA.Route = { _ in try await Task.sleep(nanoseconds: 20_000_000_000); return (200, ["value": .null]) }
+        for key in ["GET /source", "GET /screenshot", "GET /wda/activeAppInfo", "GET /status"] { wda.set(key, stuck) }
+        _ = await core.call("look", [:])
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(host.restarts.value, 1, "no answer to /status either: the runner is started again")
+    }
 }

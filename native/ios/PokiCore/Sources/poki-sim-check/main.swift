@@ -57,8 +57,10 @@ func call(_ label: String, _ name: String, _ args: JSON = .object([:])) async ->
 _ = await rpc("initialize", ["protocolVersion": "2025-06-18", "capabilities": .object([:]), "clientInfo": ["name": "poki-sim-check", "version": "1"]])
 await call("look (cold: opens the session)", "look")
 let launched = await call("launch Settings fresh", "do", ["actions": [["launch": ["bundle": "com.apple.Preferences", "fresh": true]]]])
-check(launched.contains("app: Settings"), "Settings is in front after launch")
-await call("look (warm)", "look")
+// A cold app's first tree can take longer than a read waits on a CI simulator; the reply then says
+// so. What must hold: Settings is in front by the next look.
+let warm = await call("look (warm)", "look")
+check(launched.contains("app: Settings") || warm.contains("app: Settings"), "Settings is in front after launch")
 await call("look (warm, again)", "look")
 let swiped = await call("swipe up", "do", ["actions": [["swipe": "up"]]])
 check(swiped.contains("screen_changed: true"), "a swipe up scrolls Settings")
@@ -79,7 +81,7 @@ if let searchRef, let ref = Int(searchRef) {
     let typed = await call("type mixed text in search", "do", ["actions": [["type": .string(text), "ref": .number(Double(ref))]]])
     check(typed.contains("the field now reads \"\(text)\""), "typed text reads back exactly")
     let waited = await call("wait_until settled", "do", ["actions": [["wait_until": "settled"]]])
-    check(waited.contains("held still"), "wait_until settled")
+    check(waited.contains("wait_until: the screen held still"), "wait_until settled")
 } else {
     check(false, "Settings shows a search field")
 }

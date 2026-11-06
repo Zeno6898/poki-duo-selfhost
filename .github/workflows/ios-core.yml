@@ -114,6 +114,9 @@ jobs:
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
+          # A phone in use has long dismissed the keyboard's slide-to-type introduction; a fresh simulator
+          # shows it over the keyboard on the first field (as Appium does, set it as already shown).
+          xcrun simctl spawn "$UDID" defaults write com.apple.Preferences DidShowContinuousPathIntroduction -bool true
           xcrun simctl list devices | grep "$UDID"
       - name: Build WebDriverAgent for the simulator
         run: xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd build-for-testing -quiet

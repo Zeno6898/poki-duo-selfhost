@@ -215,8 +215,12 @@ Each answer is facts only: the app in front, numbered elements, what each action
   character, launches 8 s) and the whole tool call has `toolDeadline`.
 - At the deadline the tool answers anyway, saying which step did not finish and whether it may
   have been delivered, plus the last good read if any. A late runner answer is dropped.
-- Two runner timeouts in a row, or a refused connection, mark the runner unhealthy: PokiCore calls
-  `host.restartRunner()`. A call that finds the runner `.starting` (restarting, or woken from idle by
+- Two refused or broken runner requests in a row mark the runner unhealthy: PokiCore calls
+  `host.restartRunner()`. Two timeouts in a row only start a `GET /status` probe in the background
+  (up to 15 s): WDA serves every request on its main thread, so one slow read (a cold app's first
+  tree, a keyboard coming up) makes the requests queued behind it time out too. A runner that answers
+  the probe is busy, keeps its session and is not restarted; one that answers nothing is restarted.
+  (Found on the CI simulator, where the first tree after a launch or a keyboard took over 4 s.) A call that finds the runner `.starting` (restarting, or woken from idle by
   the app) waits for it, checking every 250 ms for up to `runnerWait` (15 s) within its deadline, then
   goes on; a `.failed` runner is answered at once with its fix.
 - One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what

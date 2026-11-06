@@ -13,6 +13,7 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
 
     init() {
         set("POST /session") { _ in (200, ["value": ["sessionId": "s1"]]) }
+        set("GET /status") { _ in (200, ["value": ["ready": true]]) }
         set("GET /wda/screen") { _ in (200, ["value": ["screenSize": ["width": 390, "height": 844]]]) }
         set("GET /screenshot") { _ in (200, ["value": .string(Data("png".utf8).base64EncodedString())]) }
         set("GET /wda/activeAppInfo") { _ in (200, ["value": ["bundleId": "com.apple.Preferences", "name": "Settings"]]) }
