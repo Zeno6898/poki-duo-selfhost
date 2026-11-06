@@ -43,7 +43,7 @@ pub fn enabled() -> bool {
 pub fn is_live_op(op: &str) -> bool {
     matches!(
         op,
-        "latest_frame" | "wait_settled" | "frame_diff" | "frames"
+        "latest_frame" | "wait_settled" | "frame_diff" | "frames" | "ocr_region" | "ocr_frame"
     )
 }
 
@@ -95,6 +95,7 @@ pub async fn answer(
                 answer["tree"] = tree_summary(&state.prefetch, &live);
                 Ok(answer)
             }
+            "ocr_region" | "ocr_frame" => read_text(&live, op, &object).await,
             "frame_diff" => {
                 let a = Duration::from_millis(number(&object, "a_ms_ago", 1000));
                 let b = Duration::from_millis(number(&object, "b_ms_ago", 0));
@@ -297,6 +298,58 @@ fn number(object: &Map<String, Value>, key: &str, default: u64) -> u64 {
     object.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+/// `ocr_region {box: [x, y, w, h] fractions, epoch?}` and `ocr_frame {epoch?}`: the text in the
+/// newest picture, read by the persistent OCR worker. With `epoch`, a picture at least that new is
+/// awaited for up to a second; `epoch` in the answer is the picture read, and `epoch_matches` says
+/// whether it is the one asked for (only the newest picture is kept).
+async fn read_text(live: &Live, op: &str, object: &Map<String, Value>) -> Result<Value> {
+    let region = match object.get("box") {
+        None | Some(Value::Null) if op == "ocr_frame" => None,
+        None | Some(Value::Null) => {
+            return Err("ocr_region needs box: [x, y, w, h] as fractions".into());
+        }
+        Some(value) => {
+            let numbers: Vec<f64> = value
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default();
+            let [x, y, w, h] = numbers[..] else {
+                return Err("box must be [x, y, w, h] as fractions of the screen".into());
+            };
+            if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) || w <= 0.0 || h <= 0.0 {
+                return Err("box must be [x, y, w, h] as fractions of the screen".into());
+            }
+            Some([x, y, w.min(1.0 - x), h.min(1.0 - y)])
+        }
+    };
+    let wanted = object.get("epoch").and_then(Value::as_u64);
+    if let Some(wanted) = wanted {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut watcher = live.watcher();
+        while live.state(settle_time()).epoch < wanted && Instant::now() < deadline {
+            watcher.mark_unchanged();
+            let _ = tokio::time::timeout_at(deadline.into(), watcher.changed()).await;
+        }
+    }
+    let ocr = crate::ocr::shared();
+    let started = Instant::now();
+    let (reading, picture) = ocr.read_live(live, region, Duration::from_secs(5)).await?;
+    let state = live.state(settle_time());
+    Ok(json!({
+        "text": reading.text(),
+        "elements": reading.json(),
+        "box": region,
+        "epoch": picture.epoch,
+        "epoch_matches": wanted.map(|wanted| wanted == picture.epoch),
+        "latest_epoch": state.epoch,
+        "captured_at": stamp_at(picture.wall),
+        "size": [picture.width, picture.height],
+        "settled": state.settled,
+        "ocr_ms": reading.ms,
+        "total_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
 /// The newest picture and what the screen is doing, waiting up to `wait_ms` for a first picture.
 async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Result<Value> {
     let settle = settle_time();
@@ -378,6 +431,120 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(&[0xff, 0xd8, 0xff, 0xe0]), "/9j/4A==");
+    }
+
+    /// AX-on-settle against a fake screen and a fake phone whose reads take 300 ms: a read starts
+    /// when the screen settles, a pixel change during it aborts it, the next settle starts a new
+    /// one, and only that one lands, marked current with the epoch it was asked at. A later
+    /// change makes it stale.
+    #[test]
+    fn a_read_the_screen_outran_is_dropped_and_redone_at_the_next_settle() {
+        use crate::frames::fake::{FakeScreen, draw, encode};
+        let pictures = [
+            draw(
+                "prefetch-a",
+                "302x656",
+                "drawbox=x=20:y=100:w=262:h=60:color=gray:t=fill",
+            ),
+            draw(
+                "prefetch-b",
+                "302x656",
+                "drawbox=x=20:y=400:w=262:h=120:color=black:t=fill",
+            ),
+        ];
+        let Some(pictures) = pictures.into_iter().collect::<Option<Vec<_>>>() else {
+            println!("skipped: ffmpeg cannot draw pictures here");
+            return;
+        };
+        let Some(units) = encode(&pictures) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        let Some(screen) = FakeScreen::start() else {
+            println!("skipped: no libavcodec");
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async {
+            let live = screen.live.clone();
+            let prefetch = Prefetcher::default();
+            let events = Rc::new(watch::channel(0u64).0);
+            let calls = Rc::new(std::cell::Cell::new(0u32));
+            let reader: TreeReader = {
+                let calls = calls.clone();
+                Rc::new(move || {
+                    calls.set(calls.get() + 1);
+                    let call = calls.get();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok(json!({"elements": [], "call": call}))
+                    })
+                })
+            };
+            let running = tokio::task::spawn_local({
+                let (live, prefetch, events, reader) = (
+                    live.clone(),
+                    prefetch.clone(),
+                    events.clone(),
+                    reader.clone(),
+                );
+                async move { prefetch_while_open(&live, &prefetch, &events, &reader).await }
+            });
+            let wait_for = async |what: &str, check: &dyn Fn() -> bool| {
+                let started = Instant::now();
+                while !check() {
+                    assert!(started.elapsed() < Duration::from_secs(3), "{what}");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            screen.show(&units[0]).await;
+            wait_for("a read starts on settle", &|| {
+                prefetch.borrow().pending.is_some()
+            })
+            .await;
+            assert_eq!(calls.get(), 1);
+            assert_eq!(tree_summary(&prefetch, &live)["pending"], json!(true));
+            // The screen moves while the phone is answering.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            screen.show(&units[1]).await;
+            let moved_epoch = live.state(settle_time()).epoch;
+            wait_for("the outrun read is dropped", &|| {
+                prefetch.borrow().dropped == 1
+            })
+            .await;
+            assert!(prefetch.borrow().ready.is_none());
+            // The next settle reads again, and that read lands.
+            let mut landed = events.subscribe();
+            tokio::time::timeout(Duration::from_secs(3), landed.changed())
+                .await
+                .expect("a tree lands")
+                .unwrap();
+            assert_eq!(calls.get(), 2);
+            {
+                let p = prefetch.borrow();
+                let read = p.ready.as_ref().expect("ready");
+                assert_eq!(read.tree["call"], json!(2));
+                assert_eq!(read.epoch, moved_epoch);
+                assert_eq!((p.reads, p.dropped), (1, 1));
+                let provenance = read.provenance(&live);
+                assert_eq!(provenance["current"], json!(true));
+                assert_eq!(provenance["request_epoch"], json!(moved_epoch));
+            }
+            let served = prefetched(&prefetch, &events, &live, Duration::ZERO).await;
+            assert_eq!(served.map(|r| r.tree["call"].clone()), Some(json!(2)));
+            // An input makes the tree stale; no read is served for the new screen until one lands.
+            live.note_input();
+            assert_eq!(tree_summary(&prefetch, &live)["current"], json!(false));
+            assert!(
+                prefetched(&prefetch, &events, &live, Duration::from_millis(50))
+                    .await
+                    .is_none_or(|r| r.tree["call"] != json!(2))
+            );
+            running.abort();
+        });
     }
 }
 
@@ -489,13 +656,16 @@ pub async fn prefetched(
     }
 }
 
+/// Reads the on-screen accessibility tree; a seam so tests can stand in for the phone.
+pub type TreeReader =
+    Rc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>>>>>;
+
 /// Runs for the daemon's life with live frames on: starts a read whenever the screen settles
 /// after a change or input and no current read exists, and drops reads the screen outran.
 pub async fn prefetch_loop(state: Rc<State>) {
     if std::env::var("POKI_LIVE_AX_PREFETCH").as_deref() == Ok("0") {
         return;
     }
-    let settle = settle_time();
     loop {
         let found = state.session.try_lock().ok().and_then(|session| {
             let live = session.input.as_ref()?.frames.live();
@@ -507,84 +677,101 @@ pub async fn prefetch_loop(state: Rc<State>) {
             tokio::time::sleep(Duration::from_millis(300)).await;
             continue;
         };
-        let mut watcher = live.watcher();
-        loop {
-            watcher.mark_unchanged();
-            let now = live.state(settle);
-            if now.closed {
-                break;
-            }
-            {
-                let mut p = state.prefetch.borrow_mut();
-                // The screen moved after the request: its answer would show the old screen.
-                if p.pending
-                    .as_ref()
-                    .is_some_and(|pending| !live.unchanged_since(pending.requested))
-                {
-                    let pending = p.pending.take().expect("checked");
-                    pending.task.abort();
-                    p.dropped += 1;
-                }
-                let current = p
-                    .ready
-                    .as_ref()
-                    .is_some_and(|r| live.unchanged_since(r.requested));
-                let failed_here = p.failed.is_some_and(|at| live.unchanged_since(at));
-                if now.settled
-                    && p.pending.is_none()
-                    && !current
-                    && !failed_here
-                    && now.latest.is_some()
-                {
-                    let requested = Instant::now();
-                    let wall = std::time::SystemTime::now();
-                    let epoch = now.epoch;
-                    let task = tokio::task::spawn_local(read_ahead(
-                        state.clone(),
-                        live.clone(),
-                        adapter.clone(),
-                        rsd.clone(),
-                        requested,
-                        wall,
-                        epoch,
-                    ));
-                    p.pending = Some(Pending {
-                        requested,
-                        wall,
-                        epoch,
-                        task,
-                    });
-                }
-            }
-            let wake = now
-                .quiet_since
-                .filter(|_| !now.settled)
-                .map(|at| tokio::time::Instant::from_std(at + settle));
-            let tick = tokio::time::Instant::now() + Duration::from_secs(2);
-            tokio::select! {
-                _ = watcher.changed() => {},
-                _ = tokio::time::sleep_until(wake.unwrap_or(tick).min(tick)) => {},
-            }
-        }
-        if let Some(pending) = state.prefetch.borrow_mut().pending.take() {
-            pending.task.abort();
-        }
+        let reader: TreeReader = Rc::new(move || {
+            let (mut adapter, rsd) = (adapter.clone(), rsd.clone());
+            Box::pin(async move {
+                crate::ax::read_tree_with_timeout(&mut adapter, &rsd, false, Duration::from_secs(4))
+                    .await
+            })
+        });
+        prefetch_while_open(&live, &state.prefetch, &state.prefetch_events, &reader).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 
+/// The prefetch for one media session, until its stream closes.
+pub async fn prefetch_while_open(
+    live: &Live,
+    prefetch: &Prefetcher,
+    events: &Rc<watch::Sender<u64>>,
+    reader: &TreeReader,
+) {
+    let settle = settle_time();
+    let mut watcher = live.watcher();
+    loop {
+        watcher.mark_unchanged();
+        let now = live.state(settle);
+        if now.closed {
+            break;
+        }
+        {
+            let mut p = prefetch.borrow_mut();
+            // The screen moved after the request: its answer would show the old screen.
+            if p.pending
+                .as_ref()
+                .is_some_and(|pending| !live.unchanged_since(pending.requested))
+            {
+                let pending = p.pending.take().expect("checked");
+                pending.task.abort();
+                p.dropped += 1;
+            }
+            let current = p
+                .ready
+                .as_ref()
+                .is_some_and(|r| live.unchanged_since(r.requested));
+            let failed_here = p.failed.is_some_and(|at| live.unchanged_since(at));
+            if now.settled
+                && p.pending.is_none()
+                && !current
+                && !failed_here
+                && now.latest.is_some()
+            {
+                let requested = Instant::now();
+                let wall = std::time::SystemTime::now();
+                let epoch = now.epoch;
+                let task = tokio::task::spawn_local(read_ahead(
+                    prefetch.clone(),
+                    events.clone(),
+                    live.clone(),
+                    reader(),
+                    requested,
+                    wall,
+                    epoch,
+                ));
+                p.pending = Some(Pending {
+                    requested,
+                    wall,
+                    epoch,
+                    task,
+                });
+            }
+        }
+        let wake = now
+            .quiet_since
+            .filter(|_| !now.settled)
+            .map(|at| tokio::time::Instant::from_std(at + settle));
+        let tick = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::select! {
+            _ = watcher.changed() => {},
+            _ = tokio::time::sleep_until(wake.unwrap_or(tick).min(tick)) => {},
+        }
+    }
+    if let Some(pending) = prefetch.borrow_mut().pending.take() {
+        pending.task.abort();
+    }
+}
+
 async fn read_ahead(
-    state: Rc<State>,
+    prefetch: Prefetcher,
+    events: Rc<watch::Sender<u64>>,
     live: Live,
-    mut adapter: idevice::tcp::handle::AdapterHandle,
-    rsd: idevice::rsd::RsdHandshake,
+    read: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>>>>,
     requested: Instant,
     wall: std::time::SystemTime,
     epoch: u64,
 ) {
-    let result =
-        crate::ax::read_tree_with_timeout(&mut adapter, &rsd, false, Duration::from_secs(4)).await;
-    let mut p = state.prefetch.borrow_mut();
+    let result = read.await;
+    let mut p = prefetch.borrow_mut();
     if p.pending
         .as_ref()
         .is_some_and(|pending| pending.requested == requested)
@@ -611,5 +798,5 @@ async fn read_ahead(
     p.generation += 1;
     let generation = p.generation;
     drop(p);
-    state.prefetch_events.send_replace(generation);
+    events.send_replace(generation);
 }

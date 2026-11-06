@@ -209,6 +209,11 @@ impl Drop for Frames {
 impl Frames {
     /// Reads the video socket; decoding starts at once when `decode` is set, or with `decode()`.
     pub fn new(socket: UdpSocketHandle, decode: bool) -> Self {
+        Self::over(socket, decode)
+    }
+
+    /// Frames from any datagram source (the media session's UDP socket, or a test's).
+    fn over<S: Datagrams>(socket: S, decode: bool) -> Self {
         let screen = Arc::new(Mutex::new(Screen::default()));
         let (jobs, queue) = mpsc::channel();
         let (notify, changed) = tokio::sync::watch::channel(0u64);
@@ -538,8 +543,29 @@ fn decoder_thread_cpu() -> Option<f64> {
     total
 }
 
-async fn receive(
-    socket: Arc<UdpSocketHandle>,
+/// Where RTP arrives and RTCP goes: the media session's UDP socket, or a test's fake.
+trait Datagrams: Send + Sync + 'static {
+    fn recv(&self) -> impl std::future::Future<Output = std::io::Result<Vec<u8>>> + Send;
+    fn send_to(
+        &self,
+        port: u16,
+        data: Vec<u8>,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+}
+
+impl Datagrams for UdpSocketHandle {
+    async fn recv(&self) -> std::io::Result<Vec<u8>> {
+        UdpSocketHandle::recv(self)
+            .await
+            .map(|datagram| datagram.data)
+    }
+    async fn send_to(&self, port: u16, data: Vec<u8>) -> std::io::Result<()> {
+        UdpSocketHandle::send_to(self, port, data).await
+    }
+}
+
+async fn receive<S: Datagrams>(
+    socket: Arc<S>,
     screen: Arc<Mutex<Screen>>,
     jobs: mpsc::Sender<Job>,
     decoder_ready: Arc<AtomicBool>,
@@ -557,7 +583,7 @@ async fn receive(
         .map_or(0x504f_4b49, |d| d.subsec_nanos() ^ 0x504f_4b49);
     while let Ok(datagram) = socket.recv().await {
         let now = Instant::now();
-        let data = &datagram.data;
+        let data = &datagram;
         if rtcp::is_rtcp(data) {
             screen.lock().unwrap().counters.rtcp += 1;
             continue;
@@ -603,6 +629,9 @@ async fn receive(
         }
         if gap && keyed {
             // A lost packet spoils the pictures that refer to it: start again at a key frame.
+            // The depacketizer too: it would hold everything after the hole, waiting for the lost
+            // packet, until 128 packets had piled up.
+            depacketizer = HevcDepacketizer::new();
             keyed = false;
             last_request = None;
             unit.clear();
@@ -845,8 +874,171 @@ mod tests {
         assert!(cpu_seconds("self").is_some_and(|s| s >= 0.0));
     }
 
+    /// A phone that is only a UDP queue: the test sends RTP in and sees the RTCP that goes out.
+    struct FakeSocket {
+        incoming: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+        sent: Mutex<Vec<(u16, Vec<u8>)>>,
+    }
+
+    impl Datagrams for Arc<FakeSocket> {
+        async fn recv(&self) -> std::io::Result<Vec<u8>> {
+            self.incoming
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("closed"))
+        }
+        async fn send_to(&self, port: u16, data: Vec<u8>) -> std::io::Result<()> {
+            self.sent.lock().unwrap().push((port, data));
+            Ok(())
+        }
+    }
+
+    /// RTP packets for one access unit as RFC 7798 sends it: small NAL units whole, large ones
+    /// as fragmentation units, the marker on the last packet.
+    fn packetize(unit: &[u8], seq: &mut u16, timestamp: u32) -> Vec<Vec<u8>> {
+        const MTU: usize = 1200;
+        let starts: Vec<usize> = nal_units(unit)
+            .map(|(at, _)| at)
+            .chain([unit.len()])
+            .collect();
+        let mut payloads = Vec::new();
+        for w in starts.windows(2) {
+            let mut nal = &unit[w[0]..w[1]];
+            while nal.first() == Some(&0) {
+                nal = &nal[1..];
+            }
+            let nal = &nal[1..]; // the 0x01 that ends the start code
+            if nal.len() <= MTU {
+                payloads.push(nal.to_vec());
+                continue;
+            }
+            let kind = (nal[0] >> 1) & 0x3f;
+            let header = [(nal[0] & 0x81) | (49 << 1), nal[1]];
+            let body = &nal[2..];
+            let chunks: Vec<&[u8]> = body.chunks(MTU).collect();
+            for (i, chunk) in chunks.iter().enumerate() {
+                let mut fu = kind;
+                if i == 0 {
+                    fu |= 0x80;
+                }
+                if i == chunks.len() - 1 {
+                    fu |= 0x40;
+                }
+                let mut payload = header.to_vec();
+                payload.push(fu);
+                payload.extend_from_slice(chunk);
+                payloads.push(payload);
+            }
+        }
+        let count = payloads.len();
+        payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                let mut packet = vec![0x80, 100 | if i == count - 1 { 0x80 } else { 0 }];
+                packet.extend_from_slice(&seq.to_be_bytes());
+                packet.extend_from_slice(&timestamp.to_be_bytes());
+                packet.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+                packet.extend_from_slice(&payload);
+                *seq = seq.wrapping_add(1);
+                packet
+            })
+            .collect()
+    }
+
+    /// The receive path from RTP datagrams to pictures, with a fake phone: nothing is decoded
+    /// before a key frame and a key frame is asked for over RTCP; a lost packet flushes, asks
+    /// again and skips to the next key frame; pictures resume there.
+    #[test]
+    fn rtp_becomes_pictures_and_a_lost_packet_waits_for_the_next_key_frame() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        // Key frames at units 0, 10 and 20.
+        let Some(units) = stream_with(30, "testsrc2=size=320x640:rate=30", 10) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        let key = |unit: &Vec<u8>| nal_units(unit).any(|(_, kind)| (16..=23).contains(&kind));
+        assert!(key(&units[0]) && key(&units[10]) && !key(&units[1]));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let socket = Arc::new(FakeSocket {
+                    incoming: tokio::sync::Mutex::new(rx),
+                    sent: Mutex::new(Vec::new()),
+                });
+                let frames = Frames::over(socket.clone(), true);
+                let live = frames.live();
+                let counters = |f: fn(&Counters) -> u64| f(&live.screen.lock().unwrap().counters);
+                // Let the decoder open, so key frame requests can go out.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let (mut seq, lost_one) = (1000u16, std::cell::Cell::new(false));
+                let mut send = async |index: usize, drop_middle: bool| {
+                    let packets = packetize(&units[index], &mut seq, index as u32 * 3000);
+                    let middle = packets.len() / 2;
+                    for (i, packet) in packets.into_iter().enumerate() {
+                        if drop_middle && i == middle && middle > 0 {
+                            lost_one.set(true);
+                            continue;
+                        }
+                        tx.send(packet).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                };
+                // Joining mid-stream: unit 5 is not a key frame.
+                send(5, false).await;
+                assert_eq!(counters(|c| c.decoded), 0, "nothing before a key frame");
+                let requests = |s: &FakeSocket| {
+                    s.sent
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(port, data)| *port == SENDER_VIDEO_PORT && rtcp::is_rtcp(data))
+                        .count()
+                };
+                assert_eq!(requests(&socket), 1, "a key frame is asked for");
+                for index in 10..15 {
+                    send(index, false).await;
+                }
+                assert_eq!(counters(|c| c.decoded), 5);
+                let epoch = live.state(Duration::from_millis(150)).epoch;
+                // A packet of unit 15 is lost: 15 to 19 refer to it and are skipped.
+                send(15, true).await;
+                assert!(lost_one.get());
+                for index in 16..20 {
+                    send(index, false).await;
+                }
+                assert_eq!(counters(|c| c.lost), 1);
+                assert_eq!(
+                    counters(|c| c.decoded),
+                    5,
+                    "nothing until the next key frame"
+                );
+                assert!(requests(&socket) >= 2, "a key frame is asked for again");
+                for index in 20..25 {
+                    send(index, false).await;
+                }
+                assert_eq!(counters(|c| c.decoded), 10);
+                assert!(live.state(Duration::from_millis(150)).epoch >= epoch + 5);
+                let latest = live.state(Duration::from_millis(150)).latest.unwrap();
+                assert_eq!((latest.2, latest.3), (320, 640));
+                drop(tx);
+            });
+    }
+
     /// An x265 stream like the phone's (no B-frames, delimiters), split into access units.
     fn stream(frames: u32, source: &str) -> Option<Vec<Vec<u8>>> {
+        stream_with(frames, source, 60)
+    }
+
+    fn stream_with(frames: u32, source: &str, keyint: u32) -> Option<Vec<Vec<u8>>> {
         let dir = std::env::temp_dir().join(format!("poki-frames-{}-{frames}", std::process::id()));
         std::fs::create_dir_all(&dir).ok()?;
         let file = dir.join("screen.hevc");
@@ -868,7 +1060,7 @@ mod tests {
                 "libx265",
                 "-x265-params",
             ])
-            .arg("bframes=0:keyint=60:aud=1:repeat-headers=1:log-level=none")
+            .arg(format!("bframes=0:keyint={keyint}:min-keyint={keyint}:scenecut=0:aud=1:repeat-headers=1:log-level=none"))
             .args(["-f", "hevc"])
             .arg(&file)
             .status();
@@ -986,5 +1178,139 @@ mod tests {
                 drop(jobs);
                 thread.join().unwrap();
             });
+    }
+}
+
+/// A screen fed with encoded pictures instead of the phone's stream, for tests of what reacts to
+/// the screen (prefetch, type_text's fast return). It runs the daemon's own decoder thread.
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+
+    pub struct FakeScreen {
+        pub live: Live,
+        jobs: mpsc::Sender<Job>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeScreen {
+        /// None without libavcodec.
+        pub fn start() -> Option<Self> {
+            libav::available().ok()?;
+            let screen = Arc::new(Mutex::new(Screen {
+                decoding_since: Some(Instant::now()),
+                ..Screen::default()
+            }));
+            let (jobs, queue) = mpsc::channel();
+            let (notify, changed) = tokio::sync::watch::channel(0u64);
+            let notify = Arc::new(notify);
+            let thread = {
+                let (screen, notify) = (screen.clone(), notify.clone());
+                let ready = Arc::new(AtomicBool::new(false));
+                std::thread::Builder::new()
+                    .name("poki-frames".into())
+                    .spawn(move || decode_loop(queue, screen, notify, ready))
+                    .ok()?
+            };
+            Some(Self {
+                live: Live {
+                    screen,
+                    jobs: jobs.clone(),
+                    changed,
+                    notify,
+                },
+                jobs,
+                thread: Some(thread),
+            })
+        }
+
+        /// Sends one access unit and waits for its picture.
+        pub async fn show(&self, unit: &[u8]) {
+            let before = self.live.screen.lock().unwrap().counters.decoded;
+            let sent = Instant::now();
+            self.jobs.send(Job::Unit(unit.to_vec(), sent)).unwrap();
+            while self.live.screen.lock().unwrap().counters.decoded == before {
+                assert!(sent.elapsed() < Duration::from_secs(2), "no picture");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    impl Drop for FakeScreen {
+        fn drop(&mut self) {
+            // The decoder thread ends once every Live clone is gone.
+            self.live.screen.lock().unwrap().closed = true;
+            self.thread.take();
+        }
+    }
+
+    /// A picture drawn by ffmpeg: a white `size` screen with the `draw` filters on it. None without
+    /// ffmpeg (or its drawtext).
+    pub fn draw(name: &str, size: &str, draw: &str) -> Option<std::path::PathBuf> {
+        let path =
+            std::env::temp_dir().join(format!("poki-fake-{}-{name}.png", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("color=c=white:s={size}"))
+            .args(["-vf", draw, "-frames:v", "1"])
+            .arg(&path)
+            .status();
+        made.is_ok_and(|s| s.success()).then_some(path)
+    }
+
+    /// The pictures as an HEVC stream like the phone's, one access unit per picture. None
+    /// without ffmpeg and libx265.
+    pub fn encode(pictures: &[std::path::PathBuf]) -> Option<Vec<Vec<u8>>> {
+        let dir = std::env::temp_dir().join(format!(
+            "poki-fake-{}-{}",
+            std::process::id(),
+            pictures.len()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        for (i, picture) in pictures.iter().enumerate() {
+            std::fs::copy(picture, dir.join(format!("{i:03}.png"))).ok()?;
+        }
+        let file = dir.join("screen.hevc");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-framerate",
+                "30",
+                "-i",
+            ])
+            .arg(dir.join("%03d.png"))
+            .args(["-c:v", "libx265", "-pix_fmt", "yuv420p", "-x265-params"])
+            .arg("bframes=0:keyint=1:aud=1:repeat-headers=1:log-level=none")
+            .args(["-f", "hevc"])
+            .arg(&file)
+            .status();
+        let stream = std::fs::read(&file).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        if !made.is_ok_and(|s| s.success()) {
+            return None;
+        }
+        let stream = stream?;
+        let starts: Vec<usize> = nal_units(&stream)
+            .filter(|(_, kind)| *kind == 35)
+            .map(|(at, _)| at)
+            .chain([stream.len()])
+            .collect();
+        Some(
+            starts
+                .windows(2)
+                .map(|w| stream[w[0]..w[1]].to_vec())
+                .collect(),
+        )
     }
 }

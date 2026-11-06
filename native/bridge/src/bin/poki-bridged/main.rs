@@ -28,6 +28,8 @@ mod ax {
 mod frames;
 #[path = "libav.rs"]
 mod libav;
+#[path = "ocr.rs"]
+mod ocr;
 
 #[path = "../.."]
 mod src {
