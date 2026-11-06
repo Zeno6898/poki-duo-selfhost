@@ -156,6 +156,11 @@ struct State {
     prefetch_events: Rc<watch::Sender<u64>>,
     /// The foreground app from the newest tree, and app_for_pid answers (see live::Foreground).
     foreground: live::ForegroundCell,
+    lane: Lane,
+    /// Inputs running now (see InputRunning): reads on the lane wait for them.
+    inputs_running: Rc<std::cell::Cell<u32>>,
+    /// The media session's view, for live ops while another op holds the session.
+    live_view: std::cell::RefCell<Option<crate::frames::Live>>,
     /// Locked or awake, from SpringBoard's notifications (see device_state).
     device: lock_state::DeviceCell,
     /// Every accessibility read goes through it (see ax_gate).
@@ -163,6 +168,15 @@ struct State {
 }
 
 impl State {
+    /// The held tunnel's handles for a read, when there is a tunnel and no input runs (inputs
+    /// still go one at a time against everything).
+    pub fn read_lane(&self) -> Option<(AdapterHandle, RsdHandshake)> {
+        if self.inputs_running.get() > 0 {
+            return None;
+        }
+        self.lane.borrow().clone()
+    }
+
     fn new(target: Target) -> Self {
         let prefetch = live::Prefetcher::default();
         let prefetch_events = Rc::new(watch::channel(0).0);
@@ -171,8 +185,12 @@ impl State {
         let mut session = Session::new(target, prefetch.clone(), prefetch_events.clone());
         session.foreground = foreground.clone();
         session.ax_gate = ax_gate.clone();
+        let lane = session.lane.clone();
         Self {
             session: Mutex::new(session),
+            lane,
+            inputs_running: Default::default(),
+            live_view: Default::default(),
             prefetch,
             prefetch_events,
             foreground,
@@ -258,6 +276,7 @@ async fn reap(state: Rc<State>) {
                 session.ax = None;
                 session.ax_link = None;
                 session.link = None;
+                *session.lane.borrow_mut() = None;
                 session.tunnel_down = Some(TunnelDown {
                     state: "error",
                     since: std::time::SystemTime::now(),
@@ -519,18 +538,14 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 // What observe needs to know before trusting a picture.
                 let mut reasons = Vec::new();
                 let frames = &pong["frames"];
-                if frames["video_stalled"] == json!(true) {
+                if frames["media_silent"] == json!(true) {
+                    // Nothing comes from the phone: the media session is gone (a reopen is asked).
+                    reasons.push("media_silent");
+                } else if frames["video_stalled"] == json!(true) {
                     reasons.push("video_stalled");
-                } else if frames["latest_age_ms"]
-                    .as_u64()
-                    .is_some_and(|age| age > 1000)
-                    && frames["ms_since_last_packet"]
-                        .as_u64()
-                        .is_some_and(|ms| ms < 500)
-                {
-                    // Units arrive but the newest picture is old: decoding is behind.
-                    reasons.push("decode_backlog");
                 }
+                // A backlog under the stall time is not a reason: it drains on its own, and
+                // latest_frame waits for it (backlog_ms says how far behind).
                 if frames["picture_damaged"] == json!(true) {
                     // A packet was lost: pictures may show errors until the session reopens.
                     reasons.push("picture_damaged");
@@ -658,10 +673,39 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
         }
         _ => {}
     }
+    if let Ok(request) = parse(&object)
+        && on_lane(&request)
+        && let Some((mut adapter, mut rsd)) = state.read_lane()
+    {
+        let mut timings = Timings {
+            reused_tunnel: true,
+            ..Timings::default()
+        };
+        let outcome = tokio::select! {
+            outcome = tokio::time::timeout(Duration::from_secs(30), lane_op(&mut adapter, &mut rsd, request)) => outcome,
+            _ = closed.wait_for(|closed| *closed) => {
+                log(&format!("{op}: client left; cancelled"));
+                return None;
+            }
+        };
+        let result = outcome.unwrap_or_else(|elapsed| Err(elapsed.into()));
+        timings.total_ms = ms(started);
+        log(&format!(
+            "{op}: {} in {} ms (lane)",
+            if result.is_ok() { "ok" } else { "error" },
+            timings.total_ms
+        ));
+        return Some(match result {
+            Ok(output) => success(id, &output, timings),
+            Err(error) => failure(id, &*error, timings),
+        });
+    }
+    let read = parse(&object).is_ok_and(|request| reads_only(&request));
     let mut session = tokio::select! {
         session = state.session.lock() => session,
         _ = closed.wait_for(|closed| *closed) => return None,
     };
+    let _input = (!read).then(|| InputRunning::new(&state.inputs_running));
     let mut timings = Timings::default();
     let limit = Duration::from_secs(if op == "install_app" { 180 } else { 90 });
     let outcome = tokio::select! {
@@ -674,7 +718,10 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     let result = match outcome {
         None => {
             log(&format!("{op}: client left; cancelled"));
-            session.recover().await;
+            // Not a device failure: only what the op may have left half-used goes. A full
+            // recover here closed the media session and probed the tunnel for 5 s (Nov 6:
+            // "client left" at 07:22:55.9, "tunnel lost" at 07:23:00.8, video never back).
+            session.cancelled(read).await;
             return None;
         }
         Some(Err(elapsed)) => {
@@ -753,7 +800,13 @@ struct Session {
     tunnel_down: Option<TunnelDown>,
     tunnels_opened: u64,
     tunnels_lost: u64,
+    lane: Lane,
 }
+
+/// A copy of the held tunnel's handles: reads that need only the tunnel (a screenshot, an
+/// app_for_pid) run on it without waiting for the session, which an accessibility read holds
+/// for over a second (Nov 6: a screenshot beside an AX read took 7.1 s instead of 0.8 s).
+pub type Lane = Rc<std::cell::RefCell<Option<(AdapterHandle, RsdHandshake)>>>;
 
 /// No tunnel, and why: what health reports and what a failing op says.
 #[derive(Clone)]
@@ -840,6 +893,45 @@ fn reads_only(request: &Request) -> bool {
     }
 }
 
+/// Reads that need only the tunnel: they run on the lane, beside whatever op holds the session.
+fn on_lane(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Screenshot { .. } | Request::AppForPid { .. } | Request::LockdownGet { .. }
+    )
+}
+
+async fn lane_op(
+    adapter: &mut AdapterHandle,
+    rsd: &mut RsdHandshake,
+    request: Request,
+) -> Result<Value> {
+    match request {
+        Request::Screenshot { path } => device_ops::screenshot(adapter, rsd, &path).await,
+        Request::AppForPid { pid } => apps::app_for_pid(adapter, rsd, pid).await,
+        Request::LockdownGet { domain, key } => {
+            device_ops::lockdown_get(adapter, rsd, domain.as_deref(), &key).await
+        }
+        _ => Err("not a lane op".into()),
+    }
+}
+
+/// Counts the ops that may change the screen while they run: reads wait for them.
+struct InputRunning(Rc<std::cell::Cell<u32>>);
+
+impl InputRunning {
+    fn new(count: &Rc<std::cell::Cell<u32>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for InputRunning {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 /// The ops `tunnel_op` runs on the held tunnel.
 fn on_tunnel(request: &Request) -> bool {
     matches!(
@@ -895,6 +987,7 @@ impl Session {
             input_opened_at: None,
             ax_gate: ax_gate::AxGateCell::default(),
             foreground: live::ForegroundCell::default(),
+            lane: Lane::default(),
         }
     }
 
@@ -915,6 +1008,7 @@ impl Session {
         self.ax = None;
         self.ax_link = None;
         self.link = None;
+        *self.lane.borrow_mut() = None;
     }
 
     async fn connect(&mut self, timings: &mut Timings) -> Result<()> {
@@ -956,6 +1050,7 @@ impl Session {
             ));
         }
         self.tunnels_opened += 1;
+        *self.lane.borrow_mut() = Some((device.adapter.clone(), device.rsd.clone()));
         self.link = Some(Link { device });
         Ok(())
     }
@@ -994,7 +1089,20 @@ impl Session {
         if self.link.is_some() && !self.tunnel_alive().await {
             log("tunnel lost");
             self.tunnels_lost += 1;
+            self.foreground.borrow_mut().lost_at = Some(Instant::now());
             self.link = None;
+            *self.lane.borrow_mut() = None;
+        }
+    }
+
+    /// After an op cancelled midway: accessibility state goes (its connection may be mid
+    /// message), and the input connections too when the op used them. The tunnel and, for a
+    /// read, the media session stay.
+    async fn cancelled(&mut self, read: bool) {
+        self.ax = None;
+        self.ax_link = None;
+        if !read {
+            self.close_input().await;
         }
     }
 
