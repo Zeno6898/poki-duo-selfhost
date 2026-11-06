@@ -403,7 +403,7 @@ export class Devices {
           let prompt;
           try { prompt = { status:'checked', source:'ocr', warning:promptWarning(await this.ocr(frame)) }; }
           catch (error) { if (stopped(error)) throw error; prompt = { status:'unavailable', instruction:'Inspect the screenshot for system prompts before continuing.' }; }
-          return { content: [...text({ observation: this.observation(frame) }).content, { type: 'text', text: `Screen: ${frame.width} × ${frame.height} points. Image width: ${width} pixels. Coordinates for tools are screen points. Source: lossless device capture.\nPrompt check: ${JSON.stringify(prompt)}` }, { type:'image',data:jpeg.toString('base64'),mimeType:'image/jpeg' }] };
+          return { content: [...text({ observation: this.observation(frame) }).content, { type: 'text', text: `Screen: ${frame.width} × ${frame.height} points. Image width: ${width} pixels. Coordinates for tools are screen points. Source: lossless device capture. Captured through the developer screenshot service; not saved to the device's Photos library.\nPrompt check: ${JSON.stringify(prompt)}` }, { type:'image',data:jpeg.toString('base64'),mimeType:'image/jpeg' }] };
         }
         case 'save_screenshot': {
           let path = args.path ?? join(homedir(), 'Pictures', 'Poki MCP');

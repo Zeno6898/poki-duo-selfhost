@@ -87,3 +87,9 @@ test('launch_app on a phone ends with the screen, says when the app resumed, and
  assert.equal(fresh.resumed,false);
  assert.equal((await f.events()).filter(e=>e.op==='launch_app').at(-1).request.terminate_existing,true);
 });
+
+test('a screenshot says it was not saved to the device Photos library', { timeout: 30000 }, async t => {
+ const f=await fixture(t);
+ const shot=await f.call('take_screenshot');
+ assert.ok(shot.content.some(c=>c.type==='text'&&/not saved to the device's Photos library/.test(c.text)));
+});
