@@ -7,7 +7,7 @@
 // single-step tools, sent through Devices.dispatch, so they keep their arguments and their checks.
 // Nothing here knows any app.
 import { randomUUID } from 'node:crypto';
-import { matching } from './interaction.mjs';
+import { matching, whatMoved } from './interaction.mjs';
 import { compare } from './world.mjs';
 import { checkWork, stopped, stoppingReason } from './work.mjs';
 
@@ -97,7 +97,7 @@ const treeKey = view => view.tree === 'current' ? JSON.stringify(view.lines) : u
 async function baseOf(world) {
   const frame = world.lastFrame && world.lastFrame.epoch === world.epoch ? world.lastFrame : await world.current();
   const tree = world.tree?.epoch === frame.epoch ? world.tree : undefined;
-  return { frame, foreground: tree?.foreground?.pid ?? null, key: tree ? JSON.stringify(world.view(frame, { elements: tree.elements, foreground: tree.foreground }).lines) : undefined, page: tree ? world.view(frame, { elements: tree.elements, foreground: tree.foreground }).page?.id : undefined };
+  return { frame, elements: tree?.elements, foreground: tree?.foreground?.pid ?? null, key: tree ? JSON.stringify(world.view(frame, { elements: tree.elements, foreground: tree.foreground }).lines) : undefined, page: tree ? world.view(frame, { elements: tree.elements, foreground: tree.foreground }).page?.id : undefined };
 }
 
 // Waits for the screen after an input: until the expectation holds on a settled frame, the screen
@@ -281,6 +281,8 @@ export async function act(ctx, args) {
   const body = {
     sent, ...(args.expect ? { expectation: judged.expectation } : {}), waited_ms: sentMs ? Math.max(0, Date.now() - sentMs) : 0,
     ...(answer.isError ? { error: answer.message ?? answer.error ?? 'The step failed.' } : {}),
+    // Which list a scroll moved, from the trees read for the frames on either side of it.
+    ...(/^scroll/.test(args.action.tool) && base.elements && judged.view.tree === 'current' ? { moved: whatMoved(base.elements, judged.view.elements) } : {}),
     ...(answer.outcome === 'unknown' ? { delivery: 'unknown', instruction: 'The input may have been delivered. Do not send it again before checking now.' } : {}),
     now,
   };

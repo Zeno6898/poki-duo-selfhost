@@ -320,7 +320,7 @@
     },
     {
       "name": "scroll",
-      "description": "Scroll up, down, left, or right around x/y, or the screen center when omitted. Coordinates use logical points. Waits for the list to stop, then returns screen_change (unchanged means it did not move, as at the end of a list; unknown means it could not be compared) and the visible text, so there is no need to look again. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Scroll up, down, left, or right around x/y, inside the element named by container, or around the screen center when neither is given. Coordinates use logical points. pages moves exactly that many pages of the container (or the screen) and holds before lifting, so the list does not coast past items: use it for carousels and horizontal lists. Waits for the list to stop, then returns screen_change (unchanged means it did not move, as at the end of a list; unknown means it could not be compared), moved (the container whose items shifted, and by how much) and the visible text, so there is no need to look again. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -345,6 +345,15 @@
             "type": "number",
             "minimum": -1000000,
             "maximum": 1000000
+          },
+          "container": {
+            "type": "string",
+            "description": "Visible label of the scrolling list or row itself."
+          },
+          "pages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
           }
         },
         "required": [
@@ -354,7 +363,7 @@
     },
     {
       "name": "scroll_to",
-      "description": "Search for visible text and scroll until it is found, content stops changing, or max_scrolls is reached. The default limit is ten scrolls and at most 50 are made; missing text is an error. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Search for visible text and scroll until it is found, content stops changing, or max_scrolls is reached. container (the label of the scrolling list) or x/y says which list to scroll; left and right move one page at a time without coasting, so items in a carousel are not skipped. The result names the container that moved. The default limit is ten scrolls and at most 50 are made; missing text is an error. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -386,6 +395,10 @@
             "type": "number",
             "minimum": -1000000,
             "maximum": 1000000
+          },
+          "container": {
+            "type": "string",
+            "description": "Visible label of the scrolling list or row itself."
           }
         },
         "required": [

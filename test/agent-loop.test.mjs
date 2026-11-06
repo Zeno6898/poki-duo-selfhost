@@ -10,11 +10,13 @@ const W = 200, H = 400;
 const el = (role, label, x, y, width, height, extra = {}) => ({ role, label, x, y, width, height, ...extra });
 
 class LedgerApp {
-  page = 'home'; entries = ['Coffee 4.50', 'Rent 1200', 'Book 18', 'Lunch 12', 'Taxi 22']; selected = new Set(); selecting = false; sheet = false;
+  page = 'home'; entries = ['Coffee 4.50', 'Rent 1200', 'Book 18', 'Lunch 12', 'Taxi 22']; selected = new Set(); selecting = false; sheet = false; offset = 0;
   constructor({ axLag = 0 } = {}) { this.axLag = axLag; this.lagged = 0; this.previous = undefined; }
   screen() {
     if (this.page === 'home') return { foreground: springboard, elements: [el('Icon', 'Ledger', 20, 80, 50, 50), el('Icon', 'Clock', 90, 80, 50, 50)] };
-    if (this.page === 'accounts') return { foreground: ledger, elements: [el('StaticText', 'Accounts', 10, 40, 100, 20), el('Button', 'Entries', 10, 100, 180, 40), el('Button', 'Settings', 10, 150, 180, 40)] };
+    if (this.page === 'accounts') return { foreground: ledger, elements: [el('StaticText', 'Accounts', 10, 40, 100, 20), el('Button', 'Entries', 10, 100, 180, 40), el('Button', 'Settings', 10, 150, 180, 40),
+      // A sideways row of chips that pages under a drag.
+      el('CollectionView', 'Recent', 0, 200, 200, 60), ...[1, 2, 3, 4, 5, 6].map(n => el('Cell', `Chip ${n}`, 10 + (n - 1) * 70 + this.offset, 210, 60, 40)).filter(e => e.x < W && e.x + e.width > 0)] };
     const elements = [el('Button', 'Back', 5, 40, 30, 20), el('StaticText', 'Entries', 60, 40, 80, 20), el('Button', this.selecting ? 'Done' : 'Select', 150, 40, 45, 20),
       ...this.entries.map((entry, i) => el('Cell', entry, 10, 80 + i * 44, 180, 40, { selected: this.selected.has(entry) }))];
     if (this.selecting) elements.push(el('Button', 'Delete', 60, 360, 80, 30));
@@ -56,12 +58,18 @@ class LedgerApp {
 // The real Devices with the phone replaced by the app above: dispatch, the single-step tools, the
 // World and the new tools all run as they do against a device.
 class LedgerPhone extends Devices {
-  constructor(options = {}) { super(); this.app = new LedgerApp(options); this.size = { device: 'phone-1', width: W, height: H }; this.live = options.live; }
+  constructor(options = {}) { super(); this.app = new LedgerApp(options); this.size = { device: 'phone-1', width: W, height: H }; this.live = options.live; this.drags = []; }
   async inventory() { return [{ id: 'phone-1', kind: 'physical', name: 'Test Phone', state: 'Booted' }]; }
   liveScreen() { return this.live?.(this); }
   async bridge(request) {
     if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
     if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
+    if (request.op === 'drag') {
+      this.drags.push(request);
+      const [x1, y1, x2] = [request.x1 / 65535 * (W - 1), request.y1 / 65535 * (H - 1), request.x2 / 65535 * (W - 1)];
+      if (this.app.page === 'accounts' && y1 >= 200 && y1 <= 260) { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.offset = Math.max(-280, Math.min(0, this.app.offset + Math.round(x2 - x1))); }
+      return { sent: true, screen_change_verified: false };
+    }
     if (request.op === 'tap') { this.app.touch(request.x / 65535 * (W - 1), request.y / 65535 * (H - 1)); return { sent: true, screen_change_verified: false }; }
     return { sent: true, screen_change_verified: false };
   }
@@ -249,4 +257,36 @@ test('a lost device connection blocks inputs and says why', { timeout: 30000 }, 
   assert.equal(phone.app.page, 'home');
   reasons = [];
   assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } })).sent, true);
+});
+
+test('a one-page scroll inside a named row moves only that row, without coasting, and says which container moved', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  await phone.call('run', { steps: [{ tool: 'launch_app', arguments: { bundle_id: 'local.ledger' } }] });
+  await phone.call('observe', {});
+  const result = body(await phone.call('act', { action: { tool: 'scroll', arguments: { direction: 'right', container: 'Recent', pages: 1 } }, expect: { text: 'Chip 4' } }));
+  const drag = phone.drags.at(-1);
+  assert.ok(drag.end_hold_ms > 0, 'held before lifting, so the row does not coast');
+  const y = drag.y1 / 65535 * (H - 1);
+  assert.ok(y >= 200 && y <= 260, `dragged inside the row, at y ${y}`);
+  assert.ok(drag.x1 > drag.x2, 'the finger moves left to reveal what is to the right');
+  assert.equal(result.expectation, 'met');
+  assert.equal(result.moved.container, 'Recent');
+  assert.ok(result.moved.shift.x < -100 && result.moved.shift.y === 0, JSON.stringify(result.moved));
+  // The single-step tool says the same.
+  const raw = await phone.call('scroll', { direction: 'left', container: 'Recent', pages: 1 });
+  const single = JSON.parse(raw.content[0].text);
+  assert.equal(single.moved.container, 'Recent');
+  assert.ok(single.moved.shift.x > 100);
+  const found = JSON.parse((await phone.call('scroll_to', { text: 'Chip 6', direction: 'right', container: 'Recent' })).content[0].text);
+  assert.equal(found.found, true);
+  assert.ok(phone.drags.at(-1).end_hold_ms > 0, 'scroll_to pages sideways lists');
+});
+
+test('whatMoved names the container whose items shifted together', async () => {
+  const { whatMoved } = await import('../src/interaction.mjs');
+  const row = el('CollectionView', 'Media Types', 0, 300, 390, 120);
+  const before = [row, el('StaticText', 'Header', 10, 40, 100, 20), el('Cell', 'Videos', 10, 310, 100, 100), el('Cell', 'Selfies', 120, 310, 100, 100), el('Cell', 'Live', 230, 310, 100, 100)];
+  const after = [row, el('StaticText', 'Header', 10, 40, 100, 20), el('Cell', 'Selfies', 10, 310, 100, 100), el('Cell', 'Live', 120, 310, 100, 100), el('Cell', 'Portrait', 230, 310, 100, 100)];
+  assert.deepEqual(whatMoved(before, after), { container: 'Media Types', frame: [0, 300, 390, 120], shift: { x: -110, y: 0 }, items_moved: 2, appeared: 1 });
+  assert.equal(whatMoved(before, before), null);
 });
