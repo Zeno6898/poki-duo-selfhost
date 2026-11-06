@@ -238,6 +238,9 @@ Each answer is facts only: the app in front, numbered elements, what each action
   SpringBoard's transition animation runs at full length. 8 s is a ceiling, not a wait: on the
   simulator Home answered in 0.6 to 2.9 s.
 
+- One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what
+  the first is doing.
+
 ### Measured on the CI simulator (run 42258166342)
 
 iOS simulator on a GitHub macos-15 runner, WebDriverAgent 16.15.3, Settings. One run, every check
@@ -261,9 +264,6 @@ Floor against the budget (look under 1.5 s; a do step under 1 s plus settle): a 
 swipe or drag (its synthesised touch runs its full duration on the main thread), before the settle
 pause and the read. The first read after a keyboard or a cold launch is over 4 s on the simulator
 and falls back to the picture.
-
-- One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what
-  the first is doing.
 
 ### Sensitive actions
 
