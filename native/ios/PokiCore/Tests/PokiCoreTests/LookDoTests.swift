@@ -93,7 +93,7 @@ final class LookDoTests: XCTestCase {
 
     func testASlowGestureIsNotTakenAsTheRunnerBeingGone() async {
         let (core, wda, host) = makeCore { $0.actionCap = 1.2 }
-        wda.set("POST /wda/pressAndDragWithVelocity") { _ in await hang() }
+        wda.set("POST /wda/pressAndDragWithVelocity") { _ in try await Task.sleep(nanoseconds: 30_000_000_000); return (200, ["value": .null]) }
         _ = await core.call("look", [:])
         for _ in 0..<2 {
             let result = await core.call("do", ["actions": [["swipe": "up"], ["tap": 1]]])
@@ -259,7 +259,13 @@ final class TextRecognitionTests: XCTestCase {
         let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(destination, image, nil)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
-        let found = try XCTUnwrap(TextRecognizer.recognize(png: data as Data))
+        // On a thread of its own with a limit, so a Vision that never answers fails the test instead of the run.
+        let png = data as Data
+        let box = LockedBox<[RecognizedText]??>(nil)
+        let done = DispatchSemaphore(value: 0)
+        Thread { box.value = .some(TextRecognizer.recognize(png: png)); done.signal() }.start()
+        XCTAssertEqual(done.wait(timeout: .now() + 60), .success, "Vision did not answer within 60 s")
+        let found = try XCTUnwrap(box.value ?? nil)
         let line = try XCTUnwrap(found.first { $0.text.contains("13") }, "\(found)")
         XCTAssertLessThan(line.box.y, 0.5, "the box is measured from the top: \(line.box)")
     }
