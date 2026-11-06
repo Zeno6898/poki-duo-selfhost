@@ -184,6 +184,30 @@ impl Drop for Picture {
     }
 }
 
+/// How much decoding work to spend per picture.
+#[derive(Clone, Debug)]
+pub struct Tuning {
+    pub threads: u32,
+    pub skip_loop_filter: bool,
+    pub fast: bool,
+}
+
+impl Tuning {
+    /// POKI_LIVE_DECODE_THREADS (default 3), POKI_LIVE_LOOP_FILTER=1 keeps the loop filter,
+    /// POKI_LIVE_DECODE_FAST=0 turns flags2 +fast off.
+    pub fn from_env() -> Self {
+        Self {
+            threads: std::env::var("POKI_LIVE_DECODE_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+                .clamp(1, 16),
+            skip_loop_filter: std::env::var("POKI_LIVE_LOOP_FILTER").as_deref() != Ok("1"),
+            fast: std::env::var("POKI_LIVE_DECODE_FAST").as_deref() != Ok("0"),
+        }
+    }
+}
+
 /// An HEVC decoder that returns every picture as soon as its access unit is in.
 pub struct Decoder {
     context: P,
@@ -193,6 +217,10 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn hevc() -> Result<Self, String> {
+        Self::hevc_with(&Tuning::from_env())
+    }
+
+    pub fn hevc_with(tuning: &Tuning) -> Result<Self, String> {
         let api = api()?;
         let name = CString::new("hevc").unwrap();
         let codec = unsafe { (api.find_decoder_by_name)(name.as_ptr()) };
@@ -200,9 +228,28 @@ impl Decoder {
             return Err("libavcodec has no HEVC decoder".into());
         }
         let mut context = unsafe { (api.alloc_context3)(codec) };
-        // One thread: frame threading adds a frame of delay per thread.
-        let configured =
-            set(context, "threads", "1").and_then(|()| set(context, "flags", "+low_delay"));
+        // Slice threads only: frame threading adds a frame of delay per thread, and holds the
+        // last pictures of an animation until more units come.
+        let threads = tuning.threads.to_string();
+        let configured = set(context, "threads", &threads)
+            .and_then(|()| set(context, "thread_type", "slice"))
+            .and_then(|()| set(context, "flags", "+low_delay"))
+            .and_then(|()| {
+                if tuning.fast {
+                    set(context, "flags2", "+fast")
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|()| {
+                if tuning.skip_loop_filter {
+                    // Deblocking and SAO are a large part of HEVC decoding; without them edges
+                    // show faint blocks, which a screen agent does not need.
+                    set(context, "skip_loop_filter", "all")
+                } else {
+                    Ok(())
+                }
+            });
         let opened = configured.and_then(|()| {
             let code = unsafe { (api.open2)(context, codec, std::ptr::null_mut()) };
             if code < 0 {
@@ -245,6 +292,15 @@ impl Decoder {
             }
             Ok(pictures)
         }
+    }
+
+    /// While behind, pictures nothing refers to are not decoded at all.
+    pub fn skip_unreferenced(&mut self, skip: bool) {
+        let _ = set(
+            self.context,
+            "skip_frame",
+            if skip { "nonref" } else { "default" },
+        );
     }
 
     /// Forgets the reference pictures, after a gap in the stream.
