@@ -117,7 +117,7 @@ curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/access/apps
 
 Do these steps in order. Until step 2, the tunnel keeps serving everything outside `/v1` and `/.well-known`.
 
-1. **Give the hostname a record that does not point at the tunnel.** Zone routes only run on a proxied record. Replace the tunnel CNAME (`99ffe9e8132b3ae3cf8b6a8cd4fa0382`) with a proxied placeholder. Create the new record first, then delete the CNAME:
+1. **Give the hostname a record that does not point at the tunnel.** Zone routes only run on a proxied record. Replace the tunnel CNAME (`99ffe9e8132b3ae3cf8b6a8cd4fa0382`) with a proxied placeholder:
 
    ```sh
    curl -X DELETE "https://api.cloudflare.com/client/v4/zones/b31403b7d3be18a6ad7689a364ad3fc2/dns_records/99ffe9e8132b3ae3cf8b6a8cd4fa0382" -H "Authorization: Bearer $TOKEN"
