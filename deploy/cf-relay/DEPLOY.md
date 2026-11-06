@@ -42,6 +42,7 @@ Setting `ALLOW_SECRET_ONLY=1` also accepts MCP requests with no `Authorization` 
 | Plain text | `LABEL_DAILY` | `5000` (per label per UTC day) |
 | Plain text | `GLOBAL_DAILY` | `8000` (all labels per UTC day) |
 | Plain text | `GLOBAL_DAILY_SECONDS` | `80000` (estimated Durable Object awake seconds per UTC day) |
+| Plain text | `ORIGIN_FALLBACK` | unset. Set `1` only while the Worker sits on zone routes in front of the old tunnel: paths that are not `/v1/...` (including `/.well-known/...` that is not followed by `/v1/`) are then passed to the origin. |
 | Plain text | `REDIRECT_HOSTS` | `claude.ai,claude.com,chatgpt.com,chat.openai.com,localhost,127.0.0.1` |
 
 **Migration:** tag `v1`, `new_sqlite_classes = ["DeviceRelay", "Budget"]`.
@@ -77,7 +78,7 @@ Script upload metadata for the API (`PUT /accounts/{account}/workers/scripts/pok
 `pokimcp.zheha.nz` is currently the Cloudflare Tunnel hostname of the existing daemon. A Workers Custom Domain cannot share a hostname with an existing DNS record, so there are two ways to switch:
 
 - **Test first (recommended).** Attach a Custom Domain such as `relay.zheha.nz`, and run the phone and claude.ai against it. Once that works, remove the tunnel's `pokimcp` DNS record and attach `pokimcp.zheha.nz` to the Worker. The old daemon's kill switch stays `poki-cloudflared`.
-- **Or** add a route `pokimcp.zheha.nz/v1/*` on the zone. That routes only `/v1/` paths to the Worker and leaves the tunnel serving everything else during the move. A route needs the proxied DNS record to exist, and the tunnel's record does.
+- **Or** add the routes `pokimcp.zheha.nz/v1/*` and `pokimcp.zheha.nz/.well-known/*` on the zone. The second is needed because OAuth metadata lives at the origin root, for example `/.well-known/oauth-protected-resource/v1/<label>/<secret>/mcp`. Also set `ORIGIN_FALLBACK=1`, so that `/.well-known/` documents which are not for `/v1/` (the old daemon's own) still reach the tunnel. That routes only `/v1/` paths to the Worker and leaves the tunnel serving everything else during the move. A route needs the proxied DNS record to exist, and the tunnel's record does.
 
 ## Cost model (Workers Paid)
 
