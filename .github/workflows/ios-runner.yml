@@ -116,16 +116,6 @@ jobs:
             ARCHS=arm64 | tee build/probe.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " || true
           test -d build/probe/Build/Products/Release-iphoneos/PokiProbe.app
 
-      - name: Version (the same version and build number as Poki in a release)
-        run: |
-          set -euo pipefail
-          VERSION="${{ inputs.version }}"; BUILD="${{ inputs.build }}"
-          [ -n "$VERSION" ] || VERSION=$(cat native/ios-app/VERSION 2>/dev/null || echo 0.2.0)
-          [ -n "$BUILD" ] || BUILD="${{ github.run_number }}"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PRODUCTS/$RUNNER/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PRODUCTS/$RUNNER/Info.plist"
-          echo "Poki Runner $VERSION ($BUILD)"
-
       - name: Package the IPA
         run: |
           set -euo pipefail
