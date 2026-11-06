@@ -210,17 +210,83 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     Ok(())
 }
 
-/// Closes the input services and ends the daemon after their idle times.
+/// Keeps the tunnel: checks it while idle, and opens it again after it is lost (as soon as 49152
+/// accepts, when the phone refused). Closes the input services after their idle time; exits after
+/// POKI_BRIDGED_EXIT_IDLE_MS only when that is set (a tunnel cannot be rebuilt off Wi-Fi).
 async fn reap(state: Rc<State>) {
     let input_idle = idle_env("POKI_BRIDGED_INPUT_IDLE_MS", 60_000);
-    let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 1_800_000);
+    let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 0);
     let mut reopened: Option<Instant> = None;
+    let mut checked = Instant::now();
+    let mut next_attempt = Instant::now();
+    let mut backoff = Duration::from_secs(1);
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let Ok(mut session) = state.session.try_lock() else {
             continue;
         };
         let idle = session.last_used.elapsed();
+        // Keepalive: an idle tunnel is used every KEEPALIVE_EVERY, and dropped if it stopped working.
+        if session.link.is_some() && checked.elapsed() >= KEEPALIVE_EVERY && idle >= KEEPALIVE_EVERY
+        {
+            checked = Instant::now();
+            if !session.tunnel_alive().await {
+                log("keepalive: the tunnel stopped carrying connections; dropping it");
+                session.tunnels_lost += 1;
+                session.close_input().await;
+                session.ax = None;
+                session.ax_link = None;
+                session.link = None;
+                session.tunnel_down = Some(TunnelDown {
+                    state: "error",
+                    since: std::time::SystemTime::now(),
+                    error: "keepalive failed".into(),
+                    attempts: 0,
+                });
+            }
+        }
+        // A lost tunnel is opened again. When 49152 refused, it is watched every second with a
+        // plain TCP connect, and the tunnel is opened the moment it accepts.
+        if session.link.is_none() && session.tunnel_down.is_some() && Instant::now() >= next_attempt
+        {
+            let refused = session
+                .tunnel_down
+                .as_ref()
+                .is_some_and(|d| d.state == "wifi_required");
+            let port_open = match (&session.target, refused) {
+                (Target::RemotePairing { host, .. }, true) => {
+                    let address = std::net::SocketAddr::new(*host, remote::REMOTE_PAIRING_PORT);
+                    matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(1),
+                            tokio::net::TcpStream::connect(address)
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    )
+                }
+                _ => true,
+            };
+            if port_open {
+                let mut timings = Timings::default();
+                match Box::pin(session.connect(&mut timings)).await {
+                    Ok(()) => {
+                        backoff = Duration::from_secs(1);
+                        log("tunnel reopened");
+                    }
+                    Err(error) => {
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        log(&format!(
+                            "tunnel still down ({error}); next try in {} s",
+                            backoff.as_secs()
+                        ));
+                    }
+                }
+                next_attempt = Instant::now() + backoff;
+            } else {
+                next_attempt = Instant::now() + Duration::from_secs(1);
+            }
+        }
         if live::enabled() {
             // A stream that stays stuck after a key frame request: reopen the media session on
             // the same tunnel.
@@ -235,8 +301,10 @@ async fn reap(state: Rc<State>) {
                 session.close_input().await;
                 reopened = None;
             }
-            // The live screen keeps the media session open, and opens it again after an error.
+            // The live screen keeps the media session open, and opens it again after an error,
+            // inside the tunnel while there is one (the tunnel itself is reopened above).
             if session.input.is_none()
+                && (session.link.is_some() || session.tunnel_down.is_none())
                 && reopened.is_none_or(|at: Instant| at.elapsed() >= live::REOPEN_AFTER)
             {
                 reopened = Some(Instant::now());
@@ -252,7 +320,7 @@ async fn reap(state: Rc<State>) {
                         ));
                     }
                     Err(error) => {
-                        session.reset().await;
+                        session.recover().await;
                         log(&format!(
                             "live frames: cannot open the media session: {error}"
                         ));
@@ -437,9 +505,22 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 if pong["frames"]["video_stalled"] == json!(true) {
                     reasons.push("video_stalled");
                 }
-                if live::enabled() && session.input.is_none() {
+                if let Some(down) = &session.tunnel_down {
+                    reasons.push(if down.state == "wifi_required" {
+                        "wifi_required"
+                    } else {
+                        "tunnel_down"
+                    });
+                } else if live::enabled() && session.input.is_none() {
                     reasons.push("media_closed");
                 }
+                pong["tunnel_state"] = match (&session.link, &session.tunnel_down) {
+                    (Some(_), _) => json!({"state": "up"}),
+                    (None, Some(down)) => down.json(),
+                    (None, None) => json!({"state": "not_opened"}),
+                };
+                pong["tunnels"] =
+                    json!({"opened": session.tunnels_opened, "lost": session.tunnels_lost});
                 pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
@@ -512,11 +593,11 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     let result = match outcome {
         None => {
             log(&format!("{op}: client left; cancelled"));
-            session.reset().await;
+            session.recover().await;
             return None;
         }
         Some(Err(elapsed)) => {
-            session.reset().await;
+            session.recover().await;
             Err(elapsed.into())
         }
         Some(Ok(result)) => result,
@@ -581,7 +662,60 @@ struct Session {
     ax_link: Option<Link>,
     last_used: Instant,
     ops: u64,
+    /// Why the last tunnel attempt failed, while there is no tunnel.
+    tunnel_down: Option<TunnelDown>,
+    tunnels_opened: u64,
+    tunnels_lost: u64,
 }
+
+/// No tunnel, and why: what health reports and what a failing op says.
+#[derive(Clone)]
+struct TunnelDown {
+    /// "wifi_required": the phone answers, but nothing listens on 49152 (iOS accepts new
+    /// developer connections only on Wi-Fi or USB). "unreachable": no answer. "error": other.
+    state: &'static str,
+    since: std::time::SystemTime,
+    error: String,
+    attempts: u64,
+}
+
+const WIFI_REQUIRED: &str =
+    "phone reachable, but iOS accepts new developer connections only on Wi-Fi or USB";
+
+impl TunnelDown {
+    fn json(&self) -> Value {
+        json!({
+            "state": self.state,
+            "since": crate::ax::watch::stamp_at(self.since),
+            "attempts": self.attempts,
+            "error": self.error,
+            "message": match self.state {
+                "wifi_required" => WIFI_REQUIRED,
+                "unreachable" => "the phone does not answer on the network",
+                _ => "the tunnel could not be opened",
+            },
+        })
+    }
+}
+
+/// Sorts a failed tunnel attempt: refused (the port is closed, so the phone answered) or no answer.
+fn classify(error: &str) -> &'static str {
+    let error = error.to_lowercase();
+    if error.contains("refused") {
+        "wifi_required"
+    } else if error.contains("no answer")
+        || error.contains("timed out")
+        || error.contains("unreachable")
+        || error.contains("no route")
+    {
+        "unreachable"
+    } else {
+        "error"
+    }
+}
+
+/// How often an idle tunnel is checked, which also keeps the network path to it in use.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(15);
 
 fn parse(object: &Map<String, Value>) -> Result<Request> {
     let request: Request = serde_json::from_value(Value::Object(object.clone()))?;
@@ -665,6 +799,9 @@ impl Session {
             ax_last_error: None,
             ax_link: None,
             last_used: Instant::now(),
+            tunnel_down: None,
+            tunnels_opened: 0,
+            tunnels_lost: 0,
             ops: 0,
         }
     }
@@ -694,10 +831,79 @@ impl Session {
             return Ok(());
         }
         let started = Instant::now();
-        let device = connect_device(&self.target).await?;
+        let device = match connect_device(&self.target).await {
+            Ok(device) => device,
+            Err(error) => {
+                let text = error.to_string();
+                let state = classify(&text);
+                let attempts = self.tunnel_down.as_ref().map_or(0, |d| d.attempts) + 1;
+                let since = self
+                    .tunnel_down
+                    .as_ref()
+                    .filter(|d| d.state == state)
+                    .map_or_else(std::time::SystemTime::now, |d| d.since);
+                self.tunnel_down = Some(TunnelDown {
+                    state,
+                    since,
+                    error: text.clone(),
+                    attempts,
+                });
+                if state == "wifi_required" {
+                    return Err(format!("{WIFI_REQUIRED} ({text})").into());
+                }
+                return Err(error);
+            }
+        };
         timings.connect_ms = Some(ms(started));
+        if let Some(down) = self.tunnel_down.take() {
+            log(&format!(
+                "tunnel open again after {} attempts ({} since {})",
+                down.attempts,
+                down.state,
+                crate::ax::watch::stamp_at(down.since)
+            ));
+        }
+        self.tunnels_opened += 1;
         self.link = Some(Link { device });
         Ok(())
+    }
+
+    /// Whether the tunnel still carries connections: one to a service on the phone, closed at
+    /// once. It is also the keepalive: traffic on the tunnel's path every KEEPALIVE_EVERY.
+    async fn tunnel_alive(&mut self) -> bool {
+        let Some(link) = self.link.as_mut() else {
+            return false;
+        };
+        let device = &mut link.device;
+        let port = [
+            "com.apple.mobile.lockdown.remote.untrusted",
+            "com.apple.mobile.lockdown.remote.trusted",
+        ]
+        .iter()
+        .find_map(|name| device.rsd.services.get(*name))
+        .or_else(|| device.rsd.services.values().next())
+        .map(|service| service.port);
+        let Some(port) = port else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), device.adapter.connect(port)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// After a failed op: the media session and accessibility state go, and the tunnel goes only
+    /// if it no longer works. Building a tunnel needs 49152, which iOS opens only on Wi-Fi or USB,
+    /// while a working tunnel survives a switch to cellular.
+    async fn recover(&mut self) {
+        self.close_input().await;
+        self.ax = None;
+        self.ax_link = None;
+        if self.link.is_some() && !self.tunnel_alive().await {
+            log("tunnel lost");
+            self.tunnels_lost += 1;
+            self.link = None;
+        }
     }
 
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
@@ -766,7 +972,7 @@ impl Session {
             if result.is_ok() {
                 return result;
             }
-            self.reset().await;
+            self.recover().await;
             if !(retry && reused) || timings.retried {
                 // poki-native reports a failed launch as a result rather than an error.
                 return if launch {
@@ -840,7 +1046,7 @@ impl Session {
                     {
                         return Ok(tree);
                     }
-                    self.reset().await;
+                    self.recover().await;
                     if !reused || attempt > 0 {
                         return Err(error);
                     }
@@ -942,7 +1148,7 @@ impl Session {
         match self.prepare_input(touch, timings).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.reset().await;
+                self.recover().await;
                 if !reused || timings.retried {
                     return Err(error);
                 }
@@ -969,7 +1175,7 @@ impl Session {
             | Request::LongPress { x, y, .. }
             | Request::DoubleTap { x, y, .. } => {
                 if let Err(error) = self.contact(x, y).await {
-                    self.reset().await;
+                    self.recover().await;
                     if timings.retried {
                         return Err(error);
                     }
@@ -990,7 +1196,7 @@ impl Session {
             } if super::paste_again::quick::enabled() => {
                 let result = Box::pin(self.quick_type(&text, clear, submit, object, timings)).await;
                 if result.is_err() {
-                    self.reset().await;
+                    self.recover().await;
                 }
                 return result;
             }
@@ -998,7 +1204,7 @@ impl Session {
         };
         let result = Box::pin(self.input_action(request)).await;
         if result.is_err() {
-            self.reset().await;
+            self.recover().await;
         }
         result
     }
@@ -1313,6 +1519,25 @@ mod daemon_tests {
             answer["stderr"].as_str().unwrap(),
             r#"{"error":"boom","screen_change_verified":false}"#
         );
+    }
+
+    #[test]
+    fn a_refused_tunnel_means_wifi_is_needed_and_silence_means_unreachable() {
+        assert_eq!(
+            classify("Connect: 100.64.0.9:49152: Connection refused (os error 111)"),
+            "wifi_required"
+        );
+        assert_eq!(classify("Connect: 100.64.0.9:49152: no answer within 5s"), "unreachable");
+        assert_eq!(classify("Connect: No route to host (os error 113)"), "unreachable");
+        assert_eq!(classify("cannot read the pairing file"), "error");
+        let down = TunnelDown {
+            state: "wifi_required",
+            since: std::time::SystemTime::UNIX_EPOCH,
+            error: "refused".into(),
+            attempts: 3,
+        };
+        assert_eq!(down.json()["message"], WIFI_REQUIRED);
+        assert_eq!(down.json()["attempts"], 3);
     }
 
     #[test]
