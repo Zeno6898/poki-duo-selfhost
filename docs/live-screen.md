@@ -35,3 +35,6 @@ phone (it was offline while this was written): picture latency and settle timing
 the screenshot path's scaling against the real video size, the pixel verdict against real taps,
 the OCR fallback on lagging trees, and orientation changes (the point size is not re-read when the
 phone rotates).
+
+The bridge's `subscribe_frames` event feed (05d9f82) is not used yet; the client polls
+`wait_settled` and `latest_frame`.
