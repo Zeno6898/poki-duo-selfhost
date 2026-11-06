@@ -214,7 +214,17 @@ final class Computer: @unchecked Sendable {
     func look(full: Bool) async -> ToolResult {
         let until = now() + config.toolDeadline
         if let blocked = await waitForRunner(until: until) { return blocked }
-        return await readAndReply(until: until, full: full)
+        async let locked = isLocked()
+        let result = await readAndReply(until: until, full: full)
+        guard await locked else { return result }
+        var lines = result.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        lines.insert("screen: locked (the owner has to unlock the phone before anything can be done)", at: min(1, lines.count))
+        return ToolResult(text: lines.joined(separator: "\n"), jpeg: result.jpeg, isError: result.isError)
+    }
+
+    /// WDA's lock state, without a session; unknown counts as unlocked (a failed read must not block).
+    func isLocked() async -> Bool {
+        (try? await runner.raw("GET", "/wda/locked", timeout: 1, countsAsMiss: false))?.bool ?? false
     }
 
     /// The app stops the runner when no agent is using the phone, and asking for its state wakes it.
@@ -236,9 +246,15 @@ final class Computer: @unchecked Sendable {
     // MARK: do
 
     func act(actions: [JSON], full: Bool) async -> ToolResult {
-        let started = now()
-        let until = started + config.toolDeadline
+        var started = now()
+        var until = started + config.toolDeadline
         if let blocked = await waitForRunner(until: until) { return blocked }
+
+        // A locked phone takes no input but the buttons; the owner unlocks it.
+        let onlyButtons = actions.allSatisfy { $0["button"] != nil || $0["wait"] != nil }
+        if !onlyButtons, await isLocked() {
+            return ToolResult(text: "screen: locked. Nothing was sent. The owner has to unlock the phone; call look once they have.", jpeg: nil, isError: true)
+        }
 
         // A number that is not in the latest read is refused before anything is sent.
         let stale = Set(actions.flatMap(Self.refs(in:))).filter { refs[$0] == nil }.sorted()
@@ -258,11 +274,15 @@ final class Computer: @unchecked Sendable {
             } else {
                 let approval = approvals.pending.flatMap { $0.fingerprint == fingerprint ? $0 : nil }
                     ?? approvals.request(app: lastForeground?.describe ?? "unknown", summary: labels(actions), reason: reason, fingerprint: fingerprint)
-                let wait = max(0, min(config.approvalWait, until - now() - config.readTimeout - 1))
-                switch await approvals.wait(id: approval.id, seconds: wait) {
+                // The time the owner takes is not the actions' time: the clock starts again after it.
+                let asked = now()
+                switch await approvals.wait(id: approval.id, seconds: config.approvalWait) {
                 case .approved?:
                     _ = approvals.consumeGrant(fingerprint: fingerprint)
-                    approvedNote = "approval: approved on the phone (\(reason))"
+                    let waited = now() - asked
+                    approvedNote = "approval: approved on the phone after \(Int(waited.rounded())) s (\(reason))"
+                    until += waited
+                    started += waited
                 case .declined?:
                     return ToolResult(text: "not_sent: the owner declined on the phone (\(reason)). Nothing was sent.", jpeg: nil, isError: true)
                 case .expired?:

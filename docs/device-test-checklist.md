@@ -6,13 +6,13 @@ result and the time next to each line.
 
 ## 0. Before
 
-- [ ] Poki (dev/ios-app build) and Poki Runner installed from AltStore, both opened once.
+- [ ] Poki and Poki Runner (dev/ios-app CI builds) installed with the same signing tool and Apple ID, developer trusted. Open Poki once; opening Poki Runner by hand should show its screen and go back to Poki.
 - [ ] Developer Mode on (Settings → Privacy & Security → Developer Mode).
 - [ ] Note the iOS version and whether the phone is on Wi-Fi or cellular for each step.
 
 ## 1. Loopback (one of these)
 
-- [ ] Poki's own tunnel on (Settings → VPN shows Poki): `status` should leave `waiting_network`.
+- [ ] Or LocalDevVPN (App Store) on, for people without a proxy app.
 - [ ] Or Shadowrocket "Include route 10.7.0.1/32" on, with Shadowrocket connected.
 - [ ] Or Surge Enhanced Mode with the Poki module (`10.7.0.1 = reflect`), or Loon's plugin, or sing-box `loopback_address`.
 - [ ] With a proxy app: a web page still loads through the proxy (the proxy keeps working).

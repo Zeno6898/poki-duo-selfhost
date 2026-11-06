@@ -148,7 +148,7 @@ public final class Runner: @unchecked Sendable {
         let id = try await session()
         do {
             return try await raw(method, "/session/\(id)\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
-        } catch let error as RunnerError where error.code == "invalid session id" || error.message.lowercased().contains("invalid session id") || (error.status == 404 && error.code != "unknown command" && error.code != "unknown method") {
+        } catch let error as RunnerError where error.code == "invalid session id" || error.message.lowercased().contains("invalid session id") || (error.status == 404 && error.code == nil) {
             state.update { if $0.session == id { $0.session = nil } }
             return try await raw(method, "/session/\(try await session())\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
         }

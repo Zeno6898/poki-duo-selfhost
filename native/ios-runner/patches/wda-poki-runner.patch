@@ -1,16 +1,17 @@
 diff --git a/WebDriverAgentRunner/UITestingUITests.m b/WebDriverAgentRunner/UITestingUITests.m
-index 5ffafa86..185bb02c 100644
+index 5ffafa86..770ade81 100644
 --- a/WebDriverAgentRunner/UITestingUITests.m
 +++ b/WebDriverAgentRunner/UITestingUITests.m
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,8 @@
   */
  
  #import <XCTest/XCTest.h>
 +#import <UIKit/UIKit.h>
++#import <dlfcn.h>
  
  #import <WebDriverAgentLib/FBDebugLogDelegateDecorator.h>
  #import <WebDriverAgentLib/FBConfiguration.h>
-@@ -43,11 +44,80 @@
+@@ -43,11 +45,92 @@
   */
  - (void)testRunner
  {
@@ -19,8 +20,11 @@ index 5ffafa86..185bb02c 100644
 +  if (!NSProcessInfo.processInfo.environment[@"POKI_LAUNCHER"]) {
 +    return;
 +  }
-+  [self pokiShowRunningScreen];
-+  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(pokiShowRunningScreen) name:UISceneDidActivateNotification object:nil];
++  // PokiRunnerHost (injected into the runner) draws the screen; this one is only a fallback.
++  if (![self pokiHostScreen]) {
++    [self pokiShowRunningScreen];
++    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(pokiShowRunningScreen) name:UISceneDidActivateNotification object:nil];
++  }
    FBWebServer *webServer = [[FBWebServer alloc] init];
    webServer.delegate = self;
    [webServer startServing];
@@ -33,6 +37,15 @@ index 5ffafa86..185bb02c 100644
 +#pragma clang diagnostic ignored "-Weverything"
 +
 +static UIWindow *pokiWindow;
++
++/// Asks PokiRunnerHost to show its in-use screen; NO when the host library is not there.
++- (BOOL)pokiHostScreen
++{
++  void *symbol = dlsym(RTLD_DEFAULT, "PokiRunnerShowInUse");
++  if (!symbol) { return NO; }
++  ((void (*)(void))symbol)();
++  return YES;
++}
 +
 +/// The runner's own screen while Poki uses it: without this it is black. It covers the test host's
 +/// window and says what is going on and how to stop.

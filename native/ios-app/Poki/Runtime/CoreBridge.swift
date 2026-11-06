@@ -45,14 +45,14 @@ struct RunnerStatus: Sendable, Equatable, Decodable {
     var title: String {
         switch state {
         case "idle": "Not started"
-        case "standby": "Standing by"
-        case "connecting": "Connecting to the phone"
-        case "pairing": "Verifying pairing"
-        case "tunnel": "Opening the developer tunnel"
-        case "mounting_ddi": "Mounting the developer disk image"
-        case "launching": "Launching the runner"
+        case "standby": "Sleeping"
+        case "connecting": "Connecting"
+        case "pairing": "Checking pairing"
+        case "tunnel": "Opening tunnel"
+        case "mounting_ddi": "Preparing"
+        case "launching": "Starting"
         case "running": "Running"
-        case "waiting_network": "Waiting for the loopback"
+        case "waiting_network": "Needs loopback"
         case "failed": "Stopped"
         default: state
         }

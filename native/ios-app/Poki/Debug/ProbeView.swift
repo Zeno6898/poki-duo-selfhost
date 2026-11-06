@@ -9,6 +9,7 @@ struct ProbeView: View {
     var body: some View {
         NavigationStack {
             List {
+                LogSection()
                 Section {
                     NavigationLink("Live Activity preview") { ActivityPreview() }
                 }
@@ -62,5 +63,46 @@ struct ProbeView: View {
         addresses = localAddresses()
         results = await runChecks()
         running = false
+    }
+}
+
+/// Poki's log: copy it, share it, or read the last lines.
+private struct LogSection: View {
+    @State private var log = AppLog.shared
+    @State private var copied = false
+
+    var body: some View {
+        Section {
+            HStack(spacing: 12) {
+                Button {
+                    UIPasteboard.general.string = log.text
+                    copied = true
+                    Task { try? await Task.sleep(for: .seconds(2)); copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy log", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                ShareLink(item: log.text, subject: Text("Poki log")) {
+                    Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .controlSize(.large).buttonBorderShape(.capsule)
+            .listRowBackground(Color.clear).listRowInsets(EdgeInsets())
+            NavigationLink {
+                List(Array(log.lines.reversed().enumerated()), id: \.offset) { _, line in
+                    Text(line).font(.caption.monospaced()).textSelection(.enabled)
+                }
+                .navigationTitle("Log").navigationBarTitleDisplayMode(.inline)
+                .toolbar { Button("Clear", role: .destructive) { log.clear() } }
+            } label: {
+                LabeledContent("Log", value: "\(log.lines.count) lines")
+            }
+        } header: {
+            Text("Log")
+        } footer: {
+            Text("Runner starts and stops, agent steps, approvals and connection changes. What is typed into password fields is never logged.")
+        }
     }
 }

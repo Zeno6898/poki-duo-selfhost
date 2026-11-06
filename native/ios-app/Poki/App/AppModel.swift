@@ -67,6 +67,7 @@ final class AppModel {
         host.onWake { [weak self] in Task { @MainActor in self?.wakeRunner() } }
         listenForApprovals()
         if !diskImage.isReady { Task { await diskImage.download() } }
+        if UserDefaults.standard.bool(forKey: "pokiSample") { loadSample() }
         NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.appWillTerminate() }
         }
@@ -92,6 +93,19 @@ final class AppModel {
     }
 
     var deviceName: String { UIDevice.current.name }
+
+    /// `-pokiSample YES`: sample steps and an approval, only for the build's screenshots of the home
+    /// screen. Nothing is started.
+    private func loadSample() {
+        let now = Date()
+        recentSteps = [
+            RecentStep(text: "Open WeChat", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-70)),
+            RecentStep(text: "Tap “Search”, then type “Mom”", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-52)),
+            RecentStep(text: "Tap at 212, 640", detail: "In WeChat · Didn't go through", ok: false, at: now.addingTimeInterval(-30)),
+            RecentStep(text: "Type “On my way”", detail: "In WeChat", ok: true, at: now.addingTimeInterval(-12)),
+        ]
+        approvals = [PendingApproval(id: "sample", app: "WeChat", summary: "Tap “Send”", expires: now.addingTimeInterval(45))]
+    }
 
     // MARK: Session
 
@@ -228,6 +242,7 @@ final class AppModel {
             lastAgentActivity = Date()
             activityText = summary
             log.add("agent", "started: \(summary)")
+            if problem?.hasPrefix("An approval ran out") == true { problem = nil }
             activity.update { state in
                 if state.approval == nil {
                     if state.phase != .working || state.since == nil { state.since = Date() }
@@ -256,11 +271,12 @@ final class AppModel {
             approvals.append(approval)
             log.add("approval", "requested \(approval.id) in \(approval.app): \(approval.summary)")
             activity.update { $0.phase = .approval; $0.approval = approval; $0.headline = "Allow this step?" }
-            activity.alert(title: "Poki needs your OK", body: "\(approval.summary) in \(approval.app)")
-            ApprovalNotice.post(approval)
-        case .approvalEnded(let id, _):
+            // The Live Activity pops up for it by itself; the notification is for when it is not running.
+            if !activity.isRunning { ApprovalNotice.post(approval) }
+        case .approvalEnded(let id, let approved):
             approvals.removeAll { $0.id == id }
             log.add("approval", "ended \(id): \(approved.map { $0 ? "approved" : "denied" } ?? "expired or replaced")")
+            if approved == nil { problem = "An approval ran out before you answered, so that step was not done. The agent can ask again." }
             ApprovalNotice.clear(id)
             activity.update { state in
                 if state.approval?.id == id { state.approval = nil; state.phase = .working; state.headline = approved == true ? "Approved. Continuing" : "Not allowed" }

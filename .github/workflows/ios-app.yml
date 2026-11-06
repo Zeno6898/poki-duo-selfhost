@@ -129,6 +129,10 @@ jobs:
               sleep 4
               xcrun simctl io "$UDID" screenshot "shots/$screen-$look.png" > /dev/null
             done
+            xcrun simctl terminate "$UDID" nz.zheha.poki || true
+            xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen home -pokiSample YES > /dev/null
+            sleep 4
+            xcrun simctl io "$UDID" screenshot "shots/home-sample-$look.png" > /dev/null
           done
           ls shots
 
