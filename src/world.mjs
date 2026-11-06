@@ -86,7 +86,7 @@ function fromLive(picture) {
   const capturedMs = Date.parse(picture.capturedAt);
   return { capturedMs, changedMs: capturedMs, capturedAt: picture.capturedAt, image: picture.jpeg, settled: picture.settled, quietMs: picture.quietMs ?? undefined,
     changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, ...(picture.videoStalled ? { videoStalled: true, stalledMs: picture.stalledMs } : {}),
-    ...(picture.source ? { pictureSource: picture.source } : {}), ...(picture.fallbackReason ? { fallbackReason: picture.fallbackReason } : {}), ...(picture.foreground ? { foreground: picture.foreground } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
+    ...(picture.source ? { pictureSource: picture.source } : {}), ...(picture.pictureCurrent !== undefined ? { pictureCurrent: picture.pictureCurrent } : {}), ...(Number.isFinite(picture.msSinceUnit) ? { msSinceUnit: picture.msSinceUnit } : {}), ...(picture.fallbackReason ? { fallbackReason: picture.fallbackReason } : {}), ...(picture.foreground ? { foreground: picture.foreground } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
 // A failure inside a read is not the call being stopped: only the caller's own deadline or cancel is.
@@ -128,6 +128,10 @@ const deviceReasons = new Set(['device_locked', 'screen_locked', 'locked', 'scre
 for (const reason of deviceReasons) lostText[reason] = 'The phone is locked or its screen is off; unlock it. Inputs are held until it is unlocked.';
 // Reasons the picture may be old while inputs still work: reported as unverified, not blocked.
 const degraded = new Set(['video_stalled', 'decode_backlog', 'picture_damaged']);
+// The phone streams about 60 units a second even on a still screen: this long without a packet, the
+// video has stopped, whatever the health report says.
+const silentMs = 2000;
+const stallText = { video_stalled: 'Screen video stalled', decode_backlog: 'Screen video is behind', picture_damaged: 'Screen video picture is damaged', no_packets: 'Screen video is silent', picture_not_current: 'Screen video picture is not current' };
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
 const inside = (box, [x, y, w, h], size) => {
   const f = box.frame ?? box, cx = (f.x + f.width / 2) / size.width, cy = (f.y + f.height / 2) / size.height;
@@ -155,7 +159,9 @@ export class World {
     const frame = await this.stamp(this.source.screenshot ? await this.source.screenshot() : await this.source.frame());
     // Asked for after the input and taken by our own clock after it, it shows the screen since.
     const after = !this.lastInput || (frame.startedMs ?? frame.capturedMs) >= this.lastInput.sentMs;
-    const shot = { ...frame, settled: frame.moving !== true, screenshot: true, afterInput: this.lastInput?.epoch, proven: after || this.proven(frame) };
+    // A source without a screenshot service answers with its video picture, which is no screenshot.
+    const real = !frame.videoStalled;
+    const shot = { ...frame, settled: frame.moving !== true, screenshot: real, afterInput: this.lastInput?.epoch, proven: real && after || this.proven(frame) };
     this.lastSettle = shot;
     return shot;
   }
@@ -190,20 +196,40 @@ export class World {
   // What stands between the agent and the screen, from the source's own health report: a video that
   // stopped decoding (stalled: the picture is old, inputs still work) or a connection that is gone
   // (lost: inputs would not arrive, or their result could not be seen). Undefined when all is well.
+  // Asked afresh on every call, from the source's answer now: a stall reported earlier is never carried over.
   async condition(frame) {
     const screen = this.live ? this.source.screen : undefined;
     if (typeof screen?.status !== 'function') return undefined;
     let health;
     try { health = await screen.status(); } catch { absorb(); health = { ok: false, reasons: ['unreachable'] }; }
     const reasons = health?.reasons ?? [];
-    const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.some(reason => degraded.has(reason));
+    const silent = health?.msSinceLastPacket > silentMs;
+    const stall = reasons.find(reason => degraded.has(reason)) ?? (screen.liveFeed?.stalled ? 'video_stalled' : silent ? 'no_packets' : undefined);
     // Accessibility being down costs labels, not the screen: the picture and OCR still answer.
     const lost = reasons.find(reason => !degraded.has(reason) && reason !== 'ax_unavailable');
-    if (!stalled && !lost) return undefined;
+    if (!stall && !lost) return undefined;
     return {
-      ...(stalled ? { stalled: { ms: frame?.stalledMs ?? null, lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
+      ...(stall ? { stalled: { reason: stall, text: stallText[stall] ?? 'Screen video is degraded', ms: frame?.stalledMs ?? (silent ? health.msSinceLastPacket : null), lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
       ...(lost ? { lost: { kind: deviceReasons.has(lost) ? 'device' : 'connection', reason: lost, text: lostText[lost] ?? `The device connection reports ${lost}. Inputs are held until it recovers.` } } : {}),
     };
+  }
+  // Why a frame may show less than the screen does now, or undefined when the source vouches for it: a
+  // stalled or silent video, a decode backlog, a picture the bridge does not call current. Such a frame
+  // is replaced by a screenshot before anything is read from it. A screenshot is never stale.
+  staleness(frame, condition) {
+    if (!frame || frame.screenshot || frame.pictureSource === 'screenshot') return undefined;
+    if (frame.videoStalled) return 'video_stalled';
+    if (frame.pictureCurrent === false) return 'picture_not_current';
+    if (frame.msSinceUnit > silentMs) return 'no_packets';
+    return condition?.stalled?.reason;
+  }
+  // The frame, or a screenshot in its place when it may be behind the screen. On a failed screenshot
+  // the frame is kept, still marked as stale by staleness().
+  async trusted(frame, budgetMs) {
+    if (!this.live) return frame;
+    const condition = await within(Math.min(1000, budgetMs), () => this.condition(frame), undefined);
+    if (!this.staleness(frame, condition)) return frame;
+    return await within(budgetMs, () => this.screenshot(), undefined) ?? frame;
   }
   // Whether this frame is the same picture as one seen earlier (same epoch, or no pixel change).
   same(a, b) { return Boolean(a && b) && (a.epoch === b.epoch || !compare(a.thumb, b.thumb).changed); }
@@ -213,7 +239,13 @@ export class World {
   // waitMs bounds how long the tree may take before the result goes out without it (live frames only:
   // a screenshot-based frame already took longer than the tree).
   // budgetMs bounds the whole read, OCR included, so a dead accessibility service never holds a reply.
-  async read(frame, { waitMs = Infinity, budgetMs = Infinity } = {}) {
+  async read(frame, options) {
+    const view = await this.readFor(frame, options);
+    // What the agent can be told is on screen, for target lookups by text while its pixels hold.
+    if (!this.lastView || view.frame.epoch >= this.lastView.frame.epoch) this.lastView = view;
+    return view;
+  }
+  async readFor(frame, { waitMs = Infinity, budgetMs = Infinity } = {}) {
     const end = performance.now() + budgetMs;
     waitMs = Math.min(waitMs, budgetMs);
     const size = this.devices.size ?? { width: frame.width, height: frame.height };
@@ -253,7 +285,8 @@ export class World {
   }
   async ocr(frame, region, size) {
     // The bridge keeps an OCR worker warm on the live frames; otherwise the helper reads a cropped PNG.
-    if (this.live) {
+    // The worker reads the newest video picture, so a screenshot taken in its place is read here instead.
+    if (this.live && !frame.screenshot) {
       try {
         // Boxes come back as fractions of the screen; text read from a later picture than this frame is not used.
         const request = region ? { op: 'ocr_region', box: region } : { op: 'ocr_frame' };

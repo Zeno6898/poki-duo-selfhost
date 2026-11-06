@@ -227,17 +227,18 @@ test('the profile and the count of listed tools follow the environment', async (
   assert.equal(listedNames({ POKI_MCP_TOOLS: 'all' }).length, 59);
 });
 
-test('a stalled screen video is said first, the outcome is unverified, and the old picture is not sent', { timeout: 30000 }, async () => {
+test('a stalled screen video with no screenshot to be had is said first, the outcome is unverified, and the old picture is marked as such', { timeout: 30000 }, async () => {
   const old = new Date(Date.now() - 90000).toISOString();
   const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: old, settled: true, observation: 'unverified', videoStalled: true, stalledMs: 90000 });
   const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: false, reasons: ['video_stalled'] }) });
   const phone = new LedgerPhone({ live });
   const look = await phone.call('observe', {});
   const seen = body(look);
-  assert.match(seen.now.summary, new RegExp(`^Screen feed stalled 90 s; last picture is from ${old}`));
+  assert.match(seen.now.summary, new RegExp(`^Screen video stalled 90 s and no screenshot could be taken; this picture is from ${old.replace(/[.]/g, '[.]')} and may be behind the screen`));
   assert.equal(seen.now.outcome, 'unverified');
   assert.equal(seen.now.frame.stalled, true);
-  assert.ok(!look.content.some(block => block.type === 'image'), 'no picture that would pass for the screen');
+  assert.ok(look.content.some(block => block.type === 'image'), 'every reply carries a picture');
+  assert.ok(seen.now.text.lines.length, 'and text');
   const tapped = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } }));
   assert.equal(tapped.sent, true, 'inputs still go through a stalled video');
   assert.equal(tapped.now.outcome, 'unverified');
@@ -417,4 +418,65 @@ test('with accessibility down, the picture and OCR answer, and the summary says 
   const entries = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 100, y: 120 } }, expect: { text: 'Select' } }));
   assert.equal(entries.expectation, 'met');
   assert.ok(reads <= 3, `${reads} accessibility reads while it was down`);
+});
+
+test('a stalled video is replaced by a screenshot in every reply, and the stall is asked afresh on every call', { timeout: 30000 }, async () => {
+  // The bridge reports a stall (here a decode backlog) and its video pictures are old; the screenshot service works.
+  let reasons = ['decode_backlog'], shots = 0;
+  const picture = async (phone, extra) => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), settled: true, ...extra });
+  const video = phone => reasons.length ? picture(phone, { capturedAt: new Date(Date.now() - 40000).toISOString(), observation: 'unverified', videoStalled: true, stalledMs: 40000 }) : picture(phone, { capturedAt: new Date().toISOString(), observation: 'after_input' });
+  const live = phone => ({ latestFrame: ({ source } = {}) => source === 'screenshot' ? (shots++, picture(phone, { capturedAt: new Date().toISOString(), source: 'screenshot', observation: 'after_input' })) : video(phone), waitSettled: () => video(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: true, reasons }) });
+  const phone = new LedgerPhone({ live });
+  const look = await phone.call('observe', {});
+  const seen = body(look);
+  assert.equal(shots, 1, 'observe takes the screenshot');
+  assert.equal(seen.now.frame.source, 'screenshot');
+  assert.equal(seen.now.frame.stalled, undefined);
+  assert.match(seen.now.summary, /^Screen video is behind; this picture is a screenshot taken at /);
+  assert.ok(look.content.some(block => block.type === 'image'));
+  assert.ok(seen.now.text.lines.includes('Icon: Ledger'), JSON.stringify(seen.now.text));
+  const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } }, expect: { text: 'Entries' }, timeout_ms: 4000 }));
+  assert.equal(opened.now.outcome, 'as_expected', JSON.stringify(opened.now));
+  assert.equal(opened.now.frame.source, 'screenshot');
+  assert.equal(phone.app.page, 'accounts');
+  // The stall clears: the next call trusts the video again and takes no screenshot.
+  reasons = []; const before = shots;
+  const clear = body(await phone.call('observe', {}));
+  assert.equal(shots, before);
+  assert.equal(clear.now.frame.source, 'video');
+  assert.doesNotMatch(clear.now.summary, /stalled|behind|screenshot/);
+});
+
+test('a video that has sent no packet for seconds is not taken as current, whatever the health says', { timeout: 30000 }, async () => {
+  let shots = 0, silent = 5000;
+  const picture = async (phone, source) => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date().toISOString(), settled: true, observation: 'no_input', ...(source ? { source } : {}) });
+  const live = phone => ({ latestFrame: ({ source } = {}) => source === 'screenshot' ? (shots++, picture(phone, 'screenshot')) : picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: true, reasons: [], msSinceLastPacket: silent }) });
+  const phone = new LedgerPhone({ live });
+  const seen = body(await phone.call('observe', {}));
+  assert.equal(shots, 1);
+  assert.equal(seen.now.frame.source, 'screenshot');
+  assert.match(seen.now.summary, /^Screen video is silent; this picture is a screenshot/);
+  silent = 30;
+  assert.equal(body(await phone.call('observe', {})).now.frame.source, 'video');
+  assert.equal(shots, 1);
+  // The bridge saying its picture is not current is reason enough on its own.
+  const { frameFromAnswer } = await import('../src/live-frames.mjs');
+  const frame = await frameFromAnswer({ jpeg_base64: Buffer.from('x').toString('base64'), captured_at: new Date().toISOString(), picture_current: false, ms_since_unit: 12 });
+  assert.equal(frame.pictureCurrent, false);
+  assert.equal(frame.msSinceUnit, 12);
+});
+
+test('tap_text finds its target in what the World read of the screen, even when a fresh read fails', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  const seen = body(await phone.call('observe', {}));
+  assert.ok(seen.now.text.lines.includes('Icon: Ledger'));
+  // Accessibility dies after the look: the single-step tool alone would find nothing to tap.
+  phone.axFails = true;
+  await new Promise(r => setTimeout(r, 600));
+  const started = performance.now();
+  const tapped = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Ledger' } }, timeout_ms: 2000 }));
+  assert.equal(tapped.sent, true, JSON.stringify(tapped));
+  assert.equal(tapped.error, undefined);
+  assert.equal(phone.app.page, 'accounts');
+  assert.ok(performance.now() - started < 4000, `${Math.round(performance.now() - started)} ms`);
 });
