@@ -7,6 +7,9 @@ import PokiCore
 import ImageIO
 import UniformTypeIdentifiers
 
+// Every line out at once: a crash must not take the last steps' output with it.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 final class Host: CoreHost, @unchecked Sendable {
     struct NoKey: Error {}
     func signingKey() throws -> RelayKey { throw NoKey() }
@@ -83,7 +86,8 @@ if let searchRef, let ref = Int(searchRef) {
     let typed = await call("type mixed text in search", "do", ["actions": [["type": .string(text), "ref": .number(Double(ref))]]])
     // The read-back can miss its time while the keyboard comes up; the next read shows the field then.
     let after = await call("look at the field", "look")
-    check(typed.contains("the field now reads \"\(text)\"") || after.contains("SearchField \"Search = \(text)\""), "typed text reads back exactly")
+    // With the tree late, the text read from the picture stands in; it must show the typed text.
+    check(typed.contains("the field now reads \"\(text)\"") || after.contains("SearchField \"Search = \(text)\"") || after.contains("Text \"\(text)\""), "typed text reads back exactly")
 } else {
     check(false, "Settings shows a search field")
 }

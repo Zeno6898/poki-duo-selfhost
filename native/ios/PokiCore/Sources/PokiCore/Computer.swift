@@ -129,7 +129,9 @@ final class Computer: @unchecked Sendable {
         var pictureOnly = false
         if !treeRead, let png = reading.png, size != nil {
             let host = self.host
-            let left = min(2, until - now() - 0.6)
+            // Vision's accurate model (needed for Chinese and Japanese) on a whole screenshot takes up to
+            // a few seconds on a slow machine.
+            let left = min(3.5, until - now() - 0.6)
             if left >= 0.3, let texts = (try? await withDeadline(left, "reading text from the picture", { await host.recognizeText(inPNG: png) })) ?? nil, !texts.isEmpty {
                 shown = texts.map { t in
                     Element(type: "Text", label: t.text, value: nil, identifier: nil,
