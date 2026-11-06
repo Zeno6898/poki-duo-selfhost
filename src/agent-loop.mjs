@@ -92,8 +92,9 @@ const allowed = (label, allow = []) => allow.some(entry => normalize(label).incl
 function holds(expect, view, base) {
   if (!expect) return undefined;
   if (expect.text !== undefined) return matching(view.elements, expect.text, expect.exact).length > 0;
-  if (expect.gone !== undefined) return view.tree === 'current' && matching(view.elements, expect.gone, expect.exact).length === 0;
-  if (expect.foreground !== undefined) return view.tree === 'current' && view.foreground?.bundle_id === expect.foreground;
+  // "Gone" needs a complete reading of this frame: its tree, or OCR of the whole picture.
+  if (expect.gone !== undefined) return (view.tree === 'current' || view.ocrComplete) && matching(view.elements, expect.gone, expect.exact).length === 0;
+  if (expect.foreground !== undefined) return view.foregroundFresh && view.foreground?.bundle_id === expect.foreground;
   if (expect.page_identity !== undefined) return view.tree === 'current' && (expect.page_identity === 'new' ? view.page?.id !== base.page : view.page?.id === expect.page_identity);
   if (expect.change !== undefined) {
     const change = compare(base.frame?.thumb, view.frame.thumb);
@@ -177,7 +178,7 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
   const fresh = since?.appeared?.slice(0, 3).map(line => line.replace(/^[^:]+: /, '')).join(', ');
   const word = verdict ? { as_expected: 'as expected', changed: 'changed', unchanged: 'unchanged', unknown: 'still animating', unverified: 'unverified' }[verdict.outcome] : frame.settled === false ? 'current screen, still animating' : 'current screen';
   const stall = condition?.stalled ? `Screen feed stalled${condition.stalled.ms ? ` ${Math.round(condition.stalled.ms / 1000)} s` : ''}; last picture is from ${condition.stalled.lastPictureAt}. ` : '';
-  const summary = `${condition?.lost ? `${condition.lost.text} ` : ''}${stall}${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}.`;
+  const summary = `${condition?.lost ? `${condition.lost.text} ` : ''}${stall}${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}${view.ax === 'unavailable' ? '. Accessibility unavailable: text is read from the picture, and refs are OCR boxes' : ''}.`;
   const elements = giveRefs(agent, view);
   return {
     summary,

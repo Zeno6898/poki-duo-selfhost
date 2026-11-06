@@ -114,7 +114,7 @@ const lineOf = e => {
 };
 const treeKey = (elements, foreground) => JSON.stringify([foreground?.pid ?? null, elements.map(e => { const f = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, Boolean(e.selected), f.x, f.y, f.width, f.height]; })]);
 // Only a change this large can be a page the tree has not caught up with: a spinner or a clock is not.
-const treeLagMs = 2500, lagFraction = 0.02;
+const treeLagMs = 2500, lagFraction = 0.02, axRetryMs = 5000;
 const lostText = {
   wifi_required: 'The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB. Put the phone on Wi-Fi or USB; inputs are held until it is back.',
   tunnel_down: 'The device tunnel is down and being reopened. Inputs are held until it is back.',
@@ -137,7 +137,7 @@ const inside = (box, [x, y, w, h], size) => {
 // epoch. A tree or OCR text carries the epoch of the frame it was read for, and is current only while
 // no later change has been seen. The bridge's own epoch numbers are used when it sends them.
 export class World {
-  epoch = 0; lastFrame; lastSettle; settledFrame; tree; pendingTree;
+  epoch = 0; axDownUntil = 0; lastFrame; lastSettle; settledFrame; tree; pendingTree;
   constructor(devices, screen) { this.devices = devices; this.source = screen ? new LiveSource(screen) : new CaptureSource(devices); }
   get live() { return this.source.kind === 'live'; }
   noteInput(tool) { this.epoch++; this.lastInput = { tool, sentMs: Date.now(), epoch: this.epoch }; }
@@ -189,7 +189,8 @@ export class World {
     try { health = await screen.status(); } catch { absorb(); health = { ok: false, reasons: ['unreachable'] }; }
     const reasons = health?.reasons ?? [];
     const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.some(reason => degraded.has(reason));
-    const lost = reasons.find(reason => !degraded.has(reason));
+    // Accessibility being down costs labels, not the screen: the picture and OCR still answer.
+    const lost = reasons.find(reason => !degraded.has(reason) && reason !== 'ax_unavailable');
     if (!stalled && !lost) return undefined;
     return {
       ...(stalled ? { stalled: { ms: frame?.stalledMs ?? null, lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
@@ -209,8 +210,18 @@ export class World {
     waitMs = Math.min(waitMs, budgetMs);
     const size = this.devices.size ?? { width: frame.width, height: frame.height };
     if (this.tree?.epoch === frame.epoch) return this.view(frame, { source: 'accessibility', elements: this.tree.elements, foreground: this.tree.foreground, tree: 'current' });
-    const startedMs = Date.now(), epoch = frame.epoch;
-    const reading = this.devices.structure(0).then(seen => {
+    const epoch = frame.epoch;
+    // One accessibility read at a time: a wedged service would otherwise collect a read per call. After
+    // a read that failed or came back empty, the picture alone answers for axRetryMs.
+    const down = performance.now() < this.axDownUntil;
+    if (!down) this.axRead ??= (() => {
+      const startedMs = Date.now();
+      return this.devices.structure(0).then(seen => {
+        if (!seen?.elements?.length) this.axDownUntil = performance.now() + axRetryMs; else this.axDownUntil = 0;
+        return { seen, startedMs };
+      }, error => { this.axDownUntil = performance.now() + axRetryMs; throw error; }).finally(() => { this.axRead = undefined; });
+    })();
+    const reading = down ? Promise.resolve(undefined) : this.axRead.then(({ seen, startedMs }) => {
       // Read after the frame's last change, and nothing has changed since: it describes this frame.
       // A tree identical to the last one although the pixels moved is the tree lagging the screen, until
       // treeLagMs after the input: only then are the same words on a new picture believed (an image or
@@ -228,7 +239,9 @@ export class World {
     const region = this.tree ? compare(this.tree.thumb, frame.thumb)?.region : null;
     const kept = region && this.tree ? this.tree.elements.filter(e => !inside(e, region, size)) : [];
     const recognized = await within(end - performance.now(), () => this.ocr(frame, kept.length ? region : null, size), []);
-    return this.view(frame, { source: kept.length ? 'accessibility+region_ocr' : 'ocr', elements: [...kept, ...recognized], foreground: this.tree?.foreground, tree: tree === 'late' ? 'pending' : 'unavailable', ocrOnly: recognized });
+    // The bridge names the app with each picture; an older tree's app is only a fallback.
+    return this.view(frame, { source: kept.length ? 'accessibility+region_ocr' : 'ocr', elements: [...kept, ...recognized], foreground: frame.foreground ?? this.tree?.foreground, tree: tree === 'late' ? 'pending' : 'unavailable', ocrOnly: recognized,
+      ...(performance.now() < this.axDownUntil ? { ax: 'unavailable' } : {}), ocrComplete: !kept.length && recognized.length > 0 });
   }
   async ocr(frame, region, size) {
     // The bridge keeps an OCR worker warm on the live frames; otherwise the helper reads a cropped PNG.
@@ -256,13 +269,15 @@ export class World {
       return JSON.parse(stdout).map(e => ({ label: e.text, text: e.text, type: 'StaticText', frame: { x: (e.x + left) * sx, y: (e.y + top) * sy, width: e.width * sx, height: e.height * sy }, ocr: true }));
     } finally { await unlink(file).catch(() => {}); }
   }
-  view(frame, { source, elements, foreground, tree, ocrOnly = [] }) {
+  view(frame, { source, elements, foreground, tree, ocrOnly = [], ax, ocrComplete = false }) {
     const lines = [...new Set(elements.map(lineOf).filter(Boolean))];
     const prompt = promptWarning(elements);
     const page = screenIdentity({ foreground, elements, prompt });
     // Without a tree, the app in front is the one the bridge named with the picture.
     foreground ??= frame.foreground;
-    return { frame, source, elements, foreground: foreground ? { bundle_id: foreground.bundle_id ?? null, pid: foreground.pid ?? null } : null, tree, lines, prompt, page, ocrOnly };
+    // Whether the app in front was read for this frame (by its tree or with its picture).
+    const foregroundFresh = tree === 'current' || Boolean(frame.foreground) && foreground === frame.foreground;
+    return { frame, source, elements, foreground: foreground ? { bundle_id: foreground.bundle_id ?? null, pid: foreground.pid ?? null } : null, foregroundFresh, tree, lines, prompt, page, ocrOnly, ocrComplete, ...(ax ? { ax } : {}) };
   }
   // How a session's last look differs from this one, so a result can lead with what is new.
   sinceLastLook(session, view) {

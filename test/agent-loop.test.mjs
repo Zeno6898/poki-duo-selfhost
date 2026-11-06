@@ -393,3 +393,21 @@ test('a locked phone reported by the bridge blocks inputs as a device problem', 
   assert.match(answer.now.summary, /^The phone is locked or its screen is off; unlock it/);
   assert.equal(phone.app.page, 'home');
 });
+
+test('with accessibility down, the picture and OCR answer, and the summary says so once', { timeout: 30000 }, async () => {
+  let reads = 0;
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date().toISOString(), settled: true, observation: 'after_input', foreground: phone.app.screen().foreground });
+  // The bridge's OCR worker reads the picture: here, the labels of what is drawn, as screen fractions.
+  const ocr = phone => async request => ({ elements: phone.app.screen().elements.map(e => ({ text: e.label, region: [e.x / W, e.y / H, e.width / W, e.height / H] })), epoch_matches: true, request });
+  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: ocr(phone) });
+  const phone = new LedgerPhone({ live });
+  phone.bridge = (original => async function (request) { if (request.op === 'ax') { reads++; return { foreground: { pid: 30 }, elements: [] }; } return original.call(this, request); })(phone.bridge);
+  const look = body(await phone.call('observe', {}));
+  assert.equal(look.now.summary.match(/Accessibility unavailable/g)?.length, 1, look.now.summary);
+  assert.ok(look.now.text.lines.some(line => /Ledger/.test(line)), JSON.stringify(look.now.text));
+  const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } }, expect: { foreground: 'local.ledger' } }));
+  assert.equal(opened.expectation, 'met', 'the app named with the picture is enough');
+  const entries = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 100, y: 120 } }, expect: { text: 'Select' } }));
+  assert.equal(entries.expectation, 'met');
+  assert.ok(reads <= 3, `${reads} accessibility reads while it was down`);
+});
