@@ -253,6 +253,7 @@ pub async fn subscribe(
                     "quiet_ms": now.quiet_since.map(|at| at.elapsed().as_millis() as u64),
                     // Nothing moved since the input: the input changed nothing on screen.
                     "changed_since_input": now.changed_since_input,
+                    "animating_region": crate::frames::animating_json(now.animating_region),
                     "captured_at": now.latest.map(|l| stamp_at(l.1)),
                     "size": now.latest.map(|l| [l.2, l.3]),
                     "epoch": now.epoch,
@@ -424,6 +425,8 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
         "moving": state.moving,
         "ms_since_unit": state.activity.map(|a| ago(a.at)),
         "picture_current": state.picture_current,
+        // Something keeps changing in place here (a spinner, a clock); settled ignores it.
+        "animating_region": crate::frames::animating_json(state.animating_region),
         "picture_after_input": state.last_input.map(|input| jpeg.arrived > input),
         // Upstream's rule: after an action, a frame not proven newer than it is unverified.
         "observation": observation(jpeg.epoch, state.last_input_epoch),

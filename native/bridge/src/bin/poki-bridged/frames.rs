@@ -145,6 +145,8 @@ struct Counters {
     units_done: u64,
     /// Units smaller than POKI_LIVE_ACTIVE_BYTES, not counted as movement.
     small_units: u64,
+    /// Pixel changes that repeated in place (see Animations), not counted as movement.
+    in_place_changes: u64,
     /// Time inside the decoder only (decode_ms_sum also counts the wait in the queue).
     decode_work_ms_sum: f64,
     decode_work_units: u64,
@@ -263,6 +265,100 @@ impl Default for UnitSizes {
     }
 }
 
+/// Changes that repeat in place (a spinner, a clock, a blinking caret) are not movement: a screen
+/// with one would never settle. A change is "in place" when earlier changes over at least
+/// IN_PLACE_FOR touched it and together cover it (with a small margin), within a box under
+/// IN_PLACE_AREA of the screen. A change once, however small (a typed character, a toggle), is
+/// movement; so is one that reaches outside the box (typing next to the caret), and any change in
+/// the AFTER_INPUT after an input.
+#[derive(Default)]
+struct Animations {
+    history: VecDeque<(Instant, [f64; 4])>,
+    minor: VecDeque<(Instant, [f64; 4])>,
+}
+
+const IN_PLACE_FOR: Duration = Duration::from_millis(900);
+/// How long after an input no change counts as in place.
+const AFTER_INPUT: Duration = Duration::from_millis(300);
+const IN_PLACE_AREA: f64 = 0.10;
+const IN_PLACE_MARGIN: f64 = 0.01;
+
+/// A region that keeps changing in place, for answers: {x, y, w, h, pct} (fractions of the
+/// screen; pct of its area), or null.
+pub fn animating_json(region: Option<[f64; 4]>) -> Value {
+    region.map_or(Value::Null, |[x, y, w, h]| {
+        let r = |v: f64| (v * 1000.0).round() / 1000.0;
+        json!({"x": r(x), "y": r(y), "w": r(w), "h": r(h), "pct": (w * h * 1000.0).round() / 10.0})
+    })
+}
+
+fn union(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    let (x0, y0) = (a[0].min(b[0]), a[1].min(b[1]));
+    let (x1, y1) = (
+        (a[0] + a[2]).max(b[0] + b[2]),
+        (a[1] + a[3]).max(b[1] + b[3]),
+    );
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+fn intersects(a: [f64; 4], b: [f64; 4]) -> bool {
+    a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+}
+
+fn contains(outer: [f64; 4], inner: [f64; 4], margin: f64) -> bool {
+    inner[0] >= outer[0] - margin
+        && inner[1] >= outer[1] - margin
+        && inner[0] + inner[2] <= outer[0] + outer[2] + margin
+        && inner[1] + inner[3] <= outer[1] + outer[3] + margin
+}
+
+impl Animations {
+    /// Records a change; whether it repeats in place (and so is not movement).
+    fn in_place(&mut self, now: Instant, region: [f64; 4]) -> bool {
+        let keep = IN_PLACE_FOR * 3;
+        while self
+            .history
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > keep)
+        {
+            self.history.pop_front();
+        }
+        while self
+            .minor
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(1))
+        {
+            self.minor.pop_front();
+        }
+        let touching: Vec<&(Instant, [f64; 4])> = self
+            .history
+            .iter()
+            .filter(|(_, r)| intersects(*r, region))
+            .collect();
+        let oldest = touching.iter().map(|(at, _)| *at).min();
+        let place = touching.iter().map(|(_, r)| *r).reduce(union);
+        let in_place = touching.len() >= 3
+            && oldest.is_some_and(|at| now.duration_since(at) >= IN_PLACE_FOR)
+            && place.is_some_and(|b| {
+                b[2] * b[3] < IN_PLACE_AREA && contains(b, region, IN_PLACE_MARGIN)
+            });
+        self.history.push_back((now, region));
+        if in_place {
+            self.minor.push_back((now, region));
+        }
+        in_place
+    }
+
+    /// Where something kept changing in place over the last second.
+    fn region(&self, now: Instant) -> Option<[f64; 4]> {
+        self.minor
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) <= Duration::from_secs(1))
+            .map(|(_, r)| *r)
+            .reduce(union)
+    }
+}
+
 /// What the daemon reads; written by the receive task and the decoder thread.
 #[derive(Default)]
 struct Screen {
@@ -304,6 +400,10 @@ struct Screen {
     /// Sizes of the newest units, for tuning, and the idle baseline (see UnitSizes).
     recent_unit_bytes: VecDeque<usize>,
     sizes: UnitSizes,
+    /// Changes that repeat in place, kept apart from movement (see Animations).
+    animations: Animations,
+    /// The decoder thread's niceness (see lower_priority).
+    decoder_nice: Option<i32>,
 }
 
 enum Job {
@@ -452,6 +552,9 @@ pub struct State {
     /// Whether the screen moved after the last input (None before any input), by the authority
     /// in use: pixels when decoding, unit sizes otherwise.
     pub changed_since_input: Option<bool>,
+    /// Where something kept changing in place over the last second (x, y, w, h as fractions):
+    /// settled does not wait for it.
+    pub animating_region: Option<[f64; 4]>,
 }
 
 impl Live {
@@ -508,6 +611,7 @@ impl Live {
         State {
             settled: quiet && (!decoding || (screen.latest.is_some() && picture_current)),
             moving: moved.is_some_and(|at| at.elapsed() < settle),
+            animating_region: screen.animations.region(Instant::now()),
             changed_since_input: screen
                 .last_input
                 .map(|input| moved.is_some_and(|at| at > input)),
@@ -783,6 +887,9 @@ impl Live {
             "idle_baseline_bytes": screen.sizes.baseline,
             "active_threshold_bytes": screen.sizes.threshold(),
             "movement_from": if state.decoding { "pixels" } else { "unit_bytes" },
+            "animating_region": animating_json(state.animating_region),
+            "in_place_changes": c.in_place_changes,
+            "decoder_nice": screen.decoder_nice,
         });
         if let (Value::Object(report), Value::Object(clock)) = (&mut report, clock) {
             report.extend(clock);
@@ -1043,6 +1150,10 @@ fn decode_loop(
     notify: Arc<tokio::sync::watch::Sender<u64>>,
     ready: Arc<AtomicBool>,
 ) {
+    // Below the daemon's own work (input, accessibility reads, the tunnel): the decoder's slice
+    // threads are made from this thread and inherit it.
+    let niceness = lower_priority();
+    screen.lock().unwrap().decoder_nice = niceness;
     let mut decoder: Option<libav::Decoder> = None;
     let mut thumbnailer = libav::Thumbnailer::default();
     let mut encoder = libav::JpegEncoder::default();
@@ -1178,9 +1289,22 @@ fn decode_loop(
                         && difference.changed > 0.0
                     {
                         screen.counters.changes += 1;
-                        screen.last_change = Some((arrived, difference));
-                        screen.last_change_wall = Some(wall);
-                        screen.last_change_epoch = Some(epoch);
+                        // Right after an input, every change is movement: the input's own effect
+                        // may land where something changed before (deleting what was typed).
+                        let answering = screen
+                            .last_input
+                            .and_then(|input| arrived.checked_duration_since(input))
+                            .is_some_and(|after| after < AFTER_INPUT);
+                        let in_place = difference.region.is_some_and(|region| {
+                            screen.animations.in_place(arrived, region) && !answering
+                        });
+                        if in_place {
+                            screen.counters.in_place_changes += 1;
+                        } else {
+                            screen.last_change = Some((arrived, difference));
+                            screen.last_change_wall = Some(wall);
+                            screen.last_change_epoch = Some(epoch);
+                        }
                     }
                     if let Some(mut thumb) = thumb {
                         thumb.epoch = epoch;
@@ -1209,6 +1333,36 @@ fn decode_loop(
             screen.generation += 1;
             notify.send_replace(screen.generation);
         }
+    }
+}
+
+/// Lowers this thread's CPU priority (POKI_LIVE_DECODE_NICE, default 10; 0 leaves it); the
+/// niceness it has now.
+fn lower_priority() -> Option<i32> {
+    let nice: i32 = std::env::var("POKI_LIVE_DECODE_NICE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10);
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn gettid() -> i32;
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+            fn getpriority(which: i32, who: u32) -> i32;
+        }
+        // PRIO_PROCESS with a thread id sets that thread alone on Linux.
+        unsafe {
+            let tid = gettid() as u32;
+            if nice != 0 {
+                setpriority(0, tid, nice.clamp(-20, 19));
+            }
+            Some(getpriority(0, tid))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = nice;
+        None
     }
 }
 
@@ -1678,6 +1832,10 @@ mod tests {
                     live.state(settle).moving,
                     "no baseline yet: every unit counts"
                 );
+                #[cfg(target_os = "linux")]
+                if std::env::var("POKI_LIVE_DECODE_NICE").is_err() {
+                    assert_eq!(live.screen.lock().unwrap().decoder_nice, Some(10));
+                }
                 tokio::time::sleep(Duration::from_millis(1000)).await;
                 assert!(live.wait_settled(settle, Duration::from_millis(500)).await);
                 let state = live.state(settle);
@@ -1716,6 +1874,34 @@ mod tests {
                 idle.abort();
                 drop(tx);
             });
+    }
+
+    #[test]
+    fn a_change_that_repeats_in_place_is_not_movement() {
+        let mut animations = Animations::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let spinner = [0.80, 0.30, 0.04, 0.02];
+        // The first second of a spinner is movement: nothing says yet that it repeats.
+        assert!(!animations.in_place(at(0), spinner));
+        for ms in (50..900).step_by(50) {
+            assert!(!animations.in_place(at(ms), spinner), "{ms} ms");
+        }
+        assert!(animations.in_place(at(950), spinner));
+        assert!(animations.in_place(at(1000), [0.801, 0.301, 0.038, 0.019]));
+        let region = animations.region(at(1000)).unwrap();
+        assert!(contains(spinner, region, 0.001));
+        // Elsewhere, once: movement, however small (a typed character).
+        assert!(!animations.in_place(at(1010), [0.10, 0.50, 0.01, 0.01]));
+        // Reaching outside the spinner's box: movement.
+        assert!(!animations.in_place(at(1020), [0.70, 0.30, 0.14, 0.02]));
+        // A large region that keeps changing is movement too (a video, a scroll).
+        let mut large = Animations::default();
+        for ms in (0..2000).step_by(50) {
+            assert!(!large.in_place(at(ms), [0.0, 0.2, 1.0, 0.5]));
+        }
+        assert!(animations.region(at(3000)).is_none(), "gone after a second");
+        assert_eq!(animating_json(Some(spinner))["pct"], 0.1);
     }
 
     #[test]
