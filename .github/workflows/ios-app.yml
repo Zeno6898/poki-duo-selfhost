@@ -121,6 +121,7 @@ jobs:
           echo "Poki ran on the simulator for 60 s"
           # Every screen, light and dark, for the UI check.
           mkdir -p shots
+          crashed=0
           for look in light dark; do
             xcrun simctl ui "$UDID" appearance "$look"
             for screen in home setup connect debug activity; do
@@ -128,13 +129,23 @@ jobs:
               xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen "$screen" > /dev/null
               sleep 4
               xcrun simctl io "$UDID" screenshot "shots/$screen-$look.png" > /dev/null
+              xcrun simctl spawn "$UDID" launchctl list > out/simulator/launchctl.txt 2>&1 || true
+              grep -q 'nz.zheha.poki' out/simulator/launchctl.txt || { echo "::error::Poki died on the $screen screen ($look)"; crashed=1; }
             done
             xcrun simctl terminate "$UDID" nz.zheha.poki || true
             xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen home -pokiSample YES > /dev/null
             sleep 4
             xcrun simctl io "$UDID" screenshot "shots/home-sample-$look.png" > /dev/null
+            xcrun simctl spawn "$UDID" launchctl list > out/simulator/launchctl.txt 2>&1 || true
+            grep -q 'nz.zheha.poki' out/simulator/launchctl.txt || { echo "::error::Poki died on the sample home screen ($look)"; crashed=1; }
           done
           ls shots
+          # No crash anywhere on the way: any Poki crash report fails the build.
+          if ls ~/Library/Logs/DiagnosticReports/Poki* > /dev/null 2>&1; then
+            for f in $(ls -t ~/Library/Logs/DiagnosticReports/Poki* | head -2); do echo "== $f"; head -80 "$f"; cp "$f" out/simulator/ || true; done
+            crashed=1
+          fi
+          [ "$crashed" = 0 ] || exit 1
 
       - uses: actions/upload-artifact@v4
         with:
