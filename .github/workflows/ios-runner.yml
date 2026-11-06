@@ -1,12 +1,17 @@
 # Builds Poki's on-phone runner (WebDriverAgentRunner from the vendored Appium WebDriverAgent,
-# branded as Poki) as an unsigned IPA. It is signed when it is installed (for now with AltStore and the
-# user's Apple ID). There is no other build path: the Mac in use has no Xcode.
+# branded as Poki) as an unsigned IPA. It is signed when it is installed (with the person's signing tool
+# and Apple ID, the same as Poki). There is no other build path: the Mac in use has no Xcode.
 name: iOS runner
 
 on:
   workflow_dispatch:
   push:
     branches: [dev/ios-runner]
+  # The release workflow builds the runner from the tagged commit with the release's version.
+  workflow_call:
+    inputs:
+      version: { type: string, required: true }
+      build: { type: string, required: true }
 
 permissions:
   contents: read
@@ -46,6 +51,16 @@ jobs:
 
       - name: PokiRunnerHost (opened by hand, the runner starts no test and sends people to Poki)
         run: native/ios-runner/host/install.sh "$PRODUCTS/$RUNNER" iphoneos
+
+      - name: Version (the same version and build number as Poki in a release)
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"; BUILD="${{ inputs.build }}"
+          [ -n "$VERSION" ] || VERSION=$(cat native/ios-app/VERSION 2>/dev/null || echo 0.2.0)
+          [ -n "$BUILD" ] || BUILD="${{ github.run_number }}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PRODUCTS/$RUNNER/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PRODUCTS/$RUNNER/Info.plist"
+          echo "Poki Runner $VERSION ($BUILD)"
 
       - name: Package the IPA
         run: |
@@ -100,6 +115,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ARCHS=arm64 | tee build/probe.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " || true
           test -d build/probe/Build/Products/Release-iphoneos/PokiProbe.app
+
+      - name: Version (the same version and build number as Poki in a release)
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"; BUILD="${{ inputs.build }}"
+          [ -n "$VERSION" ] || VERSION=$(cat native/ios-app/VERSION 2>/dev/null || echo 0.2.0)
+          [ -n "$BUILD" ] || BUILD="${{ github.run_number }}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PRODUCTS/$RUNNER/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PRODUCTS/$RUNNER/Info.plist"
+          echo "Poki Runner $VERSION ($BUILD)"
 
       - name: Package the IPA
         run: |
