@@ -1,0 +1,99 @@
+// Drives PokiCore's look/do through its MCP handler against a real WebDriverAgent (the iOS
+// Simulator in CI), in Settings only, and prints what each call answered and how long it took.
+// Exits non-zero when a check fails. macOS only; elsewhere it says so and exits.
+import Foundation
+#if os(macOS)
+import PokiCore
+import ImageIO
+import UniformTypeIdentifiers
+
+final class Host: CoreHost, @unchecked Sendable {
+    struct NoKey: Error {}
+    func signingKey() throws -> RelayKey { throw NoKey() }
+    func accessHashes() -> [String] { [] }
+    func jpeg(fromPNG png: Data, width: Int, quality: Double) throws -> Data {
+        guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: width * 3] as CFDictionary) else { throw NoKey() }
+        let out = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) else { throw NoKey() }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        CGImageDestinationFinalize(destination)
+        return out as Data
+    }
+    func runnerState() -> RunnerState { .running }
+    func restartRunner() {}
+}
+
+let url = URL(string: ProcessInfo.processInfo.environment["POKI_WDA_URL"] ?? "http://127.0.0.1:8100")!
+let core = PokiCore(config: CoreConfig(runnerURL: url), host: Host())
+var session: String?
+var rows: [(String, Int, String)] = []
+var failures: [String] = []
+
+@MainActor func rpc(_ method: String, _ params: JSON) async -> JSON? {
+    let body: JSON = ["jsonrpc": "2.0", "id": 1, "method": .string(method), "params": params]
+    let reply = await core.handle(RelayRequest(id: "1", method: "POST", headers: session.map { ["mcp-session-id": $0] } ?? [:], body: body.serialized()))
+    if session == nil { session = reply.headers["mcp-session-id"] }
+    return try? JSON.parse(reply.body)
+}
+
+@discardableResult @MainActor
+func call(_ label: String, _ name: String, _ args: JSON = .object([:])) async -> String {
+    let started = Date()
+    let reply = await rpc("tools/call", ["name": .string(name), "arguments": args])
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    let text = reply?["result"]?["content"]?[0]?["text"]?.string ?? "no answer: \(reply?.serialized() ?? "nil")"
+    let images = reply?["result"]?["content"]?.array?.filter { $0["type"]?.string == "image" }.count ?? 0
+    print("=== \(label): \(ms) ms, \(images) image(s)\n\(text)\n")
+    rows.append((label, ms, text.split(separator: "\n").first.map(String.init) ?? ""))
+    return text
+}
+
+@MainActor func check(_ ok: Bool, _ what: String) {
+    print(ok ? "PASS \(what)" : "FAIL \(what)")
+    if !ok { failures.append(what) }
+}
+
+_ = await rpc("initialize", ["protocolVersion": "2025-06-18", "capabilities": .object([:]), "clientInfo": ["name": "poki-sim-check", "version": "1"]])
+await call("look (cold: opens the session)", "look")
+let launched = await call("launch Settings fresh", "do", ["actions": [["launch": ["bundle": "com.apple.Preferences", "fresh": true]]]])
+check(launched.contains("app: Settings"), "Settings is in front after launch")
+await call("look (warm)", "look")
+await call("look (warm, again)", "look")
+let swiped = await call("swipe up", "do", ["actions": [["swipe": "up"]]])
+check(swiped.contains("screen_changed: true"), "a swipe up scrolls Settings")
+let back = await call("swipe down", "do", ["actions": [["swipe": "down"]]])
+check(back.contains("screen_changed: true"), "a swipe down scrolls back")
+let dragged = await call("drag up 300 points", "do", ["actions": [["drag": [200, 650, 200, 350]]]])
+check(dragged.contains("screen_changed: true"), "a drag scrolls Settings")
+let found = await call("scroll_to Privacy", "do", ["actions": [["scroll_to": "Privacy"]]])
+check(found.contains("found at"), "scroll_to finds Privacy")
+let same = await call("no-op wait", "do", ["actions": [["wait": 300]]])
+check(same.contains("screen_changed: false"), "nothing done: screen_changed false")
+await call("swipe down to the top", "do", ["actions": [["swipe": "down"], ["swipe": "down"]]])
+// Settings' search field: typing, read back exactly.
+let list = await call("look for the search field", "look")
+let searchRef = list.split(separator: "\n").first { $0.contains("SearchField") }.flatMap { line in line.split(separator: " ").first { Int($0.trimmingCharacters(in: CharacterSet(charactersIn: "+~"))) != nil } }.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "+~")) }
+if let searchRef, let ref = Int(searchRef) {
+    let text = "Wi-Fi 你好 123"
+    let typed = await call("type mixed text in search", "do", ["actions": [["type": .string(text), "ref": .number(Double(ref))]]])
+    check(typed.contains("the field now reads \"\(text)\""), "typed text reads back exactly")
+    let waited = await call("wait_until settled", "do", ["actions": [["wait_until": "settled"]]])
+    check(waited.contains("held still"), "wait_until settled")
+} else {
+    check(false, "Settings shows a search field")
+}
+let home = await call("home", "do", ["actions": [["button": "home"]]])
+check(home.contains("app:"), "home answers")
+await call("status", "status")
+
+print("\n| call | ms | first line |\n|---|---:|---|")
+for (label, ms, line) in rows { print("| \(label) | \(ms) | \(line.replacingOccurrences(of: "|", with: "/")) |") }
+if !failures.isEmpty {
+    print("\n\(failures.count) check(s) failed: \(failures.joined(separator: "; "))")
+    exit(1)
+}
+print("\nall checks passed")
+#else
+print("poki-sim-check runs on macOS only")
+#endif
