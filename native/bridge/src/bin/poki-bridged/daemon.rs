@@ -315,7 +315,9 @@ async fn reap(state: Rc<State>) {
                 let mut timings = Timings::default();
                 match Box::pin(session.prepare_input_or_retry(false, &mut timings)).await {
                     Ok(()) => {
-                        if let Some(input) = session.input.as_ref() {
+                        if let Some(input) = session.input.as_ref()
+                            && !live::decode_off()
+                        {
                             input.frames.live().decode();
                         }
                         log(&format!(
@@ -541,6 +543,12 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     json!({"opened": session.tunnels_opened, "lost": session.tunnels_lost});
                 pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
                 pong["foreground"] = live::foreground_json(state);
+                pong["decode_mode"] = if live::decode_off() {
+                    "off"
+                } else {
+                    "continuous"
+                }
+                .into();
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
@@ -1143,7 +1151,11 @@ impl Session {
                 .into_iter()
                 .map(|socket| tokio::spawn(async move { while socket.recv().await.is_ok() {} }))
                 .collect();
-            let frames = crate::frames::Frames::new(video_udp, our_ssrc, live::enabled());
+            let frames = crate::frames::Frames::new(
+                video_udp,
+                our_ssrc,
+                live::enabled() && !live::decode_off(),
+            );
             let mut input = Input {
                 client,
                 drains,
