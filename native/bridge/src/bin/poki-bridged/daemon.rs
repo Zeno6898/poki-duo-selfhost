@@ -515,6 +515,10 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     // Units arrive but the newest picture is old: decoding is behind.
                     reasons.push("decode_backlog");
                 }
+                if frames["picture_damaged"] == json!(true) {
+                    // A packet was lost: pictures may show errors until the session reopens.
+                    reasons.push("picture_damaged");
+                }
                 if let Some(down) = &session.tunnel_down {
                     reasons.push(if down.state == "wifi_required" {
                         "wifi_required"
