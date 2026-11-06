@@ -224,7 +224,7 @@ test('the profile and the count of listed tools follow the environment', async (
   assert.equal(profile({ POKI_LIVE_FRAMES: '1', POKI_TOOL_PROFILE: 'default' }), 'default');
   assert.equal(listedNames({ POKI_TOOL_PROFILE: 'agent' }).length, 7);
   assert.equal(listedNames({}).length, 29);
-  assert.equal(listedNames({ POKI_MCP_TOOLS: 'all' }).length, 59);
+  assert.equal(listedNames({ POKI_MCP_TOOLS: 'all' }).length, 61);
 });
 
 test('a stalled screen video with no screenshot to be had is said first, the outcome is unverified, and the old picture is marked as such', { timeout: 30000 }, async () => {

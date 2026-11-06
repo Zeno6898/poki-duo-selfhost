@@ -1546,6 +1546,292 @@
         },
         "additionalProperties": false
       }
+    },
+    {
+      "name": "step",
+      "description": "Send actions back to back, then read the screen once. The reply is facts, not a verdict: each action with when it was sent and whether the device took it, how long the screen took to go quiet, what appeared, vanished or changed since your last read (elements with numbered refs; unchanged elements keep their refs), the app in front, and a small screenshot of the screen now. You judge whether it worked. Refs must come from the latest reply. full=true lists every element instead of the changes. When accessibility cannot be read, the elements come from OCR of the screenshot (source: ocr).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "Exactly one of: tap {ref} or {x, y}; fill {ref, text, clear?} (sets the field's value, else types it as keys, else pastes with your clipboard saved and put back); type {text} into the field being edited; launch {bundle}; button {name: home, lock, volume_up, volume_down}; swipe {direction, in?, distance?: short|long}; scroll_to {text or ref, in?, direction?, max_swipes?: 6}; long_press {ref or x, y, ms?: 600}; drag {from: {ref} or {x, y}, to, ms?: 400}; pinch {ref or x, y, scale}; wait {ms}. x and y are in the same points as the frames in replies.",
+              "properties": {
+                "tap": {
+                  "type": "object",
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "fill": {
+                  "type": "object",
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "clear": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ],
+                  "additionalProperties": false
+                },
+                "type": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ],
+                  "additionalProperties": false
+                },
+                "launch": {
+                  "type": "object",
+                  "properties": {
+                    "bundle": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "bundle"
+                  ],
+                  "additionalProperties": false
+                },
+                "button": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ],
+                  "additionalProperties": false
+                },
+                "swipe": {
+                  "type": "object",
+                  "description": "direction is where the finger moves.",
+                  "properties": {
+                    "direction": {
+                      "type": "string",
+                      "enum": [
+                        "up",
+                        "down",
+                        "left",
+                        "right"
+                      ]
+                    },
+                    "in": {
+                      "type": "string",
+                      "description": "ref of the list or area to swipe in; the screen by default"
+                    },
+                    "distance": {
+                      "type": "string",
+                      "enum": [
+                        "short",
+                        "long"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "direction"
+                  ],
+                  "additionalProperties": false
+                },
+                "wait": {
+                  "type": "object",
+                  "properties": {
+                    "ms": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 3000
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "scroll_to": {
+                  "type": "object",
+                  "description": "Swipes until the target is fully on screen, then reads once.",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    },
+                    "in": {
+                      "type": "string"
+                    },
+                    "direction": {
+                      "type": "string",
+                      "enum": [
+                        "up",
+                        "down",
+                        "left",
+                        "right"
+                      ],
+                      "description": "where to look; down by default"
+                    },
+                    "max_swipes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 12
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "long_press": {
+                  "type": "object",
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    },
+                    "ms": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 5000
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "drag": {
+                  "type": "object",
+                  "properties": {
+                    "from": {
+                      "type": "object",
+                      "properties": {
+                        "ref": {
+                          "type": "string"
+                        },
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "to": {
+                      "type": "object",
+                      "properties": {
+                        "ref": {
+                          "type": "string"
+                        },
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "ms": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 3000
+                    }
+                  },
+                  "required": [
+                    "from",
+                    "to"
+                  ],
+                  "additionalProperties": false
+                },
+                "pinch": {
+                  "type": "object",
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    },
+                    "scale": {
+                      "type": "number",
+                      "minimum": 0.25,
+                      "maximum": 4
+                    }
+                  },
+                  "required": [
+                    "scale"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "minProperties": 1,
+              "maxProperties": 1,
+              "additionalProperties": false
+            },
+            "maxItems": 12
+          },
+          "full": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "actions"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "look",
+      "description": "Read the screen without acting: what appeared, vanished or changed since your last read, with numbered refs, and the app in front. full=true lists every element; image=true adds a small screenshot. Use it once on an unfamiliar screen; every step already ends with this read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "full": {
+            "type": "boolean"
+          },
+          "image": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
     }
   ]
 }

@@ -179,6 +179,12 @@ enum Request {
         #[serde(default)]
         target: Option<pasteboard::Target>,
     },
+    /// Types text as hardware key presses into whatever is being edited, without the pasteboard.
+    TypeKeys {
+        text: String,
+        #[serde(default)]
+        clear: bool,
+    },
 }
 fn tap_duration() -> u64 {
     50
@@ -258,6 +264,14 @@ impl Request {
                 button_usage(button)?;
                 if !(1..=200).contains(count) || *interval_ms > 10000 {
                     return Err("Invalid button count or interval_ms".into());
+                }
+            }
+            Self::TypeKeys { text, .. } => {
+                if text.chars().count() > 2000 {
+                    return Err("type_keys text is at most 2000 characters".into());
+                }
+                for c in text.chars() {
+                    char_usage(c)?;
                 }
             }
             Self::TypeText { text, .. } if text.len() > 1024 * 1024 => {
@@ -703,6 +717,13 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
                     keyboard.send_button(0x0c, code, ButtonState::Up).await?;
                 }
             }
+            Request::TypeKeys { text, clear } => {
+                let mut keyboard = Keyboard::connect(&mut adapter, &mut rsd).await?;
+                let outcome = type_keys(&mut keyboard, &text, clear).await;
+                let cleanup = keyboard.close().await;
+                outcome?;
+                cleanup?;
+            }
             Request::TypeText {
                 text,
                 clear,
@@ -811,6 +832,103 @@ fn key_usage(name: &str) -> Result<u64> {
         }
         _ => return Err(format!("Unknown keyboard key: {name}").into()),
     })
+}
+
+/// The US-layout key, and whether it takes shift, that types one character.
+fn char_usage(c: char) -> Result<(u64, bool)> {
+    Ok(match c {
+        'a'..='z' => (4 + (c as u64 - 'a' as u64), false),
+        'A'..='Z' => (4 + (c as u64 - 'A' as u64), true),
+        '1'..='9' => (0x1e + (c as u64 - '1' as u64), false),
+        '0' => (0x27, false),
+        '\n' => (0x28, false),
+        '\t' => (0x2b, false),
+        ' ' => (0x2c, false),
+        '!' => (0x1e, true),
+        '@' => (0x1f, true),
+        '#' => (0x20, true),
+        '$' => (0x21, true),
+        '%' => (0x22, true),
+        '^' => (0x23, true),
+        '&' => (0x24, true),
+        '*' => (0x25, true),
+        '(' => (0x26, true),
+        ')' => (0x27, true),
+        '-' => (0x2d, false),
+        '_' => (0x2d, true),
+        '=' => (0x2e, false),
+        '+' => (0x2e, true),
+        '[' => (0x2f, false),
+        '{' => (0x2f, true),
+        ']' => (0x30, false),
+        '}' => (0x30, true),
+        '\\' => (0x31, false),
+        '|' => (0x31, true),
+        ';' => (0x33, false),
+        ':' => (0x33, true),
+        '\'' => (0x34, false),
+        '"' => (0x34, true),
+        '`' => (0x35, false),
+        '~' => (0x35, true),
+        ',' => (0x36, false),
+        '<' => (0x36, true),
+        '.' => (0x37, false),
+        '>' => (0x37, true),
+        '/' => (0x38, false),
+        '?' => (0x38, true),
+        _ => return Err(format!("type_keys cannot type {c:?}; use type_text").into()),
+    })
+}
+
+/// Presses the keys for `text` back to back on one keyboard session (POKI_TYPE_KEY_MS between
+/// reports, default 12), after Command-A and Delete when `clear` is set. No settle per character.
+async fn type_keys(keyboard: &mut Keyboard, text: &str, clear: bool) -> Result<()> {
+    if clear {
+        chord(keyboard, 0x04, &[0xe3]).await?;
+        chord(keyboard, 0x2a, &[]).await?;
+    }
+    let gap = hid_wait("POKI_TYPE_KEY_MS", 12);
+    let shift = KeyboardUsage::new(0xe1)?;
+    let result: Result<()> = async {
+        for c in text.chars() {
+            let (usage, shifted) = char_usage(c)?;
+            let key = KeyboardUsage::new(usage as u16)?;
+            if shifted {
+                keyboard
+                    .hid
+                    .main_keyboard_key_down(&mut keyboard.service, shift)
+                    .await?;
+            }
+            keyboard
+                .hid
+                .main_keyboard_key_down(&mut keyboard.service, key)
+                .await?;
+            tokio::time::sleep(gap).await;
+            keyboard
+                .hid
+                .main_keyboard_key_up(&mut keyboard.service, key)
+                .await?;
+            if shifted {
+                keyboard
+                    .hid
+                    .main_keyboard_key_up(&mut keyboard.service, shift)
+                    .await?;
+            }
+            tokio::time::sleep(gap).await;
+        }
+        Ok(())
+    }
+    .await;
+    let release_error = keyboard
+        .hid
+        .set_main_keyboard_usages(&mut keyboard.service, [])
+        .await
+        .err();
+    result?;
+    if let Some(error) = release_error {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn button_usage(name: &str) -> Result<(u64, u64)> {

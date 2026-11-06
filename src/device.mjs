@@ -20,6 +20,7 @@ import { actAndObserve } from './act-and-observe.mjs';
 import { liveScreenFor, enabled as liveFramesEnabled } from './live-frames.mjs';
 import { World } from './world.mjs';
 import * as agentLoop from './agent-loop.mjs';
+import * as lean from './lean.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -568,6 +569,8 @@ export class Devices {
         case 'observe': return await agentLoop.observe(this, args);
         case 'act': return await agentLoop.act(this, args);
         case 'run': return await agentLoop.run(this, args);
+        case 'step': return await lean.step(this, args);
+        case 'look': return await lean.look(this, args);
         default: {
           const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
           this.beforeInput = undefined; this.expectsForeground = false;

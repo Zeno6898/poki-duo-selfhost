@@ -17,9 +17,13 @@ const instructions = 'When the request already says what to do on the device, us
 // The agent profile lists only the screen-as-state tools, for an agent that drives a device in a loop
 // (POKI_TOOL_PROFILE=agent; the default with the live screen on). Every other tool still answers by name.
 export const agentTools = new Set(['observe', 'act', 'run', 'list_apps', 'list_devices', 'select_device', 'poki_mcp_status']);
+// The lean profile (POKI_TOOL_PROFILE=lean): act, then read once, and the model judges (lean.mjs).
+export const leanTools = new Set(['step', 'look', 'list_apps', 'list_devices', 'select_device', 'poki_mcp_status']);
+const leanInstructions = 'Call look once on an unfamiliar screen, then step {actions} with the actions you have decided on; each step answers with what changed on screen (numbered refs), the app in front and a screenshot. Decide from those facts whether it worked and what to do next. Refs are valid only from the latest reply.';
+const listedFor = name => name === 'agent' ? agentTools : name === 'lean' ? leanTools : defaultTools;
 export const profile = (env = process.env) => env.POKI_TOOL_PROFILE ?? (env.POKI_LIVE_FRAMES === '1' ? 'agent' : 'default');
 const agentInstructions = 'Call observe once on an unfamiliar screen, then act {action, expect} for one step or run {steps} for steps you already know; every reply ends with now, the screen read for one frame, so there is no need to look again after it. Trust now.outcome: as_expected needs no re-check, and only unchanged, unknown, unverified or a stopped run need a decision. Put actions the user asked for that delete, send, pay or confirm in allow, and a run stops before any other such step.';
-const readOnly = new Set(['observe', 'observe_device','list_devices', 'get_device_info', 'take_screenshot', 'get_foreground_app', 'list_elements', 'list_apps', 'get_clipboard', 'list_crashes', 'get_crash', 'wait_for', 'wait']);
+const readOnly = new Set(['look', 'observe', 'observe_device','list_devices', 'get_device_info', 'take_screenshot', 'get_foreground_app', 'list_elements', 'list_apps', 'get_clipboard', 'list_crashes', 'get_crash', 'wait_for', 'wait']);
 const guidance = {
   acquire_device: 'Only needed to keep other sessions off a device across several calls. One batch_commands call already runs without interruption, so a single-call task needs no lease. If you take one, keep the returned lease_id, renew before expiry, then release.',
   wait_for: 'The timeout covers device capture, AX, OCR and polling. Success includes the matching observation and its image, so a second screenshot is not needed to inspect the matched state.',
@@ -46,12 +50,11 @@ definitions.push(['poki_mcp_status', 'Report Poki MCP version, current Git commi
 if (actAndObserve.registered()) { definitions.push(actAndObserve.definition); defaultTools.add(actAndObserve.name); }
 
 // The tools a tools/list answer names under this process's settings.
-export const listedNames = (env = process.env) => env.POKI_MCP_TOOLS === 'all' ? definitions.map(([name]) => name) : definitions.map(([name]) => name).filter(name => (profile(env) === 'agent' ? agentTools : defaultTools).has(name));
+export const listedNames = (env = process.env) => env.POKI_MCP_TOOLS === 'all' ? definitions.map(([name]) => name) : definitions.map(([name]) => name).filter(name => listedFor(profile(env)).has(name));
 
 export function createServer(call) {
-  const agent = profile() === 'agent';
-  const listed = agent ? agentTools : defaultTools;
-  const server = new McpServer({ name: 'poki-mcp', version }, { instructions: agent ? agentInstructions : instructions });
+  const chosen = profile(), listed = listedFor(chosen);
+  const server = new McpServer({ name: 'poki-mcp', version }, { instructions: chosen === 'agent' ? agentInstructions : chosen === 'lean' ? leanInstructions : instructions });
   for (const [name, description, inputSchema, readOnlyHint] of definitions) {
     server.registerTool(name, { description, inputSchema, annotations: { readOnlyHint } }, async (args, extra) => {
       const elicit = extra.mcpReq?.elicitInput;
