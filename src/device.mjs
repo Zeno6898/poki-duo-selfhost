@@ -193,7 +193,7 @@ export class Devices {
   // The screen as state for the observe, act and run tools (see world.mjs).
   async world() {
     const target = await this.target();
-    if (!this.worlds.has(target.id)) this.worlds.set(target.id, new World(this));
+    if (!this.worlds.has(target.id)) this.worlds.set(target.id, new World(this, this.liveScreen(target)));
     return this.worlds.get(target.id);
   }
   async captureFrame() {
@@ -248,7 +248,7 @@ export class Devices {
   // The pictures' verdict on the last input replaces the accessibility one: a tree can lag the screen,
   // a decoded picture cannot. Leaves the result as it is when the live screen did not answer.
   withPixels(result) {
-    const settled = this.lastSettle;
+    const settled = this.worlds.get(this.resolved?.id)?.lastSettle;
     if (!settled || settled.input !== this.lastInputAt || settled.changedSinceInput === null || settled.changedSinceInput === undefined) return result;
     const changed = settled.changedSinceInput;
     const lagging = result.screen_change === 'unchanged' && changed;
@@ -389,10 +389,10 @@ export class Devices {
     const screen = Number.isFinite(this.lastInputAt) ? this.liveScreen() : undefined;
     if (screen) {
       // Settled is seen, not timed: poki-bridged answers when the picture has stopped changing.
-      if (this.lastSettle?.input === this.lastInputAt) return;
+      const world = await this.world();
+      if (world.lastSettle?.input === this.lastInputAt) return;
       try {
-        const picture = await screen.waitSettled({ timeoutMs: liveSettleTimeoutMs, maxWidth: 64 });
-        this.lastSettle = { input: this.lastInputAt, ...picture, jpeg: undefined };
+        (await world.settle(liveSettleTimeoutMs, undefined, 64)).input = this.lastInputAt;
         return;
       } catch (error) { if (stopped(error)) throw error; }
     }

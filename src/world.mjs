@@ -2,9 +2,10 @@
 // a frame says when the screen last changed, and a tree or OCR text is attached to a frame only when
 // it was read after that change, so a result never pairs a new picture with an old description.
 //
-// Two frame sources share one interface. With POKI_LIVE_FRAMES=1 the long-lived bridge decodes the
-// screen video and answers latest_frame and wait_settled in milliseconds; otherwise each frame is a
-// developer-service screenshot, and "settled" means two captures in a row look the same.
+// Two frame sources share one interface. With the live screen on (POKI_LIVE_FRAMES=1 beside
+// POKI_BRIDGE_DAEMON=1, see live-frames.mjs) the long-lived bridge decodes the screen video and
+// answers latest_frame and wait_settled in milliseconds; otherwise each frame is a developer-service
+// screenshot, and "settled" means two captures in a row look the same.
 import { writeFile, unlink, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -15,7 +16,6 @@ import { ocrStatus, ocrPath } from './build-info.mjs';
 import { promptWarning } from './interaction.mjs';
 import { screenIdentity } from './screen-identity.mjs';
 
-export const liveFrames = () => process.env.POKI_LIVE_FRAMES === '1';
 const thumbWidth = 64, pixelDelta = 16, changedAbove = 0.002, statusBar = 0.07, quietMs = 150, imageWidth = 360;
 
 // A small grayscale copy, which is all a comparison needs.
@@ -64,18 +64,18 @@ class CaptureSource {
 
 class LiveSource {
   kind = 'live';
-  constructor(devices) { this.devices = devices; }
-  async frame() { return fromLive(await this.devices.bridge({ op: 'latest_frame', max_width: 600, quality: 5 })); }
-  async settled({ timeoutMs, settleMs }) {
-    return fromLive(await this.devices.bridge({ op: 'wait_settled', timeout_ms: Math.max(1, Math.round(timeoutMs)), ...(settleMs ? { settle_ms: settleMs } : {}) }));
-  }
+  constructor(screen) { this.screen = screen; }
+  async frame() { return fromLive(await this.screen.latestFrame({ maxWidth: 600 })); }
+  async settled({ timeoutMs, settleMs, maxWidth = 600 }) { return fromLive(await this.screen.waitSettled({ timeoutMs, settleMs, maxWidth })); }
 }
 
-function fromLive(answer) {
-  if (!answer?.jpeg_base64) throw new Error(answer?.error ?? 'The live screen feed returned no picture.');
-  const capturedMs = Date.parse(answer.captured_at);
-  return { capturedMs, changedMs: capturedMs, image: Buffer.from(answer.jpeg_base64, 'base64'), settled: Boolean(answer.settled), quietMs: answer.quiet_ms ?? undefined,
-    pictureAfterInput: answer.picture_after_input, ...(Number.isInteger(answer.epoch) ? { bridgeEpoch: answer.epoch } : {}) };
+// A picture from live-frames.mjs in this module's shape. The newest picture's arrival is the last
+// time the screen changed, since the phone sends pictures only while it moves.
+function fromLive(picture) {
+  if (!picture?.jpeg) throw new Error('The live screen returned no picture.');
+  const capturedMs = Date.parse(picture.capturedAt);
+  return { capturedMs, changedMs: capturedMs, capturedAt: picture.capturedAt, image: picture.jpeg, settled: picture.settled, quietMs: picture.quietMs ?? undefined,
+    changedSinceInput: picture.changedSinceInput, lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
 async function withThumb(frame) { return frame.thumb ? frame : { ...frame, thumb: await thumb(frame.image) }; }
@@ -96,8 +96,9 @@ const inside = (box, [x, y, w, h], size) => {
 // epoch. A tree or OCR text carries the epoch of the frame it was read for, and is current only while
 // no later change has been seen. The bridge's own epoch numbers are used when it sends them.
 export class World {
-  epoch = 0; lastFrame; settledFrame; tree; pendingTree;
-  constructor(devices) { this.devices = devices; this.source = liveFrames() ? new LiveSource(devices) : new CaptureSource(devices); }
+  epoch = 0; lastFrame; lastSettle; settledFrame; tree; pendingTree;
+  constructor(devices, screen) { this.devices = devices; this.source = screen ? new LiveSource(screen) : new CaptureSource(devices); }
+  get live() { return this.source.kind === 'live'; }
   noteInput(tool) { this.epoch++; this.lastInput = { tool, sentMs: Date.now(), epoch: this.epoch }; }
   async stamp(frame) {
     frame = await withThumb(frame);
@@ -109,10 +110,11 @@ export class World {
   // The newest frame, without waiting for the screen to stop.
   async current() { return this.stamp(await this.source.frame()); }
   // The first settled frame after the last input. A launch or navigation is judged only on one.
-  async settle(timeoutMs = 3000, settleMs) {
+  async settle(timeoutMs = 3000, settleMs, maxWidth) {
     const started = performance.now();
-    const frame = await this.stamp(await this.source.settled({ timeoutMs, settleMs }));
-    const settled = { ...frame, settleMs: Math.round(performance.now() - started) };
+    const frame = await this.stamp(await this.source.settled({ timeoutMs, settleMs, maxWidth }));
+    const settled = { ...frame, settleMs: Math.round(performance.now() - started), afterInput: this.lastInput?.epoch };
+    this.lastSettle = settled;
     if (settled.settled) this.settledFrame = settled;
     return settled;
   }
@@ -144,9 +146,9 @@ export class World {
   }
   async ocr(frame, region, size) {
     // The bridge keeps an OCR worker warm on the live frames; otherwise the helper reads a cropped PNG.
-    if (this.source.kind === 'live') {
+    if (this.live) {
       try {
-        const answer = await this.devices.bridge({ op: 'ocr_region', epoch: frame.bridgeEpoch, box: region ?? [0, 0, 1, 1] });
+        const answer = await this.source.screen.op({ op: 'ocr_region', epoch: frame.bridgeEpoch, box: region ?? [0, 0, 1, 1] }, 5000);
         const found = Array.isArray(answer) ? answer : answer?.elements;
         if (Array.isArray(found)) return found.map(e => ({ label: e.text, text: e.text, type: 'StaticText', frame: { x: e.x, y: e.y, width: e.width, height: e.height }, ocr: true }));
       } catch (error) { if (stopped(error)) throw error; }
