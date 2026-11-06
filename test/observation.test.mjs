@@ -51,3 +51,14 @@ const summary=JSON.parse(result.content.at(-1).text);
  assert.ok(summary.screen.text.includes('Button: First'));
  assert.ok(elapsed<20000,`batch took ${Math.round(elapsed)} ms`);
 });
+
+test('a gated tool says who approved it, and the status names the tools approval covers', { timeout: 30000 }, async t => {
+ const f=await fixture(t,{approvalMode:'allow'});await f.set({simulatorOnly:true,simulatorBooted:true});
+ const status=value(await f.call('poki_mcp_status'));
+ assert.equal(status.approval_mode,'operator-preapproved');
+ assert.ok(status.approval_covers.includes('open_url')&&!status.approval_covers.includes('tap'));
+ const opened=await f.call('open_url',{url:'https://example.com'});
+ assert.notEqual(opened.isError,true,JSON.stringify(opened));
+ assert.deepEqual(value(opened).approval,{mode:'operator-preapproved',approved_by:'operator'});
+ assert.equal(value(await f.call('tap',{x:10,y:10})).approval,undefined);
+});

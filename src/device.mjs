@@ -360,20 +360,22 @@ export class Devices {
       checkWork();
       if (name !== 'poki_mcp_status' && name !== 'stop_recording') await requireCurrentCode();
       if (approvedTools.has(name)) await this.target();
-      if (approvedTools.has(name) && process.env.POKI_MCP_APPROVAL_MODE !== 'allow') {
+      // Says on the result who let it run, so an agent can tell a gated call from an ordinary one.
+      const approval = !approvedTools.has(name) ? undefined : process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? { mode: 'operator-preapproved', approved_by: 'operator' } : { mode: 'ask-human', approved_by: 'human' };
+      if (approval?.mode === 'ask-human') {
         const detail = args.path ?? args.project_path ?? args.bundle_id ?? args.url ?? (name === 'set_clipboard' ? `${Buffer.byteLength(args.text)} 字节的文本` : '');
         const action = { install_app: '安装应用', uninstall_app: '卸载应用', build_and_run: '构建并运行应用', open_url: '打开链接', download_app_container: '下载应用数据', get_clipboard: '读取剪贴板', set_clipboard: '写入剪贴板' }[name];
         const result = await askHuman(`是否允许${action}？\n设备：${args.device ?? this.selected ?? '当前选中的设备'}\n${detail}`, 120);
         if (!result.completed) return { isError: true, ...text({ ...result, executed: false }), _meta: { stop_reason: result.status === 'timeout' ? 'timeout' : 'cancelled' } };
       }
       if (platformTools.has(name)) {
-        const { _meta, ...result } = await platformTool(this, name, args);
+        const { _meta, ...result } = { ...await platformTool(this, name, args), ...(approval ? { approval } : {}) };
         if (name === 'start_simulator') usedSimulators.add(this.selected);
         return { ...text(result), ...(result.isError ? { isError: true } : {}), ...(_meta || result.stop_reason ? { _meta: { ..._meta, ...(result.stop_reason ? { stop_reason: result.stop_reason } : {}) } } : {}) };
       }
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
-        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human' });
+        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
         case 'list_devices': return text({ devices: await this.describeDevices(args.include_all_simulators), ...(args.include_all_simulators ? { simulator_models: await simulatorModels() } : {}) });
         case 'select_device': {
           this.requested = args.device;
