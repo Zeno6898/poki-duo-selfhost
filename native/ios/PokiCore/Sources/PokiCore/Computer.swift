@@ -257,7 +257,7 @@ final class Computer: @unchecked Sendable {
                 approvedNote = "approval: approved on the phone (\(reason))"
             } else {
                 let approval = approvals.pending.flatMap { $0.fingerprint == fingerprint ? $0 : nil }
-                    ?? approvals.request(app: lastForeground?.describe ?? "unknown", summary: actions.map(describe).joined(separator: ", "), reason: reason, fingerprint: fingerprint)
+                    ?? approvals.request(app: lastForeground?.describe ?? "unknown", summary: labels(actions), reason: reason, fingerprint: fingerprint)
                 // The time the owner takes is not the actions' time: the clock starts again after it.
                 let asked = now()
                 switch await approvals.wait(id: approval.id, seconds: config.approvalWait) {
