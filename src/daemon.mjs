@@ -4,6 +4,7 @@ import { mkdir, writeFile, readFile, unlink, rename, chmod } from 'node:fs/promi
 import { once } from 'node:events';
 import { NodeStreamableHTTPServerTransport, localhostHostValidation, localhostOriginValidation } from '@modelcontextprotocol/node';
 import { createServer, definitions } from './tools.mjs';
+import { withCallLog } from './call-log.mjs';
 import { Coordination } from './coordination.mjs';
 import { Devices } from './device.mjs';
 import { stateDir, endpointFile } from './config.mjs';
@@ -52,7 +53,7 @@ const listener = http.createServer(async (req, res) => {
   }
   const server = createServer((name, args, extra) => {
     if (devices.cancelledRequests?.delete(extra?.requestId)) throw new DOMException('Request cancelled', 'AbortError');
-    return devices.call(name, args, extra?.signal, extra?.requestId);
+    return withCallLog(session, name, () => devices.call(name, args, extra?.signal, extra?.requestId));
   });
   const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   active.add(server);
