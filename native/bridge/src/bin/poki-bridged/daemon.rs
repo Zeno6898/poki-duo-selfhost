@@ -54,6 +54,8 @@ use tokio::{
 
 #[path = "live.rs"]
 mod live;
+#[path = "lock_state.rs"]
+mod lock_state;
 #[path = "media.rs"]
 mod media;
 
@@ -150,6 +152,8 @@ struct State {
     prefetch_events: Rc<watch::Sender<u64>>,
     /// The foreground app from the newest tree, and app_for_pid answers (see live::Foreground).
     foreground: live::ForegroundCell,
+    /// Locked or awake, from SpringBoard's notifications (see device_state).
+    device: lock_state::DeviceCell,
 }
 
 impl State {
@@ -164,6 +168,7 @@ impl State {
             prefetch,
             prefetch_events,
             foreground,
+            device: lock_state::DeviceCell::default(),
             stop: watch::channel(false).0,
             started: Instant::now(),
             version: executable_version(),
@@ -187,6 +192,7 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let reaper = tokio::task::spawn_local(reap(state.clone()));
     let resolver = tokio::task::spawn_local(live::resolve_foreground(state.clone()));
+    let device_watch = tokio::task::spawn_local(lock_state::watch(state.clone()));
     let prefetcher =
         live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     // Load the OCR models before the first type_text or ocr_region needs them.
@@ -208,6 +214,7 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     }
     reaper.abort();
     resolver.abort();
+    device_watch.abort();
     if let Some(prefetcher) = prefetcher {
         prefetcher.abort();
     }
@@ -522,6 +529,10 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     // The newest accessibility read failed: no tree shows the screen.
                     reasons.push("ax_unavailable");
                 }
+                if state.device.borrow().json()["state"] == "locked" {
+                    // Inputs reach the lock screen, not the app: launches show nothing.
+                    reasons.push("locked");
+                }
                 let foreground = live::foreground_json(state);
                 if foreground["stale"] == json!(true) {
                     reasons.push("foreground_stale");
@@ -544,6 +555,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     json!({"opened": session.tunnels_opened, "lost": session.tunnels_lost});
                 pong["health"] = json!({"ok": reasons.is_empty(), "reasons": reasons});
                 pong["foreground"] = foreground;
+                pong["device_state"] = state.device.borrow().json();
                 pong["decode_mode"] = if live::decode_off() {
                     "off"
                 } else {
@@ -565,6 +577,33 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
         }
         op if live::is_live_op(op) => {
             return Box::pin(live::answer(op, id, object, state, closed)).await;
+        }
+        "device_state_probe" => {
+            let started = Instant::now();
+            let mut timings = Timings::default();
+            let result = Box::pin(async {
+                let mut session = state.session.lock().await;
+                session.connect(&mut timings).await?;
+                let device = &session.link.as_ref().expect("connected").device;
+                let (mut adapter, mut rsd) = (device.adapter.clone(), device.rsd.clone());
+                drop(session);
+                let seconds = object
+                    .get("seconds")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(20.0);
+                lock_state::probe(&mut adapter, &mut rsd, seconds).await
+            })
+            .await;
+            timings.total_ms = ms(started);
+            log(&format!(
+                "device_state_probe: {} in {} ms",
+                if result.is_ok() { "ok" } else { "error" },
+                timings.total_ms
+            ));
+            return Some(match result {
+                Ok(output) => success(id, &output, timings),
+                Err(error) => failure(id, &*error, timings),
+            });
         }
         "ax_audit_probe" => {
             let started = Instant::now();
