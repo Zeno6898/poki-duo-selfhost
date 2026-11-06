@@ -14,7 +14,12 @@ Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-fil
 | `ax_tree` | `include_offscreen=false` | Read the native accessibility tree, application roots, foreground process, and orientation. Wait up to 20 seconds and renew the subscription every 2 seconds. |
 | `list_apps` | None | Stream the advertised AppService application list without host CoreDevice discovery. Report an error when the capability is absent. |
 | `launch_app` | `bundle_id` or `name`, `arguments=[]`, `environment={}`, `terminate_existing=false` | Launch through the paired device's RemoteXPC AppService. An explicit bundle ID skips inventory lookup. Names use only the advertised streaming list. Return the PID for the caller's subsequent foreground check. |
-| `configuration` | `method`, `value?` | Read increased contrast or read/set larger accessibility sizes. |
+| `configuration` | `method`, `value?` | Read or set appearance, text size, Reduce Motion, Reduce Transparency, Increase Contrast and larger accessibility sizes. See [Device services](#device-services). |
+| `lockdown_get` | `key`, `domain?` | Read one lockdown value through `com.apple.mobile.lockdown.remote.trusted`. |
+| `screenshot` | `path` | Take a PNG screenshot through DVT and write it to a new file at the absolute `path`. |
+| `rotate` | `direction=left` | Rotate the device 90 degrees, `left` (counter-clockwise) or `right`, through `com.apple.coredevice.devicecontrol`. |
+| `pasteboard` | `action`, `text?` | `get` the general pasteboard's text, list its `items`, or `set` it to `text`. |
+| `location` | `action`, `latitude?`, `longitude?` | `clear` the simulated location, or `set` it and hold it until the process ends. |
 | `tap` | `x`, `y`, `duration_ms=50` | Contact, hold, and release one finger. |
 | `double_tap` | `x`, `y`, `duration_ms=50` | Tap twice within one session, 80 milliseconds apart. |
 | `long_press` | `x`, `y`, `duration_ms=600` | Hold for the requested duration. |
@@ -23,6 +28,40 @@ Run `build/poki-native --udid ID`, or `build/poki-native --host IP --pairing-fil
 | `key` | `key`, `modifiers=[]`, `count=1` | Send a keyboard combination with command/control/option/shift modifiers. |
 | `button` | `button`, `count=1`, `interval_ms=120` | Send home, lock/power, volume_up, volume_down, mute, or siri. The internal keyboard value toggles the software keyboard. |
 | `type_text` | `text`, `clear=false`, `submit=false`, `target` | Paste Unicode through the clipboard and Command-V, optionally clearing first and sending Return afterward. |
+
+## Device services
+
+These ops replace the `idevice-tools` subcommands Poki uses for the same jobs. Each opens a tunnel, connects one RSD service inside it and makes one call, so they work on every target, including the remote pairing target, where `idevice-tools` cannot run because it starts `CoreDeviceProxy` over lockdown on port 62078. Each call opens a new tunnel; the cost per call on a relayed path has not been measured. Arguments are checked before the bridge connects, and an invalid request exits 1 without touching the device.
+
+| op | Request | Success output |
+| --- | --- | --- |
+| `lockdown_get` | `{"op":"lockdown_get","key":"DeviceName"}`, or with `"domain":"com.apple.mobile.iTunes"` | `{"key","domain","value"}`. `value` is the lockdown plist value as JSON: a string, number, boolean, array or object. `key` and `domain` are 1 to 256 characters with no control characters. |
+| `screenshot` | `{"op":"screenshot","path":"/abs/frame.png"}` | `{"path","bytes"}`. The file must not exist yet; it is created with mode 0600. Needs the instruments service (`com.apple.instruments.dtservicehub`), so a mounted developer disk image. |
+| `rotate` | `{"op":"rotate","direction":"left"}` | `{"orientation","non_flat_orientation","locked"}`. Orientation names are `Portrait`, `PortraitUpsideDown`, `LandscapeLeft`, `LandscapeRight`, `FaceUp` and `FaceDown`, the names `idevice-tools rotate` prints; a value the pinned idevice does not know is passed through. |
+| `pasteboard` | `{"op":"pasteboard","action":"get"}` | `{"text"}`, the first inline UTF-8 or plain-text item, or `null`. |
+| | `{"op":"pasteboard","action":"items"}` | `{"items":[{"index","uti","state","size"}]}`, one entry per item and type. `state` is `inline`, `promised` or `error`; `size` is the byte count when known, otherwise `null`. |
+| | `{"op":"pasteboard","action":"set","text":"..."}` | `{"copied":true,"bytes"}`. The text is at most 1 MiB. |
+| `location` | `{"op":"location","action":"clear"}` | `{"cleared":true}`. |
+| | `{"op":"location","action":"set","latitude":37.33,"longitude":-122.03}` | One line, `{"location_set":true,"latitude","longitude"}`, once the device accepts the location. The process then keeps running and sends the location again every 5 seconds, as `idevice-tools location_simulation set` does, because the device drops a simulated location when its instruments connection closes. The caller ends it with SIGTERM and then sends `clear`. The 90-second limit does not apply to this request. Latitude is -90..90 and longitude -180..180. Needs a mounted developer disk image. |
+
+`pasteboard` reads with the `allResolved` policy, as `idevice-tools pasteboard paste` and `items` do; `type_text` keeps its own snapshot logic, described below. Pasteboard data is neither logged nor written to files.
+
+Configuration methods and their `value`:
+
+| method | `value` | Output |
+| --- | --- | --- |
+| `get_increase_contrast`, `get_larger_accessibility_sizes` | none | The device's raw fields. |
+| `set_larger_accessibility_sizes` | boolean | The device's raw fields. |
+| `get_appearance` | none | `{"appearance":"light"}` or `"dark"`. |
+| `set_appearance` | `"light"` or `"dark"` | `{"appearance"}`. |
+| `get_text_size` | none | `{"text_size"}`, the device's dynamic type name, such as `large` or `accessibilityExtraLarge`. |
+| `set_text_size` | a dynamic type name of 1 to 64 letters | `{"text_size"}`. |
+| `get_reduce_motion`, `get_reduce_transparency` | none | `{"enabled"}`. |
+| `set_reduce_motion`, `set_reduce_transparency`, `set_increase_contrast` | boolean | `{"enabled"}`. |
+
+These ops were built and their argument checks tested without a phone; none has passed a physical-device run yet.
+
+Screen recording (`idevice-tools screencapture --stdout`) is a long-lived stream and has no bridge op yet, so recording still needs a target `idevice-tools` can reach (USB or usbmuxd).
 
 ## Input and timing
 
@@ -54,7 +93,7 @@ An unconfirmed field returns `isError=true`, `stop_reason="error"`, a `reason`, 
 
 The reader uses the RSD-advertised `com.apple.accessibility.axAuditDaemon.remoteAXService`, enables `clientNeedsAccessibility:` through DTX, decodes two NSKeyedArchive layers, reconstructs the object graph, and closes its subscription on exit.
 
-Configuration methods are `get_increase_contrast`, `get_larger_accessibility_sizes`, and `set_larger_accessibility_sizes`. The setter requires a boolean `value` and sends a top-level `{enabled: bool}` parameter. Results retain the device's raw fields. Increased contrast was readable on the tested device. Reading larger accessibility sizes returned `ActionError code 2: not implemented`; changing that setting has not passed physical-device acceptance. Protocol availability does not imply that every action is implemented by iOS.
+Configuration methods are listed under [Device services](#device-services). `set_larger_accessibility_sizes` requires a boolean `value` and sends a top-level `{enabled: bool}` parameter. Results retain the device's raw fields. Increased contrast was readable on the tested device. Reading larger accessibility sizes returned `ActionError code 2: not implemented`; changing that setting has not passed physical-device acceptance. Protocol availability does not imply that every action is implemented by iOS.
 
 ## Verification boundaries
 

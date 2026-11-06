@@ -1,6 +1,7 @@
 mod apps;
 mod ax;
 mod configuration;
+mod device_ops;
 mod gesture;
 mod installation;
 mod pasteboard;
@@ -81,6 +82,30 @@ enum Request {
         #[serde(default)]
         include_offscreen: bool,
     },
+    LockdownGet {
+        #[serde(default)]
+        domain: Option<String>,
+        key: String,
+    },
+    Screenshot {
+        path: String,
+    },
+    Rotate {
+        #[serde(default = "rotate_left")]
+        direction: String,
+    },
+    Pasteboard {
+        action: String,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    Location {
+        action: String,
+        #[serde(default)]
+        latitude: Option<f64>,
+        #[serde(default)]
+        longitude: Option<f64>,
+    },
     Tap {
         x: u16,
         y: u16,
@@ -154,6 +179,9 @@ fn long_duration() -> u64 {
 fn drag_duration() -> u64 {
     500
 }
+fn rotate_left() -> String {
+    "left".into()
+}
 fn one() -> usize {
     1
 }
@@ -170,12 +198,24 @@ impl Request {
             {
                 return Err("bundle_id must not be empty".into());
             }
-            Self::Configuration { method, value } => match method.as_str() {
-                "get_increase_contrast" | "get_larger_accessibility_sizes" if value.is_none() => {}
-                "set_larger_accessibility_sizes"
-                    if value.as_ref().and_then(Value::as_bool).is_some() => {}
-                _ => return Err("Invalid configuration method or value".into()),
-            },
+            Self::Configuration { method, value } => {
+                configuration::validate(method, value.as_ref())?
+            }
+            Self::LockdownGet { domain, key } => {
+                device_ops::validate_lockdown(domain.as_deref(), key)?
+            }
+            Self::Screenshot { path } => device_ops::validate_screenshot(path)?,
+            Self::Rotate { direction } => {
+                device_ops::direction(direction)?;
+            }
+            Self::Pasteboard { action, text } => {
+                device_ops::validate_pasteboard(action, text.as_deref())?
+            }
+            Self::Location {
+                action,
+                latitude,
+                longitude,
+            } => device_ops::validate_location(action, *latitude, *longitude)?,
             Self::Tap { duration_ms, .. }
             | Self::DoubleTap { duration_ms, .. }
             | Self::LongPress { duration_ms, .. }
@@ -374,6 +414,10 @@ async fn main() {
             .read_to_string(&mut input)?;
         let request: Request = serde_json::from_str(&input)?;
         request.validate()?;
+        if is_held_location(&request) {
+            // A held location runs until the caller ends the process.
+            return execute(&target, request).await;
+        }
         let limit = if matches!(request, Request::InstallApp { .. }) {
             180
         } else {
@@ -392,6 +436,10 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn is_held_location(request: &Request) -> bool {
+    matches!(request, Request::Location { action, .. } if action == "set")
 }
 
 async fn connect_device(target: &Target) -> Result<Device> {
@@ -487,6 +535,29 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
     if let Request::AxTree { include_offscreen } = request {
         return ax::read_tree(&mut adapter, &rsd, include_offscreen).await;
     }
+    match request {
+        Request::LockdownGet { domain, key } => {
+            return device_ops::lockdown_get(&mut adapter, &mut rsd, domain.as_deref(), &key).await;
+        }
+        Request::Screenshot { path } => {
+            return device_ops::screenshot(&mut adapter, &mut rsd, &path).await;
+        }
+        Request::Rotate { direction } => {
+            return device_ops::rotate(&mut adapter, &mut rsd, &direction).await;
+        }
+        Request::Pasteboard { action, text } => {
+            return device_ops::pasteboard(&mut adapter, &mut rsd, &action, text.as_deref()).await;
+        }
+        Request::Location {
+            action,
+            latitude,
+            longitude,
+        } => {
+            let coordinates = latitude.zip(longitude);
+            return device_ops::location(&mut adapter, &mut rsd, &action, coordinates).await;
+        }
+        _ => {}
+    }
     if matches!(request, Request::DisplayInfo) {
         let mut display =
             idevice::core_device::DisplayServiceClient::connect_rsd(&mut adapter, &mut rsd).await?;
@@ -510,6 +581,11 @@ async fn execute(target: &Target, request: Request) -> Result<Value> {
             | Request::UninstallApp { .. }
             | Request::AxTree { .. }
             | Request::Configuration { .. }
+            | Request::LockdownGet { .. }
+            | Request::Screenshot { .. }
+            | Request::Rotate { .. }
+            | Request::Pasteboard { .. }
+            | Request::Location { .. }
             | Request::LaunchApp(_) => {
                 unreachable!()
             }
@@ -836,6 +912,66 @@ mod tests {
                 host_name: Some("pairing-mac".into()),
             }
         );
+    }
+
+    fn request(text: &str) -> Result<Request> {
+        let request: Request = serde_json::from_str(text)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    #[test]
+    fn device_service_requests_parse_and_validate() {
+        for text in [
+            r#"{"op":"lockdown_get","key":"DeviceName"}"#,
+            r#"{"op":"lockdown_get","domain":"com.apple.mobile.iTunes","key":"ScreenScaleFactor"}"#,
+            r#"{"op":"screenshot","path":"/tmp/frame.png"}"#,
+            r#"{"op":"rotate"}"#,
+            r#"{"op":"rotate","direction":"right"}"#,
+            r#"{"op":"pasteboard","action":"get"}"#,
+            r#"{"op":"pasteboard","action":"items"}"#,
+            r#"{"op":"pasteboard","action":"set","text":"héllo"}"#,
+            r#"{"op":"location","action":"clear"}"#,
+            r#"{"op":"location","action":"set","latitude":37.33,"longitude":-122.03}"#,
+            r#"{"op":"configuration","method":"get_appearance"}"#,
+            r#"{"op":"configuration","method":"set_appearance","value":"dark"}"#,
+            r#"{"op":"configuration","method":"set_text_size","value":"large"}"#,
+            r#"{"op":"configuration","method":"set_reduce_motion","value":true}"#,
+        ] {
+            assert!(request(text).is_ok(), "{text}");
+        }
+        assert!(matches!(
+            request(r#"{"op":"rotate"}"#).unwrap(),
+            Request::Rotate { direction } if direction == "left"
+        ));
+        assert!(is_held_location(
+            &request(r#"{"op":"location","action":"set","latitude":1,"longitude":2}"#).unwrap()
+        ));
+        assert!(!is_held_location(
+            &request(r#"{"op":"location","action":"clear"}"#).unwrap()
+        ));
+    }
+
+    #[test]
+    fn invalid_device_service_requests_are_rejected() {
+        for text in [
+            r#"{"op":"lockdown_get"}"#,
+            r#"{"op":"lockdown_get","key":""}"#,
+            r#"{"op":"lockdown_get","key":"DeviceName","extra":1}"#,
+            r#"{"op":"screenshot","path":"frame.png"}"#,
+            r#"{"op":"screenshot"}"#,
+            r#"{"op":"rotate","direction":"up"}"#,
+            r#"{"op":"pasteboard","action":"set"}"#,
+            r#"{"op":"pasteboard","action":"get","text":"x"}"#,
+            r#"{"op":"pasteboard"}"#,
+            r#"{"op":"location","action":"set","latitude":95,"longitude":0}"#,
+            r#"{"op":"location","action":"set","latitude":1}"#,
+            r#"{"op":"location","action":"clear","latitude":1,"longitude":1}"#,
+            r#"{"op":"configuration","method":"set_appearance","value":"blue"}"#,
+            r#"{"op":"configuration","method":"get_text_size","value":"large"}"#,
+        ] {
+            assert!(request(text).is_err(), "{text}");
+        }
     }
 
     #[test]
