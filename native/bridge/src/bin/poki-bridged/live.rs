@@ -211,6 +211,7 @@ pub async fn subscribe(
         let start = live.state(settle);
         let (mut change_seen, mut input_seen) = (start.last_change.map(|c| c.0), start.last_input);
         let mut settled_for = start.settled.then_some(start.quiet_since);
+        let mut moving = start.moving;
         let mut stalled = false;
         let mut last_settled_at: Option<Instant> = start.settled.then(Instant::now);
         loop {
@@ -235,11 +236,23 @@ pub async fn subscribe(
                 event["epoch"] = now.last_change_epoch.into();
                 events.push(event);
             }
+            // The packet clock: the screen started moving (decoded or not).
+            if now.moving && !moving {
+                events.push(json!({
+                    "event": "moving",
+                    "captured_at": now.activity.map(|a| stamp_at(a.wall)),
+                    "after_input_ms": now.last_input.zip(now.activity).and_then(|(input, a)| a.at.checked_duration_since(input)).map(|d| d.as_millis() as u64),
+                    "epoch": now.epoch,
+                }));
+            }
+            moving = now.moving;
             if now.settled && settled_for != Some(now.quiet_since) {
                 settled_for = Some(now.quiet_since);
                 let mut event = json!({
                     "event": "settled",
                     "quiet_ms": now.quiet_since.map(|at| at.elapsed().as_millis() as u64),
+                    // No unit since the input: the input changed nothing on screen.
+                    "changed_since_input": now.last_input.map(|_| now.units_since_input > 0),
                     "captured_at": now.latest.map(|l| stamp_at(l.1)),
                     "size": now.latest.map(|l| [l.2, l.3]),
                     "epoch": now.epoch,
@@ -404,7 +417,12 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
             change
         }),
         "last_input_ms_ago": state.last_input.map(ago),
-        "changed_since_input": state.last_input.map(|input| state.last_change.is_some_and(|(at, _)| at > input)),
+        // By the packet clock: the phone sends units only when pixels change.
+        "changed_since_input": state.last_input.map(|_| state.units_since_input > 0),
+        "units_since_input": state.last_input.map(|_| state.units_since_input),
+        "moving": state.moving,
+        "ms_since_unit": state.activity.map(|a| ago(a.at)),
+        "picture_current": state.picture_current,
         "picture_after_input": state.last_input.map(|input| jpeg.arrived > input),
         // Upstream's rule: after an action, a frame not proven newer than it is unverified.
         "observation": observation(jpeg.epoch, state.last_input_epoch),

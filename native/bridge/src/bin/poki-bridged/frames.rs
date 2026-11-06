@@ -139,8 +139,12 @@ struct Counters {
     /// Packet losses inside a decoded stream: pictures after one may show errors until the next
     /// key unit (this phone sends one only when a session opens).
     damaging_losses: u64,
-    /// Units given to the decoder (less decode_work_units: how many wait in its queue).
+    /// Units given to the decoder, and units it is done with (with or without a picture): the
+    /// newest picture is current when the two are equal.
     units_to_decoder: u64,
+    units_done: u64,
+    /// Units smaller than POKI_LIVE_ACTIVE_BYTES, not counted as movement.
+    small_units: u64,
     /// Time inside the decoder only (decode_ms_sum also counts the wait in the queue).
     decode_work_ms_sum: f64,
     decode_work_units: u64,
@@ -156,6 +160,25 @@ struct Counters {
 
 /// The latest picture: when its unit arrived, the wall time then, and its size.
 pub type Latest = (Instant, SystemTime, u32, u32);
+
+/// The newest unit that counts as movement (at least POKI_LIVE_ACTIVE_BYTES): when it arrived,
+/// the wall time then, its size, and the picture number current then.
+#[derive(Clone, Copy, Debug)]
+pub struct Activity {
+    pub at: Instant,
+    pub wall: SystemTime,
+    pub bytes: usize,
+    pub epoch: u64,
+}
+
+/// Units smaller than this do not count as movement (POKI_LIVE_ACTIVE_BYTES, default 0: every
+/// unit counts, so "unchanged" is never claimed for a screen that moved).
+fn active_bytes() -> usize {
+    std::env::var("POKI_LIVE_ACTIVE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
 
 /// What the daemon reads; written by the receive task and the decoder thread.
 #[derive(Default)]
@@ -191,6 +214,12 @@ struct Screen {
     restart_requested: bool,
     /// Since when the pictures may show errors from a lost packet (cleared by a key unit).
     damaged_since: Option<Instant>,
+    /// The packet clock: the phone sends a unit only when pixels change, so the newest unit's
+    /// arrival says when the screen last moved, decoded or not (see Activity).
+    activity: Option<Activity>,
+    units_since_input: u64,
+    /// Sizes of the newest units, for tuning POKI_LIVE_ACTIVE_BYTES.
+    recent_unit_bytes: VecDeque<usize>,
 }
 
 enum Job {
@@ -269,6 +298,7 @@ impl Frames {
             jobs.clone(),
             ready,
             our_ssrc,
+            notify.clone(),
         ));
         let frames = Self {
             live: Live {
@@ -325,6 +355,15 @@ pub struct State {
     /// Packets arrive but no picture comes out: the newest picture is stale, however still the
     /// screen looks. Since when.
     pub stalled_since: Option<Instant>,
+    /// The packet clock (decoded or not): the newest unit, whether one came within the settle
+    /// time, and how many came since the last input.
+    pub activity: Option<Activity>,
+    pub moving: bool,
+    pub units_since_input: u64,
+    /// The decoder has every unit that arrived behind it: the newest picture is the screen now.
+    /// Always true when nothing is decoded.
+    pub picture_current: bool,
+    pub decoding: bool,
 }
 
 impl Live {
@@ -343,6 +382,7 @@ impl Live {
         screen.last_input = Some(Instant::now());
         screen.last_input_wall = Some(SystemTime::now());
         screen.last_input_epoch = Some(screen.epoch);
+        screen.units_since_input = 0;
         screen.generation += 1;
         self.notify.send_replace(screen.generation);
     }
@@ -357,13 +397,27 @@ impl Live {
 
     pub fn state(&self, settle: Duration) -> State {
         let screen = self.screen.lock().unwrap();
-        let quiet_since = [screen.last_change.map(|(at, _)| at), screen.last_input]
-            .into_iter()
-            .flatten()
-            .max()
-            .or(screen.decoding_since);
+        let quiet_since = [
+            screen.activity.map(|a| a.at),
+            screen.last_change.map(|(at, _)| at),
+            screen.last_input,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .or(screen.decoding_since);
+        let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
+        let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
+        let c = &screen.counters;
+        let picture_current = !decoding || c.units_done >= c.units_to_decoder;
         State {
-            settled: screen.latest.is_some() && quiet_since.is_none_or(|at| at.elapsed() >= settle),
+            // Settled by the packet clock; when decoding, also once the picture shows it.
+            settled: quiet && (!decoding || (screen.latest.is_some() && picture_current)),
+            moving: screen.activity.is_some_and(|a| a.at.elapsed() < settle),
+            activity: screen.activity,
+            units_since_input: screen.units_since_input,
+            picture_current,
+            decoding,
             quiet_since,
             latest: screen.latest,
             last_change: screen.last_change,
@@ -473,6 +527,7 @@ impl Live {
     pub fn unchanged_since(&self, at: Instant) -> bool {
         let screen = self.screen.lock().unwrap();
         screen.last_change.is_none_or(|(changed, _)| changed <= at)
+            && screen.activity.is_none_or(|a| a.at <= at)
             && screen.last_input.is_none_or(|input| input <= at)
             && !screen.closed
     }
@@ -569,7 +624,7 @@ impl Live {
         let screen = self.screen.lock().unwrap();
         let c = &screen.counters;
         let since = |at: Option<Instant>| at.map(|at| at.elapsed().as_millis() as u64);
-        json!({
+        let mut report = json!({
             "seconds": (seconds * 10.0).round() / 10.0,
             "packets_per_s": rate(from.packets, to.packets),
             "kbit_per_s": rate(from.bytes * 8 / 1000, to.bytes * 8 / 1000),
@@ -588,7 +643,6 @@ impl Live {
             "decoder_error": screen.decoder_error,
             "video_stalled": screen.stalled_since.is_some(),
             "picture_damaged": screen.damaged_since.is_some(),
-            "queued_units": c.units_to_decoder.saturating_sub(c.decode_work_units),
             "stalled_ms": since(screen.stalled_since),
             "totals": {
                 "packets": c.packets,
@@ -605,6 +659,7 @@ impl Live {
                 "stalls": c.stalls,
                 "restart_requests": c.restart_requests,
                 "damaging_losses": c.damaging_losses,
+                "small_units": c.small_units,
                 "decode_work_ms_avg": (c.decode_work_units > 0).then(|| (c.decode_work_ms_sum / c.decode_work_units as f64 * 100.0).round() / 100.0),
                 "units_without_picture": c.units_without_picture,
                 "units_without_picture_run": c.units_without_picture_run,
@@ -613,7 +668,20 @@ impl Live {
                 "first_picture_after_ms": screen.first_picture_after_ms,
             },
             "ms_since_last_packet": since(c.last_packet),
-        })
+        });
+        // The packet clock, and how far the picture is behind it.
+        let clock = json!({
+            "queued_units": c.units_to_decoder.saturating_sub(c.units_done),
+            "picture_current": state.picture_current,
+            "moving": state.moving,
+            "ms_since_unit": since(state.activity.map(|a| a.at)),
+            "units_since_input": state.units_since_input,
+            "recent_unit_bytes": screen.recent_unit_bytes,
+        });
+        if let (Value::Object(report), Value::Object(clock)) = (&mut report, clock) {
+            report.extend(clock);
+        }
+        report
     }
 }
 
@@ -677,7 +745,11 @@ async fn receive<S: Datagrams>(
     jobs: mpsc::Sender<Job>,
     decoder_ready: Arc<AtomicBool>,
     our_ssrc: u32,
+    notify: Arc<tokio::sync::watch::Sender<u64>>,
 ) {
+    let active_bytes = active_bytes();
+    // Bytes of the unit being received, for the packet clock.
+    let mut unit_bytes = 0usize;
     let mut depacketizer = HevcDepacketizer::new();
     let mut last_seq: Option<u16> = None;
     let mut was_decoding = false;
@@ -724,6 +796,7 @@ async fn receive<S: Datagrams>(
                 c.discontinuities += 1;
                 gap = true;
             }
+            unit_bytes += packet.payload.len();
             if packet.marker {
                 c.units += 1;
                 if let Some(last) = c.last_unit {
@@ -731,7 +804,26 @@ async fn receive<S: Datagrams>(
                     c.max_unit_gap_ms = c.max_unit_gap_ms.max(gap_ms);
                 }
                 c.last_unit = Some(now);
+                let bytes = std::mem::take(&mut unit_bytes);
+                if screen.recent_unit_bytes.len() >= 32 {
+                    screen.recent_unit_bytes.pop_front();
+                }
+                screen.recent_unit_bytes.push_back(bytes);
+                if bytes >= active_bytes {
+                    screen.activity = Some(Activity {
+                        at: now,
+                        wall: SystemTime::now(),
+                        bytes,
+                        epoch: screen.epoch,
+                    });
+                    screen.units_since_input += 1;
+                    screen.generation += 1;
+                    notify.send_replace(screen.generation);
+                } else {
+                    screen.counters.small_units += 1;
+                }
             }
+            let screen = &mut *screen;
             let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
             (decoding, gap)
         };
@@ -833,10 +925,10 @@ async fn receive<S: Datagrams>(
             waiting_since = None;
         }
         keyed = true;
+        screen.lock().unwrap().counters.units_to_decoder += 1;
         if jobs.send(Job::Unit(complete, now)).is_err() {
             return;
         }
-        screen.lock().unwrap().counters.units_to_decoder += 1;
     }
 }
 
@@ -867,6 +959,7 @@ fn decode_loop(
         }
         let job = pending.pop_front().expect("one job");
         let more_units = pending.iter().any(|job| matches!(job, Job::Unit(..)));
+        let unit_job = matches!(job, Job::Unit(..));
         match job {
             Job::Flush => {
                 if let Some(decoder) = decoder.as_mut() {
@@ -895,13 +988,13 @@ fn decode_loop(
                 };
                 let _ = reply.send(answer);
             }
-            Job::Unit(unit, arrived) => {
+            Job::Unit(unit, arrived) => 'unit: {
                 if decoder.is_none() {
                     match libav::Decoder::hevc() {
                         Ok(made) => decoder = Some(made),
                         Err(error) => {
                             screen.lock().unwrap().decoder_error = Some(error);
-                            continue;
+                            break 'unit;
                         }
                     }
                 }
@@ -920,14 +1013,14 @@ fn decode_loop(
                         let mut screen = screen.lock().unwrap();
                         screen.counters.units_without_picture += 1;
                         screen.counters.units_without_picture_run += 1;
-                        continue;
+                        break 'unit;
                     }
                     Ok(pictures) => pictures,
                     Err(error) => {
                         let mut screen = screen.lock().unwrap();
                         screen.counters.decode_errors += 1;
                         screen.counters.last_decode_error = Some(error);
-                        continue;
+                        break 'unit;
                     }
                 };
                 for picture in pictures {
@@ -1003,6 +1096,13 @@ fn decode_loop(
                     notify.send_replace(screen.generation);
                 }
             }
+        }
+        if unit_job {
+            // Done with it, picture or not: waiters for a current picture look again.
+            let mut screen = screen.lock().unwrap();
+            screen.counters.units_done += 1;
+            screen.generation += 1;
+            notify.send_replace(screen.generation);
         }
     }
 }
@@ -1422,6 +1522,56 @@ mod tests {
                     live.state(Duration::ZERO).stalled_since.is_none(),
                     "a picture clears it"
                 );
+                drop(tx);
+            });
+    }
+
+    /// The packet clock with nothing decoded: units say the screen moves, quiet after them says it
+    /// settled, and an input followed by no unit proves the input changed nothing.
+    #[test]
+    fn units_are_the_clock_without_decoding() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let socket = Arc::new(FakeSocket {
+                    incoming: tokio::sync::Mutex::new(rx),
+                    sent: Mutex::new(Vec::new()),
+                });
+                let frames = Frames::over(socket.clone(), 1, false);
+                let live = frames.live();
+                let settle = Duration::from_millis(80);
+                let mut seq = 1u16;
+                // Any bytes do: nothing is decoded.
+                let mut unit = |tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>| {
+                    for packet in packetize(&[0, 0, 0, 1, 0x02, 0x01, 0xaa, 0xbb], &mut seq, 0) {
+                        tx.send(packet).unwrap();
+                    }
+                };
+                let started = Instant::now();
+                live.note_input();
+                unit(&tx);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let state = live.state(settle);
+                assert!(state.moving && !state.settled && !state.decoding);
+                assert_eq!(state.units_since_input, 1);
+                assert!(!live.unchanged_since(started));
+                assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
+                let state = live.state(settle);
+                assert!(state.settled && !state.moving && state.picture_current);
+                assert!(
+                    state.latest.is_none(),
+                    "settled with no picture: nothing is decoded"
+                );
+                // An input, and no unit after it: unchanged, as soon as the settle time passes.
+                let input = Instant::now();
+                live.note_input();
+                assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
+                assert!(input.elapsed() < Duration::from_millis(200));
+                assert_eq!(live.state(settle).units_since_input, 0);
+                assert!(live.unchanged_since(input + Duration::from_millis(1)));
                 drop(tx);
             });
     }
