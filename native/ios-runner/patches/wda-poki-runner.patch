@@ -1,5 +1,5 @@
 diff --git a/WebDriverAgentRunner/UITestingUITests.m b/WebDriverAgentRunner/UITestingUITests.m
-index 5ffafa86..99f5c8ce 100644
+index 5ffafa86..54218522 100644
 --- a/WebDriverAgentRunner/UITestingUITests.m
 +++ b/WebDriverAgentRunner/UITestingUITests.m
 @@ -7,6 +7,7 @@
@@ -10,7 +10,7 @@ index 5ffafa86..99f5c8ce 100644
  
  #import <WebDriverAgentLib/FBDebugLogDelegateDecorator.h>
  #import <WebDriverAgentLib/FBConfiguration.h>
-@@ -43,11 +44,72 @@
+@@ -43,11 +44,78 @@
   */
  - (void)testRunner
  {
@@ -27,6 +27,10 @@ index 5ffafa86..99f5c8ce 100644
  }
  
 +#pragma mark - Poki
++
++// WebDriverAgent builds with -Weverything -Werror; this UIKit code is Poki's, kept out of that.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Weverything"
 +
 +static UIWindow *pokiWindow;
 +
@@ -79,6 +83,8 @@ index 5ffafa86..99f5c8ce 100644
 +  pokiWindow.rootViewController = controller;
 +  pokiWindow.hidden = NO;
 +}
++
++#pragma clang diagnostic pop
 +
  #pragma mark - FBWebServerDelegate
  

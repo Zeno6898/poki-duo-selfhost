@@ -35,7 +35,7 @@ jobs:
           set -o pipefail
           xcodebuild build-for-testing -project native/ios-runner/WebDriverAgent/WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda \
-            CODE_SIGNING_ALLOWED=NO | grep -E "^error|BUILD (SUCCEEDED|FAILED)|\*\* " || true
+            CODE_SIGNING_ALLOWED=NO | grep -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* " || true
           test -d "$PRODUCTS/$RUNNER"
       - name: Where XCTRunner's pieces live
         run: |
