@@ -172,6 +172,8 @@ struct Counters {
     /// Packet losses inside a decoded stream: pictures after one may show errors until the next
     /// key unit (this phone sends one only when a session opens).
     damaging_losses: u64,
+    /// Units not decoded because no key unit had come yet in this stream.
+    units_before_key: u64,
     /// Units given to the decoder, and units it is done with (with or without a picture): the
     /// newest picture is current when the two are equal.
     units_to_decoder: u64,
@@ -1003,6 +1005,10 @@ impl Live {
             "movement_from": if state.decoding { "pixels" } else { "unit_bytes" },
             "animating_region": animating_json(state.animating_region),
             "in_place_changes": c.in_place_changes,
+            // Why units gave no picture: before this stream's key unit, taken by the decoder
+            // without output (a missing reference), or a decode error.
+            "no_picture_reasons": {"no_key_yet": c.units_before_key, "no_output": c.units_without_picture, "decode_error": c.decode_errors},
+            "decode_work_ms_avg": (c.decode_work_units > 0).then(|| (c.decode_work_ms_sum / c.decode_work_units as f64 * 100.0).round() / 100.0),
             "decoder_nice": screen.decoder_nice,
         });
         if let (Value::Object(report), Value::Object(clock)) = (&mut report, clock) {
@@ -1065,6 +1071,8 @@ const STALL_AFTER: Duration = Duration::from_millis(500);
 /// Pro: the phone does not answer key frame requests, so nothing short of that brings one, and
 /// units are never dropped to catch up (each one after a drop would refer to a missing picture).
 const RECOVER_AFTER: Duration = Duration::from_millis(1500);
+/// How long a new session may take to send its key unit before it is given up.
+const FIRST_KEY_WITHIN: Duration = Duration::from_secs(5);
 
 async fn receive<S: Datagrams>(
     socket: Arc<S>,
@@ -1181,33 +1189,53 @@ async fn receive<S: Datagrams>(
         // nothing it can use. Report it stale, and past RECOVER_AFTER ask for a new session.
         if keyed {
             let mut s = screen.lock().unwrap();
-            // The newest picture's age is its unit's arrival, not when it was decoded: a decoder
-            // that keeps giving pictures from a backlog seconds deep is as stale as one that gives
-            // none (Nov 6: 8.8 s old pictures while the decoder still produced some).
-            let progress = s.latest.map(|l| l.0).into_iter().chain(keyed_at).max();
-            let age = progress.map(|at| now.duration_since(at));
-            if age.is_some_and(|age| age >= STALL_AFTER) && s.stalled_since.is_none() {
+            // Stale (reported, and pictures come from the screenshot service) when the newest
+            // picture's unit arrived STALL_AFTER ago: a decoder behind by a backlog is as stale as
+            // one that gives nothing.
+            let behind = s
+                .latest
+                .map(|l| l.0)
+                .into_iter()
+                .chain(keyed_at)
+                .max()
+                .map(|at| now.duration_since(at));
+            if behind.is_some_and(|age| age >= STALL_AFTER) && s.stalled_since.is_none() {
                 s.counters.stalls += 1;
                 s.stalled_since = Some(now);
-                let run = s.counters.units_without_picture_run;
+                let c = &s.counters;
+                let queued = c.units_to_decoder.saturating_sub(c.units_done);
                 eprintln!(
-                    "{} poki-bridged: live frames: video stalled: units arrive but no picture for {} ms ({run} units in a row gave none)",
+                    "{} poki-bridged: live frames: video stalled: newest picture {} ms behind the stream; {queued} units queued, {} in a row gave no picture (no key yet {}, no output {}, errors {})",
                     crate::ax::watch::stamp(),
-                    STALL_AFTER.as_millis()
+                    behind.unwrap().as_millis(),
+                    c.units_without_picture_run,
+                    c.units_before_key,
+                    c.units_without_picture,
+                    c.decode_errors,
                 );
             }
-            if age.is_some_and(|age| age >= RECOVER_AFTER) && !s.restart_requested {
+            // A new session only when the decoder gives no pictures at all: a reopen does not
+            // make a slow decoder faster, and the new session needs about 1.3 s and its key unit
+            // before its first picture (Nov 6: reopening on a backlog reopened every 10 to 15 s).
+            let silent = s
+                .last_decoded_at
+                .into_iter()
+                .chain(keyed_at)
+                .max()
+                .map(|at| now.duration_since(at));
+            if silent.is_some_and(|age| age >= RECOVER_AFTER) && !s.restart_requested {
                 s.restart_requested = true;
                 s.counters.restart_requests += 1;
                 eprintln!(
-                    "{} poki-bridged: live frames: newest picture {} ms old while units arrive; the media session should be reopened",
+                    "{} poki-bridged: live frames: no picture for {} ms while units arrive; the media session should be reopened",
                     crate::ax::watch::stamp(),
-                    age.unwrap().as_millis()
+                    silent.unwrap().as_millis()
                 );
             }
         }
-        // No key unit since decoding started: a new session starts with one.
-        if !keyed && waiting_since.is_some_and(|at| now.duration_since(at) >= RECOVER_AFTER) {
+        // No key unit since decoding started: a new session starts with one. A session's key
+        // unit can come over a second after it opens, so this waits FIRST_KEY_WITHIN.
+        if !keyed && waiting_since.is_some_and(|at| now.duration_since(at) >= FIRST_KEY_WITHIN) {
             let mut s = screen.lock().unwrap();
             if !s.restart_requested {
                 s.restart_requested = true;
@@ -1215,7 +1243,7 @@ async fn receive<S: Datagrams>(
                 eprintln!(
                     "{} poki-bridged: live frames: no key unit {} ms after decoding started; the media session should be reopened",
                     crate::ax::watch::stamp(),
-                    RECOVER_AFTER.as_millis()
+                    FIRST_KEY_WITHIN.as_millis()
                 );
             }
             s.stalled_since.get_or_insert(now);
@@ -1247,6 +1275,9 @@ async fn receive<S: Datagrams>(
         }
         if complete.is_empty() || (!keyed && !key) {
             // An empty packet would tell the decoder the stream ended.
+            if !complete.is_empty() {
+                screen.lock().unwrap().counters.units_before_key += 1;
+            }
             continue;
         }
         if !keyed {
@@ -2124,6 +2155,124 @@ mod tests {
         assert!(sizes.average(now).is_some_and(|avg| avg > 50));
         let fixed = UnitSizes::new(Some(700), None);
         assert_eq!(fixed.threshold(), 700);
+    }
+
+    /// A fresh media session as the phone opens one: over a second of units that are not key
+    /// units (decoding joined mid-stream), then the session's key unit and a steady 60 units a
+    /// second. No stall and no reopen is asked for, and the pictures keep up.
+    #[test]
+    fn a_fresh_session_waits_for_its_key_unit_without_asking_for_a_reopen() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        let Some(units) = stream_with(120, "testsrc2=size=320x640:rate=60", 60) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let socket = Arc::new(FakeSocket {
+                    incoming: tokio::sync::Mutex::new(rx),
+                    sent: Mutex::new(Vec::new()),
+                });
+                let frames = Frames::over(socket.clone(), 7, true);
+                let live = frames.live();
+                let mut seq = 500u16;
+                let mut send = |index: usize| {
+                    for packet in packetize(&units[index], &mut seq, index as u32 * 1500) {
+                        tx.send(packet).unwrap();
+                    }
+                };
+                // 1.3 s of the stream before the key unit.
+                for round in 0..78 {
+                    send(61 + round % 59);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                assert!(!live.take_restart_request(), "1.3 s without a key unit is normal");
+                let first_key = Instant::now();
+                for index in 0..60 {
+                    send(index);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let screen = live.screen.lock().unwrap();
+                let c = &screen.counters;
+                println!(
+                    "fresh session: {} decoded, {} before key, {} stalls, picture age {:?} after {:?}",
+                    c.decoded,
+                    c.units_before_key,
+                    c.stalls,
+                    screen.latest.map(|l| l.0.elapsed()),
+                    first_key.elapsed()
+                );
+                assert_eq!(c.decoded, 60);
+                assert!(c.units_before_key >= 70);
+                assert_eq!(c.stalls, 0, "no stall once pictures come");
+                assert!(!screen.restart_requested, "no reopen asked for");
+                drop(screen);
+                drop(tx);
+            });
+    }
+
+    #[test]
+    fn closing_the_old_session_does_not_stop_the_new_sessions_decoder() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        let Some(units) = stream_with(30, "testsrc2=size=320x640:rate=60", 60) else {
+            println!("skipped: ffmpeg cannot encode HEVC here");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let open = || {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let socket = Arc::new(FakeSocket {
+                        incoming: tokio::sync::Mutex::new(rx),
+                        sent: Mutex::new(Vec::new()),
+                    });
+                    (Frames::over(socket, 7, true), tx)
+                };
+                let send = |tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+                            seq: &mut u16,
+                            index: usize| {
+                    for packet in packetize(&units[index], seq, index as u32 * 1500) {
+                        tx.send(packet).unwrap();
+                    }
+                };
+                let (old, old_tx) = open();
+                let old_live = old.live();
+                let mut seq = 10u16;
+                for index in 0..10 {
+                    send(&old_tx, &mut seq, index);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                // The reopen: the new session opens, then the old one closes (a view of it lives on).
+                let (new, new_tx) = open();
+                let new_live = new.live();
+                drop(old);
+                let mut seq = 900u16;
+                for index in 0..30 {
+                    send(&new_tx, &mut seq, index);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(old_live.screen.lock().unwrap().closed);
+                let screen = new_live.screen.lock().unwrap();
+                assert!(!screen.closed);
+                assert_eq!(screen.counters.decoded, 30, "the new decoder runs on");
+                drop(screen);
+                drop((new, new_tx, old_tx));
+            });
     }
 
     /// An x265 stream like the phone's (no B-frames, delimiters), split into access units.

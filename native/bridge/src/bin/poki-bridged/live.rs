@@ -431,10 +431,10 @@ thread_local! {
     static FOREGROUND_WANTED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
 }
 
-/// Notes the foreground app of a tree an op read.
-pub fn note_tree(cell: &ForegroundCell, tree: &Value) {
+/// Notes the foreground app of a tree an op read; `asked` is when the read was asked for.
+pub fn note_tree(cell: &ForegroundCell, tree: &Value, asked: Instant) {
     if let Some(app) = tree.get("foreground_app").filter(|app| app.is_object()) {
-        cell.borrow_mut().noted = Some((Instant::now(), app.clone()));
+        cell.borrow_mut().noted = Some((asked, app.clone()));
     }
 }
 
@@ -465,7 +465,12 @@ pub fn foreground_json(state: &State) -> Value {
     // Read before the last input: the foreground may have changed since (a fresh tree, e.g.
     // the AX prefetch at each settle, brings it up to date). The same answer in ping and
     // latest_frame: the input time is kept here, not read from the session.
-    answer["stale"] = f.last_input.is_some_and(|input| at < input).into();
+    // A tree asked for before the screen had time to answer the input shows the screen before
+    // it (Nov 6: Clock still in the tree just after Home).
+    answer["stale"] = f
+        .last_input
+        .is_some_and(|input| at < input + crate::frames::no_response_time())
+        .into();
     if let Some(pid) = pid {
         if let Some(known) = f.known.get(&pid) {
             if answer["bundle_id"].is_null() {
