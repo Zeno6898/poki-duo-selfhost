@@ -131,26 +131,44 @@ public final class Runner: @unchecked Sendable {
 
     func forgetSession() { state.update { $0.session = nil } }
 
-    func session() async throws -> String {
+    private let opening = LockedBox<Task<String, Error>?>(nil)
+
+    /// The session, opened once when there is none. Concurrent callers share one open, and each waits
+    /// at most its own `timeout` (and 8 s): a slow open never holds a call past its deadline, and the
+    /// open goes on for the next caller.
+    func session(timeout: Double = 8) async throws -> String {
         if let id = state.value.session { return id }
-        let value = try await raw("POST", "/session", ["capabilities": ["alwaysMatch": .object([:])]], timeout: 8)
-        guard let id = value["sessionId"]?.string ?? value["capabilities"]?["sessionId"]?.string else {
-            throw RunnerError(message: "the runner opened no session", delivery: .notSent)
+        let task = opening.update { current -> Task<String, Error> in
+            if let current { return current }
+            let made = Task { [self] () throws -> String in
+                defer { opening.value = nil }
+                let value = try await raw("POST", "/session", ["capabilities": ["alwaysMatch": .object([:])]], timeout: 8)
+                guard let id = value["sessionId"]?.string ?? value["capabilities"]?["sessionId"]?.string else {
+                    throw RunnerError(message: "the runner opened no session", delivery: .notSent)
+                }
+                // Best effort: a runner that refuses the settings still works, only slower.
+                _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": Self.sessionSettings], timeout: 2, countsAsMiss: false)
+                state.update { $0.session = id }
+                return id
+            }
+            current = made
+            return made
         }
-        state.update { $0.session = id }
-        // Best effort: a runner that refuses the settings still works, only slower.
-        _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": Self.sessionSettings], timeout: 2, countsAsMiss: false)
-        return id
+        do {
+            return try await withDeadline(max(0.2, min(8, timeout)), "opening a session with the runner") { try await task.value }
+        } catch let error as DeadlineExceeded {
+            throw RunnerError(message: error.description, delivery: .notSent, silent: true)
+        }
     }
 
     /// A request inside the session, made again once on a new session when WDA no longer knows it.
     public func call(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4, countsAsMiss: Bool = true) async throws -> JSON {
-        let id = try await session()
+        let id = try await session(timeout: timeout)
         do {
             return try await raw(method, "/session/\(id)\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
         } catch let error as RunnerError where error.code == "invalid session id" || error.message.lowercased().contains("invalid session id") || (error.status == 404 && error.code == nil) {
             state.update { if $0.session == id { $0.session = nil } }
-            return try await raw(method, "/session/\(try await session())\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
+            return try await raw(method, "/session/\(try await session(timeout: timeout))\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
         }
     }
 

@@ -179,4 +179,22 @@ final class FaultTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 5.5)
         XCTAssertTrue(result.text.contains("may have been delivered"), result.text)
     }
+
+    func testAHangingSessionCreationDoesNotOutliveTheToolDeadline() async {
+        let wda = FakeWDA()
+        wda.set("POST /session") { _ in try await Task.sleep(nanoseconds: 60_000_000_000); return (200, ["value": ["sessionId": "s1"]]) }
+        let (core, _, _) = makeCore(wda) { $0.toolDeadline = 4; $0.readTimeout = 1 }
+        let started = Date()
+        let result = await core.call("look", [:])
+        XCTAssertLessThan(Date().timeIntervalSince(started), 4)
+        XCTAssertFalse(result.text.contains("what was sent is unknown"), "the call's own answer, not the backstop: \(result.text)")
+    }
+
+    func testConcurrentReadsOpenOneSession() async {
+        let wda = FakeWDA()
+        wda.set("POST /session") { _ in try await Task.sleep(nanoseconds: 200_000_000); return (200, ["value": ["sessionId": "s1"]]) }
+        let (core, _, _) = makeCore(wda)
+        _ = await core.call("look", [:])
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, 1, wda.sent.joined(separator: ", "))
+    }
 }
