@@ -262,6 +262,18 @@ final class LookDoTests: XCTestCase {
         XCTAssertTrue(result.text.contains("app: Settings"), "the read after it still answers: \(result.text)")
     }
 
+    func testRowsListedBesideTheListDoNotShrinkTheSwipe() async {
+        let (core, wda, _) = makeCore()
+        // Some apps list their rows after the table instead of inside it.
+        wda.tree([Node("Table", nil, [0, 0, 390, 844])] + (0..<7).map { Node("Cell", "Row \($0)", [0, Double(100 + $0 * 100), 390, 100]) } + [Node("TabBar", nil, [0, 790, 390, 54], [Node("Button", "Chats", [20, 795, 80, 44])])])
+        _ = await core.call("look", [:])
+        _ = await core.call("do", ["actions": [["swipe": "up"]]])
+        let body = wda.bodies("POST /wda/pressAndDragWithVelocity").first
+        let fromY = body?["fromY"]?.double ?? 0, toY = body?["toY"]?.double ?? 0
+        XCTAssertLessThan(fromY, 790, "not on the tab bar")
+        XCTAssertGreaterThan(fromY - toY, 400, "a long swipe, from \(fromY) to \(toY)")
+    }
+
     func testTheToolDescriptionsPointToScrollTo() {
         let text = PokiCore.tools.map { $0.serialized() }.joined() + PokiCore.instructions
         XCTAssertTrue(PokiCore.instructions.contains("scroll_to"))

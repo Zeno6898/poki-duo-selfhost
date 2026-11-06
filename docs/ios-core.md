@@ -194,6 +194,16 @@ Each answer is facts only: the app in front, numbered elements, what each action
   0.5 s. WDA otherwise waited up to 2 s after every gesture for the app to hold still, and up to 10 s
   before events for it to be idle, which an app that never stops animating used in full (2.3 to 4.3 s
   drags in X). Poki's own short pause before the read stays.
+- **Typing** is key presses first (`/wda/keys`, the whole text in one request; CJK, kana, Hangul and
+  digits are read back exactly in the tests), and every `type` says what the focused field holds
+  afterwards (`the field now reads "…"`, or only its length for a password). `via: "paste"` is the
+  backup the model may choose: PokiCore reads the owner's clipboard first (unreadable: nothing is
+  pasted), puts the text on it, opens the field's edit menu with a long press, taps Paste (the word
+  in 12 languages) and puts the owner's clipboard back whatever happened.
+- **Locked phone**: `do` checks `/wda/locked` first and sends nothing but buttons while locked
+  (`screen: locked`); `look` says so too. Unknown counts as unlocked.
+- **Approvals**: the owner's time on an approval does not count against the actions or the read;
+  a `do` that waited for one may take up to `toolDeadline + approvalWait` (about 46 s).
 - **`wait_until`**: `{wait_until: "text"}`, `{wait_until: {text, gone: true, ms}}` or
   `{wait_until: {settled: true, ms}}` reads the tree every 250 ms until the text appears or goes, or
   two reads match (default 3 s, at most 10 s, within the action time). Not seeing it is reported, not
