@@ -45,19 +45,22 @@ jobs:
       - name: Build for the simulator
         run: |
           set -o pipefail
+          mkdir -p build
           # Signed ad hoc, so the App Group (the thumbnail file) and Live Activities work.
           xcodebuild build \
             -project native/ios-app/Poki.xcodeproj -scheme Poki -configuration Debug \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim \
             CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO ARCHS=arm64 2>&1 | tee build/sim.log | grep -E "error:|warning: .*Activity|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+          grep -q 'BUILD SUCCEEDED' build/sim.log
+          test -d build/sim/Build/Products/Debug-iphonesimulator/Poki.app/PlugIns/PokiWidgets.appex
 
       - name: Screenshots
         run: |
           set -uo pipefail
           APP=build/sim/Build/Products/Debug-iphonesimulator/Poki.app
           RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys;r=[x for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["platform"]=="iOS"];print(r[-1]["identifier"])')
-          TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys;d=[x for x in json.load(sys.stdin)["devicetypes"] if x["name"].startswith("iPhone") and "Pro" in x["name"] and "Max" not in x["name"]];print(d[-1]["identifier"])')
+          # The newest iPhone Pro (it has the Dynamic Island), by model number, not by list order.
+          TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,re,sys;d=[x for x in json.load(sys.stdin)["devicetypes"] if re.fullmatch(r"iPhone \d+ Pro",x["name"])];d.sort(key=lambda x:int(re.search(r"\d+",x["name"]).group()));print(d[-1]["identifier"])')
           echo "runtime $RUNTIME, device $TYPE"
           UDID=$(xcrun simctl create poki-la "$TYPE" "$RUNTIME")
           boot() { xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b > /dev/null; xcrun simctl ui "$UDID" appearance dark; }
@@ -68,13 +71,17 @@ jobs:
           xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 || true
           mkdir -p shots/preview shots/real
           shot() { xcrun simctl io "$UDID" screenshot "$1" > /dev/null 2>&1 || echo "no screenshot $1"; }
-          # 1. The app's preview of each phase.
-          for s in start working approval done ready idle problem pairing code setup; do
-            xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
-            xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityState "$s" > /dev/null
-            sleep 3
-            shot "shots/preview/$s.png"
+          # 1. The app's preview of each phase, in light and dark.
+          for look in dark light; do
+            xcrun simctl ui "$UDID" appearance "$look"
+            for s in start working approval done ready idle problem pairing code setup; do
+              xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
+              xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityState "$s" > /dev/null
+              sleep 3
+              shot "shots/preview/$s-$look.png"
+            done
           done
+          xcrun simctl ui "$UDID" appearance dark
           # 2. Real Live Activities: compact island, the alert's expanded island, then the Lock Screen.
           for s in working approval code done setup; do
             xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true

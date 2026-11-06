@@ -31,6 +31,9 @@ final class ActivityController {
     private let alertSpacing: TimeInterval = 8
 
     private var lastAlert = Date.distantPast
+    private var lastSent = Date.distantPast
+    private let minimumGap: TimeInterval = 1
+    private var deferred: Task<Void, Never>?
     private var sending: Task<Void, Never>?
     private var finishTimer: Task<Void, Never>?
     private var eventTimer: Task<Void, Never>?
@@ -77,7 +80,7 @@ final class ActivityController {
     }
 
     func end() {
-        finishTimer?.cancel(); eventTimer?.cancel()
+        finishTimer?.cancel(); eventTimer?.cancel(); deferred?.cancel(); deferred = nil
         guard let activity else { return }
         self.activity = nil
         state.steps = []; state.guide = nil; state.pin = nil; state.since = nil; state.event = nil
@@ -120,12 +123,12 @@ final class ActivityController {
         if state.phase == .working, !runPhases.contains(old.phase) {
             state.stepCount = 0; state.failedCount = 0; state.endedAt = nil; state.steps = []
             if state.since == nil { state.since = now }
-            let place = state.app.map { "Working in \($0)" } ?? "Your agent is using this iPhone"
+            let place = state.app.map { String(localized: "Working in \($0)") } ?? String(localized: "Your agent is using this iPhone")
             // The runner's start and the agent's first step are one start, not two pop-ups.
             if !runAnnounced {
                 runAnnounced = true
-                setEvent(.started, "Started")
-                alert = ordinary("Agent started", place)
+                setEvent(.started, String(localized: "Started"))
+                alert = ordinary(String(localized: "Agent started"), place)
             }
         }
         if state.phase == .done || state.phase == .idle && state.runnerPaused || state.phase == .pairing || state.phase == .setup {
@@ -133,32 +136,32 @@ final class ActivityController {
         }
         // Into another app mid-run.
         if runPhases.contains(state.phase), let app = state.app, let before = old.app, app != before {
-            setEvent(.app, "Now in \(app)")
-            alert = alert ?? ordinary("Now in \(app)", state.steps.last?.text ?? "Your agent switched apps")
+            setEvent(.app, String(localized: "Now in \(app)"))
+            alert = alert ?? ordinary(String(localized: "Now in \(app)"), state.steps.last?.text ?? String(localized: "Your agent switched apps"))
         }
         // Approval: always pops up and lights the screen.
         if let approval = state.approval, approval.id != old.approval?.id {
             state.approvalSince = now
             alertedApproval = approval.id
-            alert = critical("Allow this step?", "\(approval.summary) · \(approval.app)")
+            alert = critical(String(localized: "Allow this step?"), "\(approval.summary) · \(approval.app)")
         }
         if state.approval == nil, let was = old.approval {
             state.approvalSince = nil
             let approved = state.headline.hasPrefix("Approved")
             let expired = !approved && was.expires <= now.addingTimeInterval(0.5)
-            setEvent(approved ? .approved : expired ? .expired : .denied, approved ? "Allowed" : expired ? "Timed out" : "Denied")
+            setEvent(approved ? .approved : expired ? .expired : .denied, approved ? String(localized: "Allowed") : expired ? String(localized: "Timed out") : String(localized: "Denied"))
         }
         if state.phase == .problem, old.phase != .problem {
-            setEvent(.problem, "Problem")
-            alert = critical("Poki needs attention", state.headline)
+            setEvent(.problem, String(localized: "Problem"))
+            alert = critical(String(localized: "Poki needs attention"), state.headline)
         }
         if let pin = state.pin, pin != old.pin {
-            setEvent(.code, "Code ready")
-            alert = critical("Pairing code \(pin)", "Type it on the Pair with Poki screen in Settings")
+            setEvent(.code, String(localized: "Code ready"))
+            alert = critical(String(localized: "Pairing code \(pin)"), String(localized: "Type it on the Pair with Poki screen in Settings"))
         }
         if old.phase == .pairing, state.phase == .idle, state.headline == "Paired" {
-            setEvent(.paired, "Paired")
-            alert = critical("Paired", "This iPhone is ready for Poki")
+            setEvent(.paired, String(localized: "Paired"))
+            alert = critical(String(localized: "Paired"), String(localized: "This iPhone is ready for Poki"))
         }
 
         // The finish timer: re-armed by every change during a run. A headline change that is not the
@@ -187,10 +190,10 @@ final class ActivityController {
         state.phase = .done
         runAnnounced = false
         state.endedAt = Date()
-        state.headline = state.app.map { "Finished in \($0)" } ?? "Finished"
-        setEvent(.finished, "Finished")
-        let summary = "\(count) step\(count == 1 ? "" : "s")" + (state.failedCount > 0 ? ", \(state.failedCount) didn't go through" : "")
-        send(alert: ordinary("Agent finished", summary))
+        state.headline = state.app.map { String(localized: "Finished in \($0)") } ?? String(localized: "Finished")
+        setEvent(.finished, String(localized: "Finished"))
+        let summary = state.runSummary
+        send(alert: ordinary(String(localized: "Agent finished"), summary))
     }
 
     private func setEvent(_ kind: PokiActivityAttributes.Event.Kind, _ text: String) {
@@ -219,14 +222,48 @@ final class ActivityController {
 
     // MARK: Sending
 
+    /// Sends the state. Alerts go out at once; plain updates are coalesced to at most one a second
+    /// (the latest state wins), which keeps a fast agent inside ActivityKit's update budget.
     private func send(alert: AlertConfiguration?) {
+        guard activity != nil else { return }
+        if alert == nil {
+            let wait = minimumGap - Date().timeIntervalSince(lastSent)
+            if wait > 0 {
+                if deferred == nil {
+                    deferred = Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(wait))
+                        guard !Task.isCancelled, let self else { return }
+                        self.deferred = nil
+                        self.push(alert: nil)
+                    }
+                }
+                return
+            }
+        }
+        deferred?.cancel(); deferred = nil
+        push(alert: alert)
+    }
+
+    private func push(alert: AlertConfiguration?) {
         guard let activity else { return }
+        lastSent = Date()
+        trimToFit()
         let content = content()
         let previous = sending
         sending = Task {
             await previous?.value
             if let alert { await activity.update(content, alertConfiguration: alert) } else { await activity.update(content) }
         }
+    }
+
+    /// ActivityKit refuses a state over 4 KB. Ours is far smaller, but long step texts from an agent
+    /// are cut first, then the older steps dropped, so an update is never lost to size.
+    private func trimToFit() {
+        func size() -> Int { (try? JSONEncoder().encode(state).count) ?? 0 }
+        guard size() > 3_500 else { return }
+        state.steps = state.steps.map { .init(text: String($0.text.prefix(40)), ok: $0.ok) }
+        state.headline = String(state.headline.prefix(80))
+        while size() > 3_500, !state.steps.isEmpty { state.steps.removeFirst() }
     }
 
     private func content() -> ActivityContent<PokiActivityAttributes.ContentState> {

@@ -43,13 +43,13 @@ extension PokiState {
     /// One word, so the pill never wraps.
     var status: String {
         switch phase {
-        case .working: "Working"
-        case .approval: "Approve"
-        case .pairing: "Pairing"
-        case .setup: "Setup"
-        case .problem: "Problem"
-        case .done: "Done"
-        case .idle: runnerPaused ? "Idle" : "Ready"
+        case .working: String(localized: "Working")
+        case .approval: String(localized: "Approve")
+        case .pairing: String(localized: "Pairing")
+        case .setup: String(localized: "Setup")
+        case .problem: String(localized: "Problem")
+        case .done: String(localized: "Done")
+        case .idle: runnerPaused ? String(localized: "Idle") : String(localized: "Ready")
         }
     }
     var symbol: String {
@@ -72,8 +72,8 @@ extension PokiState {
         }
     }
     var runSummary: String {
-        let steps = "\(stepCount) step\(stepCount == 1 ? "" : "s")"
-        return failedCount > 0 ? "\(steps) · \(failedCount) missed" : steps
+        let steps = stepCount == 1 ? String(localized: "1 step") : String(localized: "\(stepCount) steps")
+        return failedCount > 0 ? String(localized: "\(steps) · \(failedCount) missed") : steps
     }
 }
 
@@ -224,7 +224,7 @@ struct RunLayout: View {
         HStack(spacing: 8) {
             switch state.phase {
             case .working:
-                Meta(symbol: "list.bullet", text: "Step \(state.stepCount + 1)")
+                Meta(symbol: "list.bullet", text: String(localized: "Step \(state.stepCount + 1)"))
                 if let since = state.since { ElapsedMeta(since: since) }
                 Spacer(minLength: 4)
                 StopButton()
