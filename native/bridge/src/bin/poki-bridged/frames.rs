@@ -1650,11 +1650,19 @@ mod tests {
         for tuning in [
             libav::Tuning {
                 threads: 1,
+                thread_type: "slice",
                 skip_loop_filter: false,
                 fast: false,
             },
             libav::Tuning {
                 threads: 3,
+                thread_type: "slice",
+                skip_loop_filter: true,
+                fast: true,
+            },
+            libav::Tuning {
+                threads: 2,
+                thread_type: "frame",
                 skip_loop_filter: true,
                 fast: true,
             },
@@ -1665,8 +1673,20 @@ mod tests {
             for unit in &units {
                 pictures += decoder.decode(unit).unwrap().len();
             }
+            let held = units.len() - pictures;
+            pictures += decoder.finish().unwrap().len();
             let per_unit = started.elapsed().as_secs_f64() * 1000.0 / units.len() as f64;
-            println!("{tuning:?}: {per_unit:.1} ms per 1216x2656 unit, {pictures} pictures");
+            println!(
+                "{tuning:?}: {per_unit:.1} ms per 1216x2656 unit, {pictures} pictures, {held} held until the end"
+            );
+            if tuning.thread_type == "slice" {
+                assert_eq!(held, 0, "slice threads hold no picture back");
+            } else {
+                assert!(
+                    held < tuning.threads as usize + 1,
+                    "frame threads hold back a unit or so"
+                );
+            }
             assert_eq!(pictures, units.len());
         }
         let screen = fake::FakeScreen::start().unwrap();
