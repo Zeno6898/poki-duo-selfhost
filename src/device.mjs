@@ -9,7 +9,7 @@ import sharp from 'sharp';
 import { root, stateDir, idevice } from './config.mjs';
 import { definitions } from './tools.mjs';
 import { platformTool, inventorySimulators, simulatorModels, readSettings, closePlatform } from './platform.mjs';
-import { interaction, promptWarning, readScreen, screenChanged, justReadMs } from './interaction.mjs';
+import { interaction, promptWarning, readScreen, describeScreen, screenChanged, justReadMs } from './interaction.mjs';
 import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
@@ -268,7 +268,10 @@ export class Devices {
       return { screen, screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
-      return { screen_change_verified: false, screen: { unavailable: error.message } };
+      // Input clears the last read, so one left now was taken after the action: report it rather than nothing.
+      const seen = this.seen?.device === this.resolved?.id && this.seen.elements.length ? this.seen : undefined;
+      if (!seen) return { screen_change_verified: false, screen: { unavailable: error.message } };
+      return { screen_change_verified: false, screen: { ...describeScreen(seen), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
     }
   }
   // The action does not depend on this read, so a slow read only costs the comparison.

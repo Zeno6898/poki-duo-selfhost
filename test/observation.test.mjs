@@ -11,3 +11,13 @@ test('a tap on a phone with slow accessibility reads still ends with the screen'
  assert.equal(receipt.screen.unavailable,undefined,JSON.stringify(receipt));
  assert.ok(receipt.screen.text.includes('Button: First'),JSON.stringify(receipt));
 });
+
+test('a readback cut off by its deadline reports the last complete read instead of nothing', { timeout: 30000 }, async t => {
+ const f=await fixture(t);await f.set({afterInput:{axDelays:[300,20000]}});
+ const result=await f.call('tap',{x:10,y:10});
+ assert.notEqual(result.isError,true,result.content[0].text);
+ const receipt=value(result);
+ assert.equal(receipt.screen.partial,true,JSON.stringify(receipt));
+ assert.ok(receipt.screen.text.includes('Button: First'));
+ assert.match(receipt.screen.reason,/deadline/);
+});
