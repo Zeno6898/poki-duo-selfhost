@@ -33,8 +33,9 @@ jobs:
           git -C .deps/idevice checkout -q --detach 89702099f4d7552f704f93b4526756abda319ceb
           git -C .deps/idevice apply ../../native/patches/idevice-xctest-run-over-rsd.patch
           rustup update stable --no-self-update && rustup default stable
-          rustup target add aarch64-apple-ios
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           cargo build --release --locked --target aarch64-apple-ios --manifest-path native/launcher/Cargo.toml
+          cargo build --release --locked --target aarch64-apple-ios-sim --manifest-path native/launcher/Cargo.toml
           ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
           # The C ABI's symbols, for the log (the app's link step is the real check).
           (nm -g native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a 2>/dev/null | grep -E '_poki_(launcher|pair|string)_' | sort -u) || echo "nm listed no poki_ symbols"
@@ -81,6 +82,30 @@ jobs:
           ditto -c -k --keepParent --norsrc Payload out/Poki-unsigned.ipa
           (cd out && shasum -a 256 *.ipa | tee SHA256SUMS)
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/Poki.app/Info.plist
+
+      # The app on the iOS Simulator: it launches, stays up, and draws its first screen. The launcher
+      # cannot reach a simulator's developer services, so this checks the shell, not automation.
+      - name: Simulator smoke test
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project native/ios-app/Poki.xcodeproj -scheme Poki -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim \
+            CODE_SIGNING_ALLOWED=NO ARCHS=arm64 2>&1 | tee build/sim.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          APP=build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+          test -d "$APP"
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys;r=[x for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["platform"]=="iOS"];print(r[-1]["identifier"])')
+          TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys;d=[x for x in json.load(sys.stdin)["devicetypes"] if x["name"].startswith("iPhone") and "Pro" in x["name"] and "Max" not in x["name"]];print(d[-1]["identifier"])')
+          UDID=$(xcrun simctl create poki-smoke "$TYPE" "$RUNTIME")
+          xcrun simctl boot "$UDID" && xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" nz.zheha.poki
+          sleep 12
+          mkdir -p out/simulator
+          xcrun simctl io "$UDID" screenshot out/simulator/home.png
+          # Still running after 12 s: no crash at launch (keychain, PokiCore, launcher link).
+          xcrun simctl spawn "$UDID" launchctl list | grep -q 'nz.zheha.poki' || { xcrun simctl spawn "$UDID" log show --last 2m --predicate 'process == "Poki"' | tail -80; exit 1; }
+          echo "Poki is running on the simulator"
 
       - uses: actions/upload-artifact@v4
         with:
