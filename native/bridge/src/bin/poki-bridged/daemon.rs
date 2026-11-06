@@ -70,7 +70,7 @@ pub fn main() {
         Err(error) => Err(error),
     };
     if let Err(error) = code {
-        eprintln!("poki-bridged: {error}");
+        log(&error.to_string());
         std::process::exit(if error.to_string() == ALREADY_RUNNING {
             3
         } else {
@@ -113,7 +113,7 @@ fn idle_env(name: &str, default_ms: u64) -> Option<Duration> {
 async fn run(socket: PathBuf, target: Target) -> Result<()> {
     let listener = bind(&socket).await?;
     let state = Rc::new(State::new(target));
-    eprintln!("poki-bridged: ready (pid {})", std::process::id());
+    log(&format!("ready (pid {})", std::process::id()));
     let result = serve(listener, state.clone()).await;
     state.session.lock().await.reset().await;
     let _ = std::fs::remove_file(&socket);
@@ -208,7 +208,7 @@ async fn reap(state: Rc<State>) {
 }
 
 fn log(message: &str) {
-    eprintln!("poki-bridged: {message}");
+    eprintln!("{} poki-bridged: {message}", crate::ax::watch::stamp());
 }
 
 /// One client. Its requests are answered in order; when it disconnects, a running op is cancelled.

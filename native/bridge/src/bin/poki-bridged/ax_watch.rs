@@ -74,7 +74,32 @@ impl AsyncWrite for Writer {
 }
 
 fn log_line(message: &str) {
-    eprintln!("poki-bridged: {message}");
+    eprintln!("{} poki-bridged: {message}", stamp());
+}
+
+/// The time now in UTC, as 2026-11-06T02:58:16.123Z, for the daemon's log lines.
+pub(crate) fn stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (secs, millis) = (now.as_secs(), now.subsec_millis());
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -700,6 +725,21 @@ mod tests {
             assert_eq!(watch.stats()["push_mode"], json!(false));
             phone.task.abort();
         });
+    }
+
+    #[test]
+    fn log_stamps_are_utc_dates() {
+        let stamp = stamp();
+        assert_eq!(stamp.len(), 24, "{stamp}");
+        let today = std::process::Command::new("date")
+            .args(["-u", "+%Y-%m-%dT%H"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        if let Ok(today) = today
+            && !today.is_empty()
+        {
+            assert!(stamp.starts_with(&today[..10]), "{stamp} vs {today}");
+        }
     }
 
     #[test]
