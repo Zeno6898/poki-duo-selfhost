@@ -64,6 +64,12 @@ async function read(ctx) {
   if (frameResult.status === 'rejected') throw frameResult.reason;
   const frame = frameResult.value;
   let elements = [], source = 'accessibility', foreground, note;
+  // A dark, uniform picture is a locked or sleeping display: say so instead of reading it.
+  const { channels } = await sharp(frame.data).stats();
+  const dark = channels.slice(0, 3).every(c => c.mean < 12 && c.stdev < 6);
+  if (dark && !(treeResult.status === 'fulfilled' && treeResult.value.elements?.length)) {
+    return { frame, elements: [], source: 'none', note: 'screen: dark (the phone is locked or its display is off)', ms: Math.round(performance.now() - started) };
+  }
   if (treeResult.status === 'fulfilled' && treeResult.value.elements?.length) {
     elements = treeResult.value.elements; foreground = treeResult.value.foreground;
   } else {
