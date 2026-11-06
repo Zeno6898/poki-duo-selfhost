@@ -51,6 +51,8 @@ class LedgerApp {
       if (e.selected) parts.push([e.x + e.width - 14, e.y + 12, 10, 10, 0]);
       return parts.map(async ([left, top, width, height, v]) => ({ input: await sharp({ create: { width, height, channels: 3, background: { r: v, g: v, b: v } } }).png().toBuffer(), left, top }));
     }));
+    // A spinner that never stops, below the status bar.
+    if (this.spinner) blocks.push({ input: await sharp({ create: { width: 12, height: 12, channels: 3, background: 'black' } }).png().toBuffer(), left: 150 + (this.spin = ((this.spin ?? 0) + 7) % 40), top: 32 });
     return sharp({ create: { width: W, height: H, channels: 3, background: 'white' } }).composite(blocks).png().toBuffer();
   }
 }
@@ -62,6 +64,8 @@ class LedgerPhone extends Devices {
   async inventory() { return [{ id: 'phone-1', kind: 'physical', name: 'Test Phone', state: 'Booted' }]; }
   liveScreen() { return this.live?.(this); }
   async bridge(request) {
+    if (request.op === 'ax' && this.axFails) { await new Promise(r => setTimeout(r, 300)); throw new DOMException('External process deadline exceeded', 'TimeoutError'); }
+    if (request.op === 'ax' && this.axDelayMs) await new Promise(r => setTimeout(r, this.axDelayMs));
     if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: this.pidOnly ? { pid: tree.foreground.pid } : tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
     if (request.op === 'app_for_pid') { this.lookups = (this.lookups ?? 0) + 1; return request.pid === ledger.pid ? { bundle_id: ledger.bundle_id, name: 'Ledger' } : { executable: '/System/Library/CoreServices/SpringBoard.app/SpringBoard' }; }
     if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
@@ -300,4 +304,38 @@ test('an accessibility root with only a pid is named from the app service, once 
   assert.match(opened.now.summary, /^local\.ledger: as expected/);
   await phone.call('observe', {});
   assert.equal(phone.lookups, 2, 'one lookup per process');
+});
+
+test('a screen that never stops animating: the expectation is met once its text holds, at the newest picture', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  phone.app.spinner = true;
+  await phone.call('observe', {});
+  const started = performance.now();
+  const opened = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Ledger' } }, expect: { text: 'Entries' } }));
+  assert.equal(opened.expectation, 'met');
+  assert.ok(performance.now() - started < 4500, `${Math.round(performance.now() - started)} ms`);
+  assert.ok(opened.now.frame.age_ms < 1500, `picture ${opened.now.frame.age_ms} ms old`);
+  // Without an expectation it still answers inside the step's time, and says the screen is animating.
+  const tapped = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, timeout_ms: 2000 }));
+  assert.ok(tapped.now.frame.age_ms < 1500);
+  const missed = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, expect: { text: 'Nowhere' }, timeout_ms: 2500 }));
+  assert.equal(missed.expectation, 'missed', 'text that holds still without the expectation is a miss, not a timeout');
+});
+
+test('a step returns at its deadline with what the World has, and a dead accessibility read is not an error', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  await phone.call('observe', {});
+  phone.axFails = true;
+  const started = performance.now();
+  const result = await phone.call('run', { steps: [{ tool: 'tap', arguments: { x: 45, y: 105 }, timeout_ms: 2000 }] });
+  const answer = body(result);
+  assert.equal(answer.stopped, null, JSON.stringify(answer.stopped));
+  assert.equal(phone.app.page, 'accounts');
+  assert.ok(performance.now() - started < 5000, `${Math.round(performance.now() - started)} ms`);
+  assert.equal(answer.now.outcome, 'changed', 'the pictures still say what happened');
+  phone.axFails = false; phone.axDelayMs = 6000;
+  const slow = performance.now();
+  const late = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, timeout_ms: 2000 }));
+  assert.ok(performance.now() - slow < 4500, `a 6 s tree read held the reply for ${Math.round(performance.now() - slow)} ms`);
+  assert.equal(late.sent, true);
 });

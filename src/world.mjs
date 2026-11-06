@@ -19,7 +19,7 @@ import { writeFile, unlink, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
-import { pause, remaining, stopped } from './work.mjs';
+import { pause, remaining, checkWork } from './work.mjs';
 import { stateDir } from './config.mjs';
 import { ocrStatus, ocrPath } from './build-info.mjs';
 import { promptWarning } from './interaction.mjs';
@@ -87,6 +87,22 @@ function fromLive(picture) {
     changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, ...(picture.videoStalled ? { videoStalled: true, stalledMs: picture.stalledMs } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
+// A failure inside a read is not the call being stopped: only the caller's own deadline or cancel is.
+// Read failures (a bridge op timing out, a tree read that died) are absorbed and the caller goes on.
+export const absorb = () => { checkWork(); };
+// Runs fn for at most ms and returns fallback if it is not done by then or fails on its own. What it
+// started keeps running, so this is only for reads, never for input.
+export async function within(ms, fn, fallback) {
+  if (!(ms > 0)) return fallback;
+  if (!Number.isFinite(ms)) { try { return await fn(); } catch { checkWork(); return fallback; } }
+  let timer;
+  const run = Promise.resolve().then(fn);
+  run.catch(() => {});
+  try { return await Promise.race([run, new Promise(done => { timer = setTimeout(done, ms, fallback); })]); }
+  catch { checkWork(); return fallback; }
+  finally { clearTimeout(timer); }
+}
+
 async function withThumb(frame) { return frame.thumb ? frame : { ...frame, thumb: await thumb(frame.image) }; }
 
 // A read of the screen, tied to the frame it describes.
@@ -96,7 +112,8 @@ const lineOf = e => {
   return parts.length ? `${e.type ?? e.role ?? 'Text'}: ${parts.join(' = ')}` : undefined;
 };
 const treeKey = (elements, foreground) => JSON.stringify([foreground?.pid ?? null, elements.map(e => { const f = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, Boolean(e.selected), f.x, f.y, f.width, f.height]; })]);
-const treeLagMs = 2500;
+// Only a change this large can be a page the tree has not caught up with: a spinner or a clock is not.
+const treeLagMs = 2500, lagFraction = 0.02;
 const lostText = {
   wifi_required: 'The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB. Put the phone on Wi-Fi or USB; inputs are held until it is back.',
   tunnel_down: 'The device tunnel is down and being reopened. Inputs are held until it is back.',
@@ -136,9 +153,9 @@ export class World {
   }
   // The first settled frame after the last input. A launch or navigation is judged only on one.
   async settle(timeoutMs = 3000, settleMs, maxWidth) {
-    const started = performance.now();
+    const started = performance.now(), input = this.lastInput;
     const frame = await this.stamp(await this.source.settled({ timeoutMs, settleMs, maxWidth }));
-    const settled = { ...frame, settleMs: Math.round(performance.now() - started), afterInput: this.lastInput?.epoch, proven: this.proven(frame) };
+    const settled = { ...frame, settleMs: Math.round(performance.now() - started), afterInput: input?.epoch, proven: this.proven(frame, input) };
     this.lastSettle = settled;
     if (settled.settled) this.settledFrame = settled;
     return settled;
@@ -146,8 +163,7 @@ export class World {
   // Whether a frame is known to show the screen after the last input: it was captured after the input
   // was sent, or the source watched the screen since the input and saw it settle without a change.
   // A frame that is neither may be the screen the input was sent to, so it proves nothing about it.
-  proven(frame) {
-    const input = this.lastInput;
+  proven(frame, input = this.lastInput) {
     // A picture from a stalled video is older than the screen, whatever its number says.
     if (frame.videoStalled) return false;
     if (!input) return true;
@@ -163,7 +179,7 @@ export class World {
     const screen = this.live ? this.source.screen : undefined;
     if (typeof screen?.status !== 'function') return undefined;
     let health;
-    try { health = await screen.status(); } catch (error) { if (stopped(error)) throw error; health = { ok: false, reasons: ['unreachable'] }; }
+    try { health = await screen.status(); } catch { absorb(); health = { ok: false, reasons: ['unreachable'] }; }
     const reasons = health?.reasons ?? [];
     const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.some(reason => degraded.has(reason));
     const lost = reasons.find(reason => !degraded.has(reason));
@@ -180,7 +196,10 @@ export class World {
   // describes it, and the elements inside that region are not offered as targets.
   // waitMs bounds how long the tree may take before the result goes out without it (live frames only:
   // a screenshot-based frame already took longer than the tree).
-  async read(frame, { waitMs = Infinity } = {}) {
+  // budgetMs bounds the whole read, OCR included, so a dead accessibility service never holds a reply.
+  async read(frame, { waitMs = Infinity, budgetMs = Infinity } = {}) {
+    const end = performance.now() + budgetMs;
+    waitMs = Math.min(waitMs, budgetMs);
     const size = this.devices.size ?? { width: frame.width, height: frame.height };
     if (this.tree?.epoch === frame.epoch) return this.view(frame, { source: 'accessibility', elements: this.tree.elements, foreground: this.tree.foreground, tree: 'current' });
     const startedMs = Date.now(), epoch = frame.epoch;
@@ -190,10 +209,10 @@ export class World {
       // treeLagMs after the input: only then are the same words on a new picture believed (an image or
       // canvas can change without the tree changing).
       const elements = seen?.elements.filter(visible) ?? [], key = treeKey(elements, seen?.foreground);
-      const lagging = this.tree && this.tree.epoch !== epoch && this.tree.key === key && compare(this.tree.thumb, frame.thumb)?.changed && startedMs - (this.lastInput?.sentMs ?? 0) < treeLagMs;
+      const lagging = this.tree && this.tree.epoch !== epoch && this.tree.key === key && (compare(this.tree.thumb, frame.thumb)?.fraction ?? 0) > lagFraction && startedMs - (this.lastInput?.sentMs ?? 0) < treeLagMs;
       if (elements.length && !lagging && startedMs >= frame.changedMs && this.epoch === epoch) this.tree = { elements, foreground: seen.foreground, epoch, thumb: frame.thumb, key };
       return this.tree?.epoch === epoch ? this.tree : undefined;
-    }, error => { if (stopped(error)) throw error; });
+    }, absorb);
     const timer = Number.isFinite(waitMs) ? new Promise(done => setTimeout(done, waitMs, 'late')) : undefined;
     const tree = await (timer ? Promise.race([reading, timer]) : reading);
     if (tree === 'late') this.pendingTree = reading.catch(() => {});
@@ -201,7 +220,7 @@ export class World {
     // Where the pixels did not move since the last tree, it still describes them; the changed region is read by OCR.
     const region = this.tree ? compare(this.tree.thumb, frame.thumb)?.region : null;
     const kept = region && this.tree ? this.tree.elements.filter(e => !inside(e, region, size)) : [];
-    const recognized = await this.ocr(frame, kept.length ? region : null, size).catch(error => { if (stopped(error)) throw error; return []; });
+    const recognized = await within(end - performance.now(), () => this.ocr(frame, kept.length ? region : null, size), []);
     return this.view(frame, { source: kept.length ? 'accessibility+region_ocr' : 'ocr', elements: [...kept, ...recognized], foreground: this.tree?.foreground, tree: tree === 'late' ? 'pending' : 'unavailable', ocrOnly: recognized });
   }
   async ocr(frame, region, size) {
@@ -213,7 +232,7 @@ export class World {
         const answer = await this.source.screen.op({ ...request, ...(Number.isInteger(frame.bridgeEpoch) ? { epoch: frame.bridgeEpoch } : {}) }, 5000);
         const point = e => { const [x, y, w, h] = e.region ?? [e.x, e.y, e.width, e.height]; return { x: x * size.width, y: y * size.height, width: w * size.width, height: h * size.height }; };
         if (Array.isArray(answer?.elements) && answer.epoch_matches !== false) return answer.elements.map(e => ({ label: e.text, text: e.text, type: 'StaticText', frame: point(e), ocr: true }));
-      } catch (error) { if (stopped(error)) throw error; }
+      } catch { absorb(); }
     }
     if (!(await ocrStatus()).available) return [];
     const meta = await sharp(frame.image).metadata();

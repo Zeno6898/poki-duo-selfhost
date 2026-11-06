@@ -8,8 +8,8 @@
 // Nothing here knows any app.
 import { randomUUID } from 'node:crypto';
 import { matching, whatMoved } from './interaction.mjs';
-import { compare } from './world.mjs';
-import { checkWork, stopped, stoppingReason } from './work.mjs';
+import { compare, within } from './world.mjs';
+import { checkWork, stoppingReason } from './work.mjs';
 
 export const names = ['observe', 'act', 'run'];
 // Steps a run may contain. wait_for is an expectation with no input; select_items is handled here.
@@ -19,6 +19,10 @@ const coordinateTouches = new Set(['tap', 'double_tap', 'long_press']);
 // Words that mark a step whose effect may not be undone. A run stops before such a step unless the
 // caller allowed it. This is a generic pattern over the target's label, not a list of apps.
 export const destructive = /\b(delete|remove|erase|send|pay|purchase|buy|confirm|sign out|log out|reset|discard)\b/i;
+// A wait after an input is cut into slices, so an expectation is checked while a screen keeps moving.
+const sliceMs = 800, lookMs = 3000;
+// Whether the call itself was stopped (its deadline or a cancel), as opposed to one read failing.
+const cancelled = () => { try { checkWork(); return false; } catch { return true; } };
 const stepTimeoutMs = 3000, maxTimeoutMs = 30000, runKeptMs = 10 * 60 * 1000, lineLimit = 40, treeWaitMs = 400;
 
 const normalize = value => String(value).normalize('NFKC').toLocaleLowerCase().trim();
@@ -27,7 +31,7 @@ const centerOf = element => { const f = box(element); return { x: f.x + f.width 
 const labelOf = element => element.label ?? element.text ?? element.value ?? element.placeholder ?? element.identifier;
 const roleOf = element => String(element.type ?? element.role ?? '');
 const covers = (element, { x, y }) => { const f = box(element); return x >= f.x && x <= f.x + f.width && y >= f.y && y <= f.y + f.height; };
-const within = (element, container) => covers(container, centerOf(element)) && element !== container;
+const insideOf = (element, container) => covers(container, centerOf(element)) && element !== container;
 // Reading order: rows top to bottom (centers within 8 points share a row), then left to right.
 const readingOrder = (a, b) => { const p = centerOf(a), q = centerOf(b); return Math.abs(p.y - q.y) > 8 ? p.y - q.y : p.x - q.x; };
 
@@ -41,7 +45,7 @@ function state(ctx) {
 // Refs name elements of one frame. Once the screen has changed they name nothing, so a stale ref is
 // refused instead of being tapped where the element used to be.
 function giveRefs(agent, view) {
-  agent.refs = { epoch: view.frame.epoch, byRef: new Map() };
+  agent.refs = { epoch: view.frame.epoch, thumb: view.frame.thumb, byRef: new Map() };
   agent.counter ??= 0;
   return view.elements.filter(e => labelOf(e) || e.ocr).map(e => {
     const ref = `e${++agent.counter}`;
@@ -51,9 +55,20 @@ function giveRefs(agent, view) {
   });
 }
 class StaleRef extends Error {}
+// A ref stays good while the pixels under its element hold: a spinner or a clock elsewhere on the
+// screen does not retire it, a change that reaches it does. Its frame has to be seen after the last input.
 function resolveRef(agent, world, ref) {
   const element = agent.refs?.byRef.get(String(ref).toLowerCase());
-  if (!element || agent.refs.epoch !== world.epoch) throw new StaleRef(`Ref ${ref} is from an earlier screen. Use the refs in this result, or the visible text with tap_text.`);
+  const stale = () => new StaleRef(`Ref ${ref} is from an earlier screen. Use the refs in this result, or the visible text with tap_text.`);
+  if (!element) throw stale();
+  if (agent.refs.epoch === world.epoch) return element;
+  const latest = world.lastFrame, size = world.devices.size;
+  if (!latest || !size || !agent.refs.thumb || latest.epoch < (world.lastInput?.epoch ?? 0)) throw stale();
+  const change = compare(agent.refs.thumb, latest.thumb);
+  if (!change?.changed) return element;
+  const f = box(element), [x, y, w, h] = change.region;
+  const fx = f.x / size.width, fy = f.y / size.height, fw = f.width / size.width, fh = f.height / size.height;
+  if (fx < x + w && x < fx + fw && fy < y + h && y < fy + fh) throw stale();
   return element;
 }
 
@@ -95,7 +110,7 @@ const treeKey = view => view.tree === 'current' ? JSON.stringify(view.lines) : u
 
 // The screen the next input is sent to, as the comparison base for its verdict.
 async function baseOf(world) {
-  const frame = world.lastFrame && world.lastFrame.epoch === world.epoch ? world.lastFrame : await world.current();
+  const frame = world.lastFrame && world.lastFrame.epoch === world.epoch ? world.lastFrame : await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current();
   const tree = world.tree?.epoch === frame.epoch ? world.tree : undefined;
   return { frame, elements: tree?.elements, foreground: tree?.foreground?.pid ?? null, key: tree ? JSON.stringify(world.view(frame, { elements: tree.elements, foreground: tree.foreground }).lines) : undefined, page: tree ? world.view(frame, { elements: tree.elements, foreground: tree.foreground }).page?.id : undefined };
 }
@@ -104,23 +119,33 @@ async function baseOf(world) {
 // settles without it, a system prompt is up, or time runs out. Without an expectation, until the
 // first settled frame.
 async function judge(world, base, { expect, timeoutMs }) {
-  const until = performance.now() + timeoutMs;
+  // A hard deadline: every settle, picture, tree and OCR read races it, and the answer at the end is
+  // whatever the World has then.
+  const until = performance.now() + timeoutMs, left = () => until - performance.now();
   let previous, frame, view;
   for (;;) {
     checkWork();
-    frame = await world.settle(Math.max(250, until - performance.now()));
-    view = await world.read(frame, { waitMs: world.live ? treeWaitMs : Infinity });
+    const settled = await within(left(), () => world.settle(Math.max(150, Math.min(left(), sliceMs))), undefined);
+    frame = settled ?? frame;
+    // Never a picture older than the newest: a screen that does not settle is shown as it is now.
+    if (!settled?.settled) frame = await within(Math.max(300, left()), () => world.current(), frame) ?? frame ?? world.lastFrame ?? base.frame;
+    view = await within(Math.max(300, left()), () => world.read(frame, { waitMs: world.live ? treeWaitMs : left(), budgetMs: Math.max(300, left()) }), undefined)
+      ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
     const met = holds(expect, view, base);
-    if (met) return { expectation: 'met', frame, view };
+    // A screen that keeps animating (a spinner, a clock) never settles; its text holding still across
+    // two reads of a tree current for each frame is as good a sign that it has arrived.
+    const textStill = Boolean(previous) && view.tree === 'current' && previous.view.tree === 'current' && JSON.stringify(view.lines) === JSON.stringify(previous.view.lines);
+    const still = frame.settled || textStill;
+    if (met && still) return { expectation: 'met', frame, view };
     if (view.prompt) return { expectation: expect ? 'blocked' : undefined, frame, view };
-    if (!expect && frame.settled) return { frame, view };
+    if (!expect && still) return { frame, view };
     // A settled screen that never moved is the answer; one that moved may still be on its way (a
     // spinner, a page sliding in), so it is believed when it settles twice on the same picture.
     const moved = compare(base.frame.thumb, frame.thumb)?.changed;
     // Only a tree read for this frame can say what is missing: a lagging one is waited out.
-    if (expect && frame.settled && view.tree === 'current' && (!moved || previous && world.same(previous, frame))) return { expectation: 'missed', frame, view };
-    if (performance.now() >= until) return { expectation: expect ? 'timeout' : undefined, frame, view };
-    previous = frame.settled ? frame : undefined;
+    if (expect && view.tree === 'current' && (frame.settled && (!moved || previous?.frame.settled && world.same(previous.frame, frame)) || textStill)) return { expectation: 'missed', frame, view };
+    if (left() <= 0) return { expectation: expect ? (met ? 'met' : 'timeout') : undefined, frame, view };
+    previous = { frame, view };
   }
 }
 
@@ -148,7 +173,7 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
   const lines = view.lines.slice(0, lineLimit);
   const app = view.foreground?.bundle_id ?? 'unknown app';
   const fresh = since?.appeared?.slice(0, 3).map(line => line.replace(/^[^:]+: /, '')).join(', ');
-  const word = verdict ? { as_expected: 'as expected', changed: 'changed', unchanged: 'unchanged', unknown: 'not settled', unverified: 'unverified' }[verdict.outcome] : 'current screen';
+  const word = verdict ? { as_expected: 'as expected', changed: 'changed', unchanged: 'unchanged', unknown: 'still animating', unverified: 'unverified' }[verdict.outcome] : frame.settled === false ? 'current screen, still animating' : 'current screen';
   const stall = condition?.stalled ? `Screen feed stalled${condition.stalled.ms ? ` ${Math.round(condition.stalled.ms / 1000)} s` : ''}; last picture is from ${condition.stalled.lastPictureAt}. ` : '';
   const summary = `${condition?.lost ? `${condition.lost.text} ` : ''}${stall}${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}.`;
   const elements = giveRefs(agent, view);
@@ -211,13 +236,13 @@ async function send(ctx, world, agent, step) {
 
 // Taps the first `count` elements that match, in reading order, inside a container when one is named.
 async function selectItems(ctx, world, agent, args) {
-  let view = await world.read(world.lastFrame?.epoch === world.epoch ? world.lastFrame : await world.current());
-  if (view.tree !== 'current') view = await world.read(await world.current());
+  let view = await world.read(world.lastFrame?.epoch === world.epoch ? world.lastFrame : await world.current(), { budgetMs: lookMs });
+  if (view.tree !== 'current') view = await world.read(await world.current(), { budgetMs: lookMs });
   let pool = view.elements;
   if (args.in) {
     const container = args.in.ref ? resolveRef(agent, world, args.in.ref) : matching(pool, args.in.label, true)[0] ?? matching(pool, args.in.label)[0];
     if (!container) return { isError: true, message: `No container ${JSON.stringify(args.in.label ?? args.in.ref)} on screen.` };
-    pool = pool.filter(e => within(e, container));
+    pool = pool.filter(e => insideOf(e, container));
   }
   const match = args.match ?? {};
   const label = match.label === undefined ? () => true : /^\/.+\/[a-z]*$/.test(match.label) ? (() => { const [, body, flags] = match.label.match(/^\/(.+)\/([a-z]*)$/); const re = new RegExp(body, flags); return e => re.test(labelOf(e) ?? ''); })() : e => normalize(labelOf(e) ?? '').includes(normalize(match.label));
@@ -252,8 +277,8 @@ async function step(ctx, world, agent, item, { timeoutMs }) {
 
 export async function observe(ctx, args = {}) {
   const world = await ctx.world();
-  const frame = await world.current();
-  const view = await world.read(frame);
+  const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current();
+  const view = await within(lookMs, () => world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs }), undefined) ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
   const now = await nowBlock(ctx, world, { frame, view }, { full: args.full });
   return reply(ctx, world, { now, next: 'Act with act {action, expect}, or chain known steps with run {steps}; each reply ends with the screen as now.' }, frame, args.full);
 }
@@ -269,9 +294,9 @@ export async function act(ctx, args) {
   let done;
   try { done = await step(ctx, world, agent, { ...args.action, expect: args.expect }, { timeoutMs }); }
   catch (error) {
-    if (stopped(error)) return { isError: true, content: [{ type: 'text', text: JSON.stringify({ stopped: true, stop_reason: stoppingReason(error) }) }], _meta: { stop_reason: stoppingReason(error) } };
+    if (cancelled()) return { isError: true, content: [{ type: 'text', text: JSON.stringify({ stopped: true, stop_reason: stoppingReason(error) }) }], _meta: { stop_reason: stoppingReason(error) } };
     if (!(error instanceof StaleRef)) throw error;
-    const frame = await world.current(), view = await world.read(frame);
+    const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(), view = await world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs });
     const now = await nowBlock(ctx, world, { frame, view }, { refsInvalid: true });
     return { isError: true, ...await reply(ctx, world, { sent: false, error: error.message, now }, frame) };
   }
@@ -318,7 +343,7 @@ export async function run(ctx, args) {
     try {
       last = await step(ctx, world, agent, item, { timeoutMs: Math.min(item.timeout_ms ?? stepTimeoutMs, maxTimeoutMs) });
     } catch (error) {
-      if (stopped(error)) throw error;
+      if (cancelled()) throw error;
       stoppedAt = { step: index + 1, tool: item.tool, reason: 'error', detail: error.message };
       break;
     }
@@ -341,7 +366,7 @@ export async function run(ctx, args) {
   const finished = saved.next >= saved.steps.length && !stoppedAt;
   if (finished) agent.runs.delete(saved.id);
   // The last step's frame, or the screen now when the run stopped before sending anything.
-  const judged = last?.judged ?? await (async () => { const frame = await world.current(); return { frame, view: await world.read(frame) }; })();
+  const judged = last?.judged ?? await (async () => { const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(); return { frame, view: await world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs }) }; })();
   const verdict = last ? { ...outcomeOf(judged, last.base, last.sent), expectation: judged.expectation, expected: last.expect ? describeExpect(last.expect) : undefined } : undefined;
   const now = await nowBlock(ctx, world, judged, { base: last?.base, sentMs: last?.sentMs, verdict, full: args.full, typed, stop: stoppedAt?.reason === 'checkpoint' ? stoppedAt : undefined });
   const body = { run_id: saved.id, completed_steps: stoppedAt ? stoppedAt.step - 1 : saved.steps.length, stopped: stoppedAt, now };
