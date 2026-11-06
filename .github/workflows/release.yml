@@ -1,0 +1,66 @@
+# A release: push a tag vX.Y.Z on dev/ios-app (or the default branch). Builds Poki and Poki Runner
+# from that commit with the same version (from the tag) and build number (this run's number), and
+# attaches Poki-X.Y.Z-N.ipa, PokiRunner-X.Y.Z-N.ipa and SHA256SUMS to a GitHub Release. Both IPAs are
+# unsigned; people sign them with their own signing tool and Apple ID when they install.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - id: v
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::tags look like v1.2.3"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  app:
+    needs: version
+    uses: ./.github/workflows/ios-app.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      build: ${{ needs.version.outputs.build }}
+
+  runner:
+    needs: version
+    uses: ./.github/workflows/ios-runner.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      build: ${{ needs.version.outputs.build }}
+
+  publish:
+    needs: [version, app, runner]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: Poki-unsigned, path: app }
+      - uses: actions/download-artifact@v4
+        with: { name: poki-runner-unsigned, path: runner }
+      - name: Attach to a GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          BUILD: ${{ needs.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp app/Poki-unsigned.ipa "release/Poki-$VERSION-$BUILD.ipa"
+          # Only the runner without Xcode's frameworks: the one the launcher is tested with.
+          cp runner/poki-runner-unsigned.ipa "release/PokiRunner-$VERSION-$BUILD.ipa"
+          (cd release && sha256sum *.ipa > SHA256SUMS && cat SHA256SUMS)
+          notes="Poki $VERSION ($BUILD). Install both with the same signing tool and Apple ID. See native/ios-app/CHANGELOG-round.md."
+          gh release create "$GITHUB_REF_NAME" release/* --title "Poki $VERSION" --notes "$notes" --prerelease
