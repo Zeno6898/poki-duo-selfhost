@@ -118,8 +118,13 @@ export class World {
     this.lastFrame = { ...frame, epoch: this.epoch };
     return this.lastFrame;
   }
-  // The newest frame, without waiting for the screen to stop.
-  async current() { return this.stamp(await this.source.frame()); }
+  // The newest frame, without waiting for the screen to stop. When the live feed says the screen is
+  // still on the last frame seen, with no input since, that frame is the answer and nothing is asked.
+  async current() {
+    const feed = this.live ? this.source.screen.liveFeed : undefined;
+    if (feed && this.lastFrame && Number.isInteger(this.lastFrame.bridgeEpoch) && feed.stillOn(this.lastFrame.bridgeEpoch) && !(this.lastInput?.epoch > this.lastFrame.epoch)) return this.lastFrame;
+    return this.stamp(await this.source.frame());
+  }
   // The first settled frame after the last input. A launch or navigation is judged only on one.
   async settle(timeoutMs = 3000, settleMs, maxWidth) {
     const started = performance.now();

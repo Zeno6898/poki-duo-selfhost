@@ -36,5 +36,10 @@ the screenshot path's scaling against the real video size, the pixel verdict aga
 the OCR fallback on lagging trees, and orientation changes (the point size is not re-read when the
 phone rotates).
 
-The bridge's `subscribe_frames` event feed (05d9f82) is not used yet; the client polls
-`wait_settled` and `latest_frame`.
+`LiveFeed` (src/live-frames.mjs) follows the bridge's `subscribe_frames` feed on its own
+connection once a request has started the daemon, and reconnects with backoff. The World (src/world.mjs)
+uses it as a hint: while the feed says the screen is still on the last frame it saw, with no input since,
+`observe` answers from that frame without a request. Until a `settled` event has been seen since
+connecting, after a skipped line or a new media session, or with `POKI_LIVE_FEED=0`, it asks
+`latest_frame` as before. Waits after an input always use `wait_settled`, which the bridge answers
+from the input it carried.
