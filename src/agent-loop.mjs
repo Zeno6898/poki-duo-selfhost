@@ -141,30 +141,43 @@ function outcomeOf(judged, base, inputSent) {
 // The `now` block, the last thing in every result: what is on the screen, read for one frame.
 async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = false, refsInvalid = false, typed, stop }) {
   const agent = state(ctx), { frame, view } = judged;
+  // A stalled video or a lost connection comes first: everything below it is read in that light.
+  const condition = await world.condition(frame);
+  if (condition?.stalled) verdict = { ...verdict, outcome: 'unverified', reason: 'the screen video is stalled, so no picture after the input exists' };
   const since = world.sinceLastLook(agent, view);
   const lines = view.lines.slice(0, lineLimit);
   const app = view.foreground?.bundle_id ?? 'unknown app';
   const fresh = since?.appeared?.slice(0, 3).map(line => line.replace(/^[^:]+: /, '')).join(', ');
   const word = verdict ? { as_expected: 'as expected', changed: 'changed', unchanged: 'unchanged', unknown: 'not settled', unverified: 'unverified' }[verdict.outcome] : 'current screen';
-  const summary = `${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}.`;
+  const stall = condition?.stalled ? `Screen feed stalled${condition.stalled.ms ? ` ${Math.round(condition.stalled.ms / 1000)} s` : ''}; last picture is from ${condition.stalled.lastPictureAt}. ` : '';
+  const summary = `${condition?.lost ? `${condition.lost.text} ` : ''}${stall}${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}.`;
   const elements = giveRefs(agent, view);
   return {
     summary,
     ...(verdict ? { outcome: verdict.outcome, ...(verdict.reason ? { reason: verdict.reason } : {}) } : {}),
-    frame: { captured_at: new Date(frame.capturedMs).toISOString(), ...(sentMs ? { action_sent_at: new Date(sentMs).toISOString() } : {}), age_ms: Math.max(0, Date.now() - frame.capturedMs), settled: Boolean(frame.settled) },
+    frame: { captured_at: new Date(frame.capturedMs).toISOString(), ...(sentMs ? { action_sent_at: new Date(sentMs).toISOString() } : {}), age_ms: Math.max(0, Date.now() - frame.capturedMs), settled: Boolean(frame.settled), ...(condition?.stalled ? { stalled: true } : {}) },
     ...(since && Object.keys(since).length ? { since_last_look: since } : {}),
     foreground: view.foreground,
-    text: { of: new Date(frame.capturedMs).toISOString(), source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
+    // With the video stalled the text comes from a read of the screen made now, not from the old picture.
+    text: { of: condition?.stalled ? new Date().toISOString() : new Date(frame.capturedMs).toISOString(), source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
     ...(view.tree === 'pending' ? { tree: 'pending' } : {}),
     ...(full || refsInvalid ? { elements } : {}),
-    ...(view.prompt ? { blocked: { kind: view.prompt.kind, text: lines.slice(0, 6) } } : {}),
+    ...(condition?.lost ? { blocked: { kind: 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, text: lines.slice(0, 6) } } : {}),
     ...(typed ? { typed } : {}),
   };
 }
 
+// The picture goes with the text, except an old one from a stalled video, which would pass for the screen.
 async function reply(ctx, world, body, frame, full) {
-  const image = await world.picture(frame, full);
-  return { content: [{ type: 'text', text: JSON.stringify(body) }, { type: 'image', data: image.toString('base64'), mimeType: 'image/jpeg' }], _meta: { verdict: body.now?.outcome ?? null } };
+  const content = [{ type: 'text', text: JSON.stringify(body) }];
+  if (!body.now?.frame?.stalled) content.push({ type: 'image', data: (await world.picture(frame, full)).toString('base64'), mimeType: 'image/jpeg' });
+  return { content, _meta: { verdict: body.now?.outcome ?? null } };
+}
+
+// Before an input: a connection that is gone holds it back, and the result says why.
+async function heldBack(world) {
+  const condition = await world.condition(world.lastFrame);
+  return condition?.lost;
 }
 
 // The step's own answer, as the single-step tool gave it.
@@ -248,6 +261,11 @@ export async function observe(ctx, args = {}) {
 export async function act(ctx, args) {
   const agent = state(ctx), world = await ctx.world();
   const timeoutMs = Math.min(args.timeout_ms ?? stepTimeoutMs, maxTimeoutMs);
+  const lost = await heldBack(world);
+  if (lost) {
+    const frame = await world.current(), view = await world.read(frame, { waitMs: treeWaitMs });
+    return { isError: true, ...await reply(ctx, world, { sent: false, expectation: args.expect ? 'blocked' : undefined, now: await nowBlock(ctx, world, { frame, view }, {}) }, frame) };
+  }
   let done;
   try { done = await step(ctx, world, agent, { ...args.action, expect: args.expect }, { timeoutMs }); }
   catch (error) {
@@ -286,6 +304,8 @@ export async function run(ctx, args) {
   for (; saved.next < saved.steps.length; saved.next++) {
     const index = saved.next, item = saved.steps[index];
     if (!stepTools.includes(item.tool)) { stoppedAt = { step: index + 1, tool: item.tool, reason: 'error', detail: `${item.tool} is not a run step. Steps: ${stepTools.join(', ')}.` }; break; }
+    const lost = await heldBack(world);
+    if (lost) { stoppedAt = { step: index + 1, tool: item.tool, reason: 'blocked', detail: `${lost.text} Step ${index + 1} was not sent.` }; break; }
     // The destructive check reads the label the step will touch, on the screen it will touch it on.
     const current = world.tree?.epoch === world.epoch && world.lastFrame ? world.view(world.lastFrame, { elements: world.tree.elements, foreground: world.tree.foreground }) : undefined;
     const target = targetOf(item, current, agent);

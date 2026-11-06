@@ -211,3 +211,42 @@ test('the profile and the count of listed tools follow the environment', async (
   assert.equal(listedNames({}).length, 29);
   assert.equal(listedNames({ POKI_MCP_TOOLS: 'all' }).length, 59);
 });
+
+test('a stalled screen video is said first, the outcome is unverified, and the old picture is not sent', { timeout: 30000 }, async () => {
+  const old = new Date(Date.now() - 90000).toISOString();
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: old, settled: true, observation: 'unverified', videoStalled: true, stalledMs: 90000 });
+  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: false, reasons: ['video_stalled'] }) });
+  const phone = new LedgerPhone({ live });
+  const look = await phone.call('observe', {});
+  const seen = body(look);
+  assert.match(seen.now.summary, new RegExp(`^Screen feed stalled 90 s; last picture is from ${old}`));
+  assert.equal(seen.now.outcome, 'unverified');
+  assert.equal(seen.now.frame.stalled, true);
+  assert.ok(!look.content.some(block => block.type === 'image'), 'no picture that would pass for the screen');
+  const tapped = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } }));
+  assert.equal(tapped.sent, true, 'inputs still go through a stalled video');
+  assert.equal(tapped.now.outcome, 'unverified');
+  assert.equal(phone.app.page, 'accounts');
+});
+
+test('a lost device connection blocks inputs and says why', { timeout: 30000 }, async () => {
+  let reasons = [];
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date().toISOString(), settled: true, observation: 'no_input' });
+  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: !reasons.length, reasons }) });
+  const phone = new LedgerPhone({ live });
+  await phone.call('observe', {});
+  reasons = ['needs_wifi'];
+  const held = await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } });
+  assert.equal(held.isError, true);
+  const answer = body(held);
+  assert.equal(answer.sent, false);
+  assert.equal(answer.now.blocked.kind, 'connection');
+  assert.match(answer.now.summary, /^The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB/);
+  assert.equal(phone.app.page, 'home', 'nothing was sent');
+  const run = body(await phone.call('run', { steps: [{ tool: 'tap', arguments: { x: 45, y: 105 } }] }));
+  assert.equal(run.stopped.reason, 'blocked');
+  assert.equal(run.completed_steps, 0);
+  assert.equal(phone.app.page, 'home');
+  reasons = [];
+  assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } })).sent, true);
+});

@@ -92,3 +92,17 @@ test('observe answers from the last frame while the feed says the screen has not
   await world.current();
   assert.equal(asked, 3, 'an input of ours makes the frame old, whatever the feed has seen');
 });
+
+test('a stalled video makes the feed forget the screen until pictures flow and it settles again', () => {
+  const feed = new LiveFeed('/nonexistent');
+  feed.handle({ event: 'settled', epoch: 5 });
+  assert.equal(feed.stillOn(5), true);
+  feed.handle({ event: 'video', state: 'stalled', epoch: 5 });
+  assert.equal(feed.stalled, true);
+  assert.equal(feed.stillOn(5), false);
+  feed.handle({ event: 'video', state: 'flowing', epoch: 6 });
+  assert.equal(feed.stalled, false);
+  assert.equal(feed.known, false);
+  feed.handle({ event: 'settled', epoch: 6 });
+  assert.equal(feed.stillOn(6), true);
+});

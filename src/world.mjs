@@ -84,7 +84,7 @@ function fromLive(picture) {
   if (!picture?.jpeg) throw new Error('The live screen returned no picture.');
   const capturedMs = Date.parse(picture.capturedAt);
   return { capturedMs, changedMs: capturedMs, capturedAt: picture.capturedAt, image: picture.jpeg, settled: picture.settled, quietMs: picture.quietMs ?? undefined,
-    changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
+    changedSinceInput: picture.changedSinceInput, pictureAfterInput: picture.pictureAfterInput, observation: picture.observation, identity: picture.identity, ...(picture.videoStalled ? { videoStalled: true, stalledMs: picture.stalledMs } : {}), lastChange: picture.lastChange, waitedMs: picture.waitedMs, ...(Number.isInteger(picture.epoch) ? { bridgeEpoch: picture.epoch } : {}) };
 }
 
 async function withThumb(frame) { return frame.thumb ? frame : { ...frame, thumb: await thumb(frame.image) }; }
@@ -97,6 +97,11 @@ const lineOf = e => {
 };
 const treeKey = (elements, foreground) => JSON.stringify([foreground?.pid ?? null, elements.map(e => { const f = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, Boolean(e.selected), f.x, f.y, f.width, f.height]; })]);
 const treeLagMs = 2500;
+const lostText = {
+  needs_wifi: 'The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB. Put the phone on Wi-Fi or USB; inputs are held until it is back.',
+  media_closed: 'The screen video is closed, so the result of an input cannot be seen. Inputs are held until it reopens.',
+  unreachable: 'The device bridge is not answering. Inputs are held until it does.',
+};
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
 const inside = (box, [x, y, w, h], size) => {
   const f = box.frame ?? box, cx = (f.x + f.width / 2) / size.width, cy = (f.y + f.height / 2) / size.height;
@@ -139,11 +144,30 @@ export class World {
   // A frame that is neither may be the screen the input was sent to, so it proves nothing about it.
   proven(frame) {
     const input = this.lastInput;
+    // A picture from a stalled video is older than the screen, whatever its number says.
+    if (frame.videoStalled) return false;
     if (!input) return true;
     // A source that numbers its frames says itself whether one is newer than the input (upstream's rule).
     if (frame.observation) return frame.observation !== 'unverified';
     if ((frame.startedMs ?? frame.capturedMs) >= input.sentMs || frame.pictureAfterInput === true) return true;
     return frame.settled === true && frame.changedSinceInput === false;
+  }
+  // What stands between the agent and the screen, from the source's own health report: a video that
+  // stopped decoding (stalled: the picture is old, inputs still work) or a connection that is gone
+  // (lost: inputs would not arrive, or their result could not be seen). Undefined when all is well.
+  async condition(frame) {
+    const screen = this.live ? this.source.screen : undefined;
+    if (typeof screen?.status !== 'function') return undefined;
+    let health;
+    try { health = await screen.status(); } catch (error) { if (stopped(error)) throw error; health = { ok: false, reasons: ['unreachable'] }; }
+    const reasons = health?.reasons ?? [];
+    const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.includes('video_stalled');
+    const lost = reasons.find(reason => reason !== 'video_stalled');
+    if (!stalled && !lost) return undefined;
+    return {
+      ...(stalled ? { stalled: { ms: frame?.stalledMs ?? null, lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
+      ...(lost ? { lost: { reason: lost, text: lostText[lost] ?? `The device connection reports ${lost}. Inputs are held until it recovers.` } } : {}),
+    };
   }
   // Whether this frame is the same picture as one seen earlier (same epoch, or no pixel change).
   same(a, b) { return Boolean(a && b) && (a.epoch === b.epoch || !compare(a.thumb, b.thumb).changed); }
