@@ -21,6 +21,9 @@ mod ax {
 
     #[path = "ax_watch.rs"]
     pub mod watch;
+
+    #[path = "ax_audit.rs"]
+    pub mod audit;
 }
 
 // The live screen (J1): the input media session's video, decoded in-process with libavcodec.
