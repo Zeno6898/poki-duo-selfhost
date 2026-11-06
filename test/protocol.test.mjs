@@ -79,7 +79,7 @@ test('stdio reaches the authenticated local MCP service and rejects an absent de
         assert.ok(!status.isError);
         const statusValue = JSON.parse(status.content[0].text);
         assert.equal(typeof statusValue.devices, 'number');
-        assert.equal(statusValue.total_tools, 56);
+        assert.equal(statusValue.total_tools, 59);
         assert.equal(statusValue.implementation, 'Poki MCP 0.1.0');
         assert.equal(statusValue.commit, 'unknown', 'A packaged copy outside Git must report unknown');
         assert.equal(statusValue.native_build, (await stat(join(f.dir, 'build/poki-native'))).mtime.toISOString());
@@ -88,7 +88,7 @@ test('stdio reaches the authenticated local MCP service and rejects an absent de
     } finally { await httpClient.close(); }
     const fullClient = await f.connect('all');
     const full = await fullClient.listTools();
-    assert.equal(full.tools.length, 56);
+    assert.equal(full.tools.length, 59);
     for (const tool of (await client.listTools()).tools) {
       assert.deepEqual(tool, full.tools.find(candidate => candidate.name === tool.name));
     }
@@ -144,7 +144,7 @@ test('an all-profile HTTP service still lets each stdio client choose its own li
     requestInit: { headers: { Authorization: `Bearer ${endpoint.token}`, 'x-poki-mcp-session': 'all-profile-contract' } },
   }));
   const full = await httpClient.listTools();
-  assert.equal(full.tools.length, 56);
+  assert.equal(full.tools.length, 59);
   assert.deepEqual(await f.a.listTools(), full);
   const defaultClient = await f.connect('');
   assert.equal((await defaultClient.listTools()).tools.length, 29);
@@ -165,7 +165,7 @@ test('Poki Agent opens its own MCP with the complete catalog even when the paren
     } finally { await client.close(); }
   `], { env: f.env });
   const { tools, result } = JSON.parse(stdout);
-  assert.equal(tools.length, 56);
+  assert.equal(tools.length, 59);
   for (const name of ['list_apps', 'observe_device', 'hide_keyboard', 'acquire_device']) {
     assert.ok(tools.some(tool => tool.name === name), name);
   }

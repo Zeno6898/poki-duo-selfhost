@@ -1,0 +1,204 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import sharp from 'sharp';
+import { Devices } from '../src/device.mjs';
+
+// "Ledger", an app invented for these tests: a list of entries that can be selected and deleted
+// behind a confirmation sheet. It is drawn as blocks, so pixels change exactly when the screen does.
+const springboard = { pid: 30, bundle_id: 'com.apple.springboard' }, ledger = { pid: 501, bundle_id: 'local.ledger' };
+const W = 200, H = 400;
+const el = (role, label, x, y, width, height, extra = {}) => ({ role, label, x, y, width, height, ...extra });
+
+class LedgerApp {
+  page = 'home'; entries = ['Coffee 4.50', 'Rent 1200', 'Book 18', 'Lunch 12', 'Taxi 22']; selected = new Set(); selecting = false; sheet = false;
+  constructor({ axLag = 0 } = {}) { this.axLag = axLag; this.lagged = 0; this.previous = undefined; }
+  screen() {
+    if (this.page === 'home') return { foreground: springboard, elements: [el('Icon', 'Ledger', 20, 80, 50, 50), el('Icon', 'Clock', 90, 80, 50, 50)] };
+    if (this.page === 'accounts') return { foreground: ledger, elements: [el('StaticText', 'Accounts', 10, 40, 100, 20), el('Button', 'Entries', 10, 100, 180, 40), el('Button', 'Settings', 10, 150, 180, 40)] };
+    const elements = [el('Button', 'Back', 5, 40, 30, 20), el('StaticText', 'Entries', 60, 40, 80, 20), el('Button', this.selecting ? 'Done' : 'Select', 150, 40, 45, 20),
+      ...this.entries.map((entry, i) => el('Cell', entry, 10, 80 + i * 44, 180, 40, { selected: this.selected.has(entry) }))];
+    if (this.selecting) elements.push(el('Button', 'Delete', 60, 360, 80, 30));
+    if (this.sheet) elements.push(el('StaticText', `Delete ${this.selected.size} entries?`, 20, 250, 160, 20), el('Button', `Delete ${this.selected.size} Entries`, 20, 280, 160, 30), el('Button', 'Cancel', 20, 320, 160, 30));
+    return { foreground: ledger, elements };
+  }
+  // A real tree can trail the screen: for axLag reads after a change, it still describes the old one.
+  tree() {
+    if (this.lagged < this.axLag && this.previous) { this.lagged++; return this.previous; }
+    return this.screen();
+  }
+  touch(x, y) {
+    const hit = this.screen().elements.filter(e => x >= e.x && x <= e.x + e.width && y >= e.y && y <= e.y + e.height).at(-1);
+    if (!hit) return;
+    const before = this.screen();
+    const label = hit.label;
+    if (label === 'Ledger') this.page = 'accounts';
+    else if (label === 'Entries' && this.page === 'accounts') this.page = 'entries';
+    else if (label === 'Back') this.page = 'accounts';
+    else if (label === 'Select' || label === 'Done') { this.selecting = label === 'Select'; this.selected.clear(); }
+    else if (hit.role === 'Cell' && this.selecting && !this.sheet) this.selected.has(label) ? this.selected.delete(label) : this.selected.add(label);
+    else if (label === 'Delete' && this.selected.size) this.sheet = true;
+    else if (/^Delete \d+ Entries$/.test(label)) { this.entries = this.entries.filter(e => !this.selected.has(e)); this.selected.clear(); this.sheet = false; this.selecting = false; }
+    else if (label === 'Cancel') this.sheet = false;
+    else return;
+    this.previous = before; this.lagged = 0;
+  }
+  async render() {
+    const blocks = await Promise.all(this.screen().elements.flatMap(e => {
+      const shade = [...e.label].reduce((sum, c) => sum + c.charCodeAt(0), 0) % 120;
+      const parts = [[e.x, e.y, Math.max(4, Math.min(e.width, 4 + e.label.length * 6)), e.height, shade]];
+      if (e.selected) parts.push([e.x + e.width - 14, e.y + 12, 10, 10, 0]);
+      return parts.map(async ([left, top, width, height, v]) => ({ input: await sharp({ create: { width, height, channels: 3, background: { r: v, g: v, b: v } } }).png().toBuffer(), left, top }));
+    }));
+    return sharp({ create: { width: W, height: H, channels: 3, background: 'white' } }).composite(blocks).png().toBuffer();
+  }
+}
+
+// The real Devices with the phone replaced by the app above: dispatch, the single-step tools, the
+// World and the new tools all run as they do against a device.
+class LedgerPhone extends Devices {
+  constructor(options = {}) { super(); this.app = new LedgerApp(options); this.size = { device: 'phone-1', width: W, height: H }; this.live = options.live; }
+  async inventory() { return [{ id: 'phone-1', kind: 'physical', name: 'Test Phone', state: 'Booted' }]; }
+  liveScreen() { return this.live?.(this); }
+  async bridge(request) {
+    if (request.op === 'ax') { const tree = this.app.tree(); return { foreground: tree.foreground, elements: tree.elements.map(e => ({ ...e, type: e.role })) }; }
+    if (request.op === 'launch_app') { if (request.bundle_id !== ledger.bundle_id) return { isError: true, error: 'not installed' }; if (this.app.page === 'home') { this.app.previous = this.app.screen(); this.app.lagged = 0; this.app.page = 'accounts'; } return { pid: ledger.pid, bundle_id: ledger.bundle_id }; }
+    if (request.op === 'tap') { this.app.touch(request.x / 65535 * (W - 1), request.y / 65535 * (H - 1)); return { sent: true, screen_change_verified: false }; }
+    return { sent: true, screen_change_verified: false };
+  }
+  async captureFrame() {
+    const started = new Date().toISOString(), data = await this.app.render();
+    this.frame = { id: String(Math.random()), device: 'phone-1', revision: this.coordinator.revision('phone-1'), width: W, height: H, scale: 1, data, original: data, at: Date.now(), capture_started_at: started, capture_completed_at: new Date().toISOString() };
+    return this.frame;
+  }
+}
+
+const body = result => JSON.parse(result.content.find(block => block.type === 'text').text);
+const tokens = result => Math.ceil(result.content.find(block => block.type === 'text').text.length / 4);
+
+test('a cold agent deletes three entries in an app it has never seen, in at most five calls', { timeout: 60000 }, async t => {
+  const phone = new LedgerPhone();
+  const calls = [];
+  const call = async (name, args) => { const started = performance.now(); const result = await phone.call(name, args); calls.push({ name, result }); t.diagnostic(`${name}: ${Math.round(performance.now() - started)} ms, ${tokens(result)} text tokens: ${body(result).now.summary}`); return result; };
+
+  const first = body(await call('observe', {}));
+  assert.match(first.now.summary, /springboard/);
+  assert.ok(first.now.text.lines.includes('Icon: Ledger'), JSON.stringify(first.now.text));
+
+  // What a first-time agent writes from that one look: open the app, the list, pick three, delete.
+  const steps = [
+    { tool: 'launch_app', arguments: { bundle_id: 'local.ledger' }, expect: { text: 'Entries' } },
+    { tool: 'tap_text', arguments: { text: 'Entries' }, expect: { text: 'Select' } },
+    { tool: 'tap_text', arguments: { text: 'Select' }, expect: { text: 'Done' } },
+    { tool: 'select_items', arguments: { match: { role: 'Cell' }, count: 3 } },
+    { tool: 'tap_text', arguments: { text: 'Delete', exact: true }, expect: { text: 'Delete 3 Entries' } },
+    { tool: 'tap_text', arguments: { text: 'Delete 3 Entries' }, expect: { gone: 'Coffee' } },
+  ];
+  const held = await call('run', { steps });
+  const stop = body(held);
+  assert.equal(stop.stopped.reason, 'checkpoint', JSON.stringify(stop.stopped));
+  assert.equal(stop.stopped.step, 5);
+  assert.equal(stop.completed_steps, 4);
+  assert.equal(phone.app.selected.size, 3, 'the selection ran, the delete did not');
+  assert.equal(phone.app.entries.length, 5);
+
+  const done = body(await call('run', { resume: stop.run_id, allow: ['Delete'] }));
+  assert.equal(done.stopped, null, JSON.stringify(done.stopped));
+  assert.equal(done.now.outcome, 'as_expected');
+  assert.deepEqual(phone.app.entries, ['Lunch 12', 'Taxi 22']);
+  assert.ok(done.now.text.lines.includes('Cell: Lunch 12') && !done.now.text.lines.some(line => /Coffee|Rent|Book/.test(line)), JSON.stringify(done.now.text.lines));
+  assert.match(done.now.summary, /^local\.ledger: as expected/);
+
+  assert.ok(calls.length <= 5, `${calls.length} calls`);
+  for (const { name, result } of calls) {
+    const text = result.content.find(block => block.type === 'text').text;
+    // One verdict: none of the earlier two-field form, and no advice to look again when all went as expected.
+    assert.doesNotMatch(text, /screen_change_verified|screen_changed/, name);
+    if (body(result).now.outcome === 'as_expected') assert.doesNotMatch(text, /instruction|check|again/i, name);
+    assert.ok(tokens(result) < 1500, `${name}: ${tokens(result)} tokens`);
+    assert.equal(result.content.at(-1).type, 'image');
+    assert.equal(result.content.at(-1).mimeType, 'image/jpeg');
+  }
+});
+
+test('allowing the destructive label up front runs the whole task in one call', { timeout: 60000 }, async () => {
+  const phone = new LedgerPhone();
+  const result = body(await phone.call('run', { allow: ['delete'], steps: [
+    { tool: 'launch_app', arguments: { bundle_id: 'local.ledger' }, expect: { foreground: 'local.ledger' } },
+    { tool: 'tap_text', arguments: { text: 'Entries' }, expect: { text: 'Select' } },
+    { tool: 'tap_text', arguments: { text: 'Select' }, expect: { text: 'Done' } },
+    { tool: 'select_items', arguments: { match: { label: '/^(Rent|Taxi)/' }, count: 2 } },
+    { tool: 'tap_text', arguments: { text: 'Delete', exact: true }, expect: { text: 'Delete 2 Entries' } },
+    { tool: 'tap_text', arguments: { text: 'Delete 2 Entries' }, expect: { gone: 'Rent' } },
+  ] }));
+  assert.equal(result.stopped, null, JSON.stringify(result.stopped));
+  assert.deepEqual(phone.app.entries, ['Coffee 4.50', 'Book 18', 'Lunch 12']);
+});
+
+test('unchanged only when the settled screen, the app in front and the tree are what the input was sent to', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  await phone.call('observe', {});
+  const blank = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } }));
+  assert.equal(blank.sent, true);
+  assert.equal(blank.now.outcome, 'unchanged', JSON.stringify(blank.now));
+  const opened = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Ledger' } } }));
+  assert.equal(opened.now.outcome, 'changed');
+  assert.equal(opened.now.foreground.bundle_id, 'local.ledger');
+  assert.ok(opened.now.since_last_look.foreground_changed);
+  // A missed expectation is a verdict on the screen, not a warning to look again.
+  const missed = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, expect: { text: 'Entries list' } }));
+  assert.equal(missed.expectation, 'missed');
+  assert.equal(missed.now.outcome, 'unchanged');
+});
+
+test('a text expectation never matches a tree that still shows the screen before the input', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone({ axLag: 3 });
+  await phone.call('run', { steps: [{ tool: 'launch_app', arguments: { bundle_id: 'local.ledger' } }] });
+  await phone.call('observe', {});
+  // "Settings" is on the page the tap leaves. The tree keeps reporting it for three reads after the tap.
+  const result = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Entries' } }, expect: { text: 'Settings' }, timeout_ms: 5000 }));
+  assert.notEqual(result.expectation, 'met', JSON.stringify(result.now));
+  assert.equal(result.now.outcome, 'changed');
+  const select = body(await phone.call('act', { action: { tool: 'tap_text', arguments: { text: 'Back' } }, expect: { text: 'Settings' }, timeout_ms: 5000 }));
+  assert.equal(select.expectation, 'met');
+});
+
+test('refs name elements of one frame, and an earlier screen\'s ref is refused with the current elements', { timeout: 30000 }, async () => {
+  const phone = new LedgerPhone();
+  const look = body(await phone.call('observe', { full: true }));
+  const icon = look.now.elements.find(e => e.label === 'Ledger');
+  const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { ref: icon.ref } }, expect: { foreground: 'local.ledger' } }));
+  assert.equal(opened.expectation, 'met');
+  const stale = await phone.call('act', { action: { tool: 'tap', arguments: { ref: icon.ref } } });
+  assert.equal(stale.isError, true);
+  const answer = body(stale);
+  assert.equal(answer.sent, false);
+  assert.ok(answer.now.elements.some(e => e.label === 'Entries'), 'the current refs come with the refusal');
+});
+
+test('with frames that cannot be shown to be newer than the input, the outcome is unverified', { timeout: 30000 }, async () => {
+  // A live source that numbers its frames: after the input, nothing newer than it arrived.
+  const picture = async (phone, observation) => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(Date.now() - 2000).toISOString(), settled: true, quietMs: 2000, observation });
+  let observation = 'no_input';
+  const live = phone => ({ latestFrame: () => picture(phone, observation), waitSettled: () => picture(phone, observation), op: async () => { throw new Error('no OCR'); } });
+  const phone = new LedgerPhone({ live });
+  await phone.call('observe', {});
+  observation = 'unverified';
+  const result = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } }));
+  assert.equal(result.now.outcome, 'unverified');
+  assert.match(result.now.reason, /no frame newer than the input/);
+  observation = 'after_input';
+  const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } }, expect: { foreground: 'local.ledger' } }));
+  assert.equal(opened.now.outcome, 'as_expected');
+});
+
+test('the agent profile lists the screen-as-state tools, and the default profile is unchanged', { timeout: 30000 }, async t => {
+  const { fixture } = await import('./fixture.mjs');
+  const agent = await fixture(t, { extraEnv: () => ({ POKI_TOOL_PROFILE: 'agent' }) });
+  const listed = (await agent.a.listTools()).tools.map(tool => tool.name).sort();
+  assert.deepEqual(listed, ['act', 'list_apps', 'list_devices', 'observe', 'poki_mcp_status', 'run', 'select_device']);
+  assert.match(agent.a.getInstructions(), /observe once on an unfamiliar screen/);
+  const plain = await fixture(t);
+  const names = (await plain.a.listTools()).tools.map(tool => tool.name);
+  assert.equal(names.length, 29);
+  assert.ok(!names.includes('observe') && names.includes('batch_commands'));
+});

@@ -14,7 +14,12 @@ const defaultTools = new Set([
   'scroll_to', 'terminate_app', 'pinch', 'list_apps', 'get_clipboard',
 ]);
 const instructions = 'When the request already says what to do on the device, use batch_commands for launch_app and steps whose targets are already known; use fill without field for a single visible input, and use exact observed labels when a selector is needed; it is usually the only device call needed. Tapping steps wait for their target, and the reply ends with the visible text. With one device available, skip list_devices and select_device; use them when a call reports several devices. Consecutive calls do not require an explicit device lease. Single-step tools remain for exploring an unknown screen.';
-const readOnly = new Set(['observe_device','list_devices', 'get_device_info', 'take_screenshot', 'get_foreground_app', 'list_elements', 'list_apps', 'get_clipboard', 'list_crashes', 'get_crash', 'wait_for', 'wait']);
+// The agent profile lists only the screen-as-state tools, for an agent that drives a device in a loop
+// (POKI_TOOL_PROFILE=agent; the default with the live screen on). Every other tool still answers by name.
+export const agentTools = new Set(['observe', 'act', 'run', 'list_apps', 'list_devices', 'select_device', 'poki_mcp_status']);
+export const profile = (env = process.env) => env.POKI_TOOL_PROFILE ?? (env.POKI_LIVE_FRAMES === '1' ? 'agent' : 'default');
+const agentInstructions = 'Call observe once on an unfamiliar screen, then act {action, expect} for one step or run {steps} for steps you already know; every reply ends with now, the screen read for one frame, so there is no need to look again after it. Trust now.outcome: as_expected needs no re-check, and only unchanged, unknown, unverified or a stopped run need a decision. Put actions the user asked for that delete, send, pay or confirm in allow, and a run stops before any other such step.';
+const readOnly = new Set(['observe', 'observe_device','list_devices', 'get_device_info', 'take_screenshot', 'get_foreground_app', 'list_elements', 'list_apps', 'get_clipboard', 'list_crashes', 'get_crash', 'wait_for', 'wait']);
 const guidance = {
   acquire_device: 'Only needed to keep other sessions off a device across several calls. One batch_commands call already runs without interruption, so a single-call task needs no lease. If you take one, keep the returned lease_id, renew before expiry, then release.',
   wait_for: 'The timeout covers device capture, AX, OCR and polling. Success includes the matching observation and its image, so a second screenshot is not needed to inspect the matched state.',
@@ -41,7 +46,9 @@ definitions.push(['poki_mcp_status', 'Report Poki MCP version, current Git commi
 if (actAndObserve.registered()) { definitions.push(actAndObserve.definition); defaultTools.add(actAndObserve.name); }
 
 export function createServer(call) {
-  const server = new McpServer({ name: 'poki-mcp', version }, { instructions });
+  const agent = profile() === 'agent';
+  const listed = agent ? agentTools : defaultTools;
+  const server = new McpServer({ name: 'poki-mcp', version }, { instructions: agent ? agentInstructions : instructions });
   for (const [name, description, inputSchema, readOnlyHint] of definitions) {
     server.registerTool(name, { description, inputSchema, annotations: { readOnlyHint } }, async (args, extra) => {
       const elicit = extra.mcpReq?.elicitInput;
@@ -51,7 +58,7 @@ export function createServer(call) {
   }
   if (process.env.POKI_MCP_TOOLS !== 'all') {
     server.server.setRequestHandler('tools/list', () => ({
-      tools: definitions.filter(([name]) => defaultTools.has(name)).map(([name, description, inputSchema, readOnlyHint]) => ({
+      tools: definitions.filter(([name]) => listed.has(name)).map(([name, description, inputSchema, readOnlyHint]) => ({
         name, description, inputSchema: z.toJSONSchema(inputSchema, { io: 'input', target: 'draft-2020-12' }),
         annotations: { readOnlyHint },
       })),
