@@ -192,14 +192,19 @@ struct RunLayout: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.bottom, 5)
                 detail
-                Spacer(minLength: 6)
-                footer
+                if tall { Spacer(minLength: 6) } else if hasFooter { Spacer().frame(height: 8) }
+                if hasFooter { footer }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             side
         }
-        .frame(height: island ? 104 : 128)
+        .frame(height: tall ? (island ? 104 : 128) : nil)
     }
+
+    /// A run (working, done) has the full height for its screen column; the quiet phases (ready,
+    /// idle, problem) are only as tall as their text, as the HIG asks.
+    private var tall: Bool { state.phase == .working || state.phase == .done }
+    private var hasFooter: Bool { tall || state.phase == .problem }
 
     @ViewBuilder private var detail: some View {
         switch state.phase {
@@ -252,7 +257,7 @@ struct RunLayout: View {
         if state.hasThumbnail, state.phase == .working || state.phase == .done || state.phase == .idle && !state.runnerPaused {
             Thumbnail(version: state.thumbnailVersion, accent: state.phase == .done ? Brand.done : .white.opacity(0.28))
                 .frame(width: height * 0.47, height: height)
-        } else {
+        } else if tall {
             PhaseGlyph(state: state).frame(width: island ? 52 : 60, height: height)
         }
     }

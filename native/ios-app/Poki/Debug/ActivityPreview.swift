@@ -170,7 +170,7 @@ private struct HeightBadge: View {
                 .background(height > 160 ? Color.red : Color.white.opacity(0.15), in: .capsule)
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                .offset(x: -10, y: -8)
+                .offset(x: 0, y: 22)
         }
     }
 }
