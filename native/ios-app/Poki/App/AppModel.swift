@@ -18,6 +18,15 @@ final class AppModel {
     private(set) var approvals: [PendingApproval] = []
     private(set) var pairing: PairingEvent?
     private(set) var problem: String?
+    /// The runner is stopped until the next agent request (idle, or the owner tapped Stop runner).
+    private(set) var runnerPaused = false
+    /// Stop the runner after this long without agent activity; 0 never stops it.
+    var idleStopSeconds: Int = UserDefaults.standard.object(forKey: "idleStopSeconds") as? Int ?? 120 {
+        didSet { UserDefaults.standard.set(idleStopSeconds, forKey: "idleStopSeconds") }
+    }
+    private var lastAgentActivity = Date()
+    private var idleTimer: Timer?
+    private var launcherConfig: LauncherConfig?
 
     private let host = AppCoreHost()
     private let core: LiveCore
@@ -34,6 +43,7 @@ final class AppModel {
         pairer = RustPairing()
         host.update(key: identity.signingKey, hashes: identity.accessHashes)
         host.onRestart { launcher.restart() }
+        host.onWake { [weak self] in Task { @MainActor in self?.wakeRunner() } }
         listenForApprovals()
         Task { await tunnel.load() }
         if !diskImage.isReady { Task { await diskImage.download() } }
@@ -56,11 +66,11 @@ final class AppModel {
         activity.start(deviceName: deviceName)
         activity.update { $0.phase = .idle; $0.headline = "Starting" }
         sessionOn = true
-        let config = LauncherConfig(pairing_file: pairing, ddi_dir: AppFiles.ddiDirectory.path)
-        do {
-            try launcher.start(config: config) { [weak self] status in Task { @MainActor in self?.runnerChanged(status) } }
-        } catch { runnerChanged(RunnerStatus(state: "failed", detail: "\(error)")) }
+        launcherConfig = LauncherConfig(pairing_file: pairing, ddi_dir: AppFiles.ddiDirectory.path)
+        lastAgentActivity = Date()
+        launchRunner()
         core.start()
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in Task { @MainActor in self?.checkIdle() } }
         eventsTask = Task { [weak self, core] in
             for await event in core.events { self?.handle(event) }
         }
@@ -70,6 +80,8 @@ final class AppModel {
         guard sessionOn else { return }
         core.stop()
         launcher.stop()
+        idleTimer?.invalidate(); idleTimer = nil
+        runnerPaused = false; host.setPaused(false)
         eventsTask?.cancel(); eventsTask = nil
         keepAlive.stop()
         activity.end()
@@ -81,7 +93,45 @@ final class AppModel {
 
     func restartRunner() { launcher.restart() }
 
+    private func launchRunner() {
+        guard let launcherConfig else { return }
+        do {
+            try launcher.start(config: launcherConfig) { [weak self] status in Task { @MainActor in self?.runnerChanged(status) } }
+        } catch { runnerChanged(RunnerStatus(state: "failed", detail: "\(error)")) }
+    }
+
+    /// Stops the runner, and with it iOS's automation banner, while the relay stays connected; the
+    /// next agent request starts it again. From the Stop runner button, the Live Activity, or idle.
+    func pauseRunner(reason: String = "Stopped") {
+        guard sessionOn, !runnerPaused, approvals.isEmpty else { return }
+        launcher.stop()
+        runnerPaused = true
+        runner = RunnerStatus(state: "idle", detail: "\(reason). It starts again on the next agent request.")
+        host.update(runner: .starting("stopped while idle"))
+        host.setPaused(true)
+        activity.update { $0.runnerPaused = true; $0.phase = .idle; $0.headline = "Runner stopped. Starts on the next request." }
+    }
+
+    /// Starts a paused runner again (the next agent request, or the owner).
+    func wakeRunner() {
+        guard sessionOn, runnerPaused else { return }
+        runnerPaused = false
+        host.setPaused(false)
+        lastAgentActivity = Date()
+        activity.update { $0.runnerPaused = false; $0.headline = "Starting the runner" }
+        launchRunner()
+    }
+
+    private func checkIdle() {
+        guard sessionOn, !runnerPaused, idleStopSeconds > 0, approvals.isEmpty, activityText == "Idle" else { return }
+        if Date().timeIntervalSince(lastAgentActivity) >= Double(idleStopSeconds) {
+            pauseRunner(reason: "Stopped after \(idleStopSeconds / 60 > 0 ? "\(idleStopSeconds / 60) min" : "\(idleStopSeconds) s") without agent activity")
+        }
+    }
+
     private func runnerChanged(_ status: RunnerStatus) {
+        // Events from a launcher that was stopped for idle are old news.
+        guard !runnerPaused else { return }
         runner = status
         host.update(runner: status.coreState)
         if status.state == "failed" {
@@ -98,9 +148,11 @@ final class AppModel {
         case .relay(let status):
             relayStatus = status
         case .toolStarted(_, let summary):
+            lastAgentActivity = Date()
             activityText = summary
             activity.update { $0.phase = $0.approval == nil ? .working : .approval; $0.headline = summary }
         case .toolFinished(let summary, let delivery, let app, let thumbnail):
+            lastAgentActivity = Date()
             lastAction = "\(summary) · \(delivery)"
             activityText = "Idle"
             activity.update { state in
@@ -135,6 +187,11 @@ final class AppModel {
             let model = Unmanaged<AppModel>.fromOpaque(observer).takeUnretainedValue()
             Task { @MainActor in model.drainApprovals() }
         }, ApprovalMailbox.notification as CFString, nil, .deliverImmediately)
+        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
+            guard let observer else { return }
+            let model = Unmanaged<AppModel>.fromOpaque(observer).takeUnretainedValue()
+            Task { @MainActor in model.pauseRunner(reason: "Stopped from the Live Activity") }
+        }, ApprovalMailbox.stopRunner as CFString, nil, .deliverImmediately)
     }
 
     func drainApprovals() {

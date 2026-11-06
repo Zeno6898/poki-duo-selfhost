@@ -20,6 +20,9 @@ struct PokiActivityAttributes: ActivityAttributes {
         var approval: PendingApproval?
         /// The pairing PIN while on-device pairing is waiting for it.
         var pin: String?
+        /// The runner is stopped while no agent uses the phone (no automation banner); the next
+        /// request starts it again.
+        var runnerPaused = false
     }
     var deviceName: String
 }

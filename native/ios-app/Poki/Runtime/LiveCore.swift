@@ -62,18 +62,40 @@ final class AppCoreHost: CoreHost, @unchecked Sendable {
     private var hashes: [String] = []
     private var runner: RunnerState = .starting("not started")
     private var restart: (@Sendable () -> Void)?
+    private var paused = false
+    private var wake: (@Sendable () -> Void)?
 
     func update(key: Curve25519.Signing.PrivateKey?, hashes: [String]) { lock.withLock { self.key = key; self.hashes = hashes } }
     func update(runner: RunnerState) { lock.withLock { self.runner = runner } }
     func onRestart(_ action: @escaping @Sendable () -> Void) { lock.withLock { restart = action } }
+    func onWake(_ action: @escaping @Sendable () -> Void) { lock.withLock { wake = action } }
+    /// The runner was stopped while idle (or by the owner): the next tool call starts it again.
+    func setPaused(_ value: Bool) { lock.withLock { paused = value } }
 
     func signingKey() throws -> RelayKey {
         guard let key = lock.withLock({ self.key }) else { throw NSError(domain: "Poki", code: 1, userInfo: [NSLocalizedDescriptionKey: "no relay key in the keychain"]) }
         return DeviceKey(key: key)
     }
     func accessHashes() -> [String] { lock.withLock { hashes } }
-    func runnerState() -> RunnerState { lock.withLock { runner } }
-    func restartRunner() { lock.withLock { restart }?() }
+    /// PokiCore asks before every device tool. A paused runner is started here, so the call answers
+    /// "starting" and the next one finds it running.
+    func runnerState() -> RunnerState {
+        let (state, wake) = lock.withLock { () -> (RunnerState, (@Sendable () -> Void)?) in
+            guard paused else { return (runner, nil) }
+            paused = false
+            runner = .starting("starting again after being idle; it takes a few seconds")
+            return (runner, self.wake)
+        }
+        wake?()
+        return state
+    }
+    func restartRunner() {
+        let (wasPaused, wake, restart) = lock.withLock { () -> (Bool, (@Sendable () -> Void)?, (@Sendable () -> Void)?) in
+            let was = paused; paused = false
+            return (was, self.wake, self.restart)
+        }
+        if wasPaused { wake?() } else { restart?() }
+    }
 
     func jpeg(fromPNG png: Data, width: Int, quality: Double) throws -> Data {
         guard let source = CGImageSourceCreateWithData(png as CFData, nil),

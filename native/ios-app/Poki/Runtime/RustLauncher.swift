@@ -30,7 +30,9 @@ final class RustLauncher: RunnerLauncher {
     func stop() {
         if let handle { poki_launcher_free(handle) } // stops it, then frees it
         handle = nil
-        box?.release(); box = nil
+        // An event may still be on its way from a launcher thread; the box outlives it.
+        if let box { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { box.release() } }
+        box = nil
     }
 
     deinit { stop() }

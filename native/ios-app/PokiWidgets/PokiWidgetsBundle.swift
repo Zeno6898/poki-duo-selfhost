@@ -30,8 +30,16 @@ struct PokiLiveActivity: Widget {
                         Text(pin).font(.title.monospacedDigit().bold())
                     } else if let approval = context.state.approval {
                         ApprovalButtons(approval: approval)
-                    } else if let last = context.state.lastAction {
-                        Text(last).font(.caption.monospaced()).lineLimit(1).foregroundStyle(.secondary)
+                    } else {
+                        HStack {
+                            if let last = context.state.lastAction {
+                                Text(last).font(.caption.monospaced()).lineLimit(1).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if !context.state.runnerPaused {
+                                Button(intent: StopRunnerIntent()) { Image(systemName: "pause.fill") }.tint(.blue)
+                            }
+                        }
                     }
                 }
             } compactLeading: {
@@ -61,8 +69,14 @@ struct LockScreenView: View {
                 } else if let approval = state.approval {
                     Text(approval.summary).font(.callout)
                     ApprovalButtons(approval: approval)
-                } else if let last = state.lastAction {
-                    Text(last).font(.caption.monospaced()).lineLimit(1).foregroundStyle(.secondary)
+                } else {
+                    if let last = state.lastAction {
+                        Text(last).font(.caption.monospaced()).lineLimit(1).foregroundStyle(.secondary)
+                    }
+                    if !state.runnerPaused {
+                        Button(intent: StopRunnerIntent()) { Label("Stop runner", systemImage: "pause.fill") }
+                            .buttonStyle(.bordered).tint(.blue).font(.caption)
+                    }
                 }
             }
             Spacer(minLength: 0)
@@ -92,7 +106,7 @@ struct CompactState: View {
         case .pairing: Text(state.pin ?? "").font(.caption.monospacedDigit().bold())
         case .working: ProgressView().progressViewStyle(.circular).tint(.blue)
         case .problem: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-        case .idle: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .idle: Image(systemName: state.runnerPaused ? "pause.circle.fill" : "checkmark.circle.fill").foregroundStyle(state.runnerPaused ? Color.secondary : Color.green)
         }
     }
 }

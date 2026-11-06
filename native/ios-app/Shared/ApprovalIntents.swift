@@ -36,9 +36,22 @@ struct DenyActionIntent: LiveActivityIntent {
     }
 }
 
+/// Stop runner on the Live Activity: stops the runner (and with it iOS's automation banner) until an
+/// agent's next request. No authentication: stopping is always safe.
+struct StopRunnerIntent: LiveActivityIntent {
+    static let title: LocalizedStringResource = "Stop runner"
+    static let isDiscoverable = false
+    init() {}
+    func perform() async throws -> some IntentResult {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName(ApprovalMailbox.stopRunner as CFString), nil, nil, true)
+        return .result()
+    }
+}
+
 /// Decisions in flight between the intent and the app.
 enum ApprovalMailbox {
     static let notification = "nz.zheha.poki.approval"
+    static let stopRunner = "nz.zheha.poki.stop-runner"
     private static let key = "approval.decisions"
 
     static func post(id: String, approved: Bool) {

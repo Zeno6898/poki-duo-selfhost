@@ -17,6 +17,7 @@ struct HomeView: View {
                             StatusRow(title: "Loopback", value: loopbackText, symbol: "arrow.triangle.2.circlepath", good: loopbackGood, detail: nil)
                         }
                     }
+                    if model.sessionOn { runnerControls }
                     if !model.approvals.isEmpty { approvalsCard }
                     activityCard
                     if let problem = model.problem {
@@ -49,6 +50,34 @@ struct HomeView: View {
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.tint(Brand.blue.opacity(0.2)).interactive(), in: .rect(cornerRadius: 20))
+    }
+
+    /// Stop the runner (and iOS's automation banner) without ending the session; agents' next request
+    /// starts it again. And how long the phone may sit idle before that happens by itself.
+    private var runnerControls: some View {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                if model.runnerPaused {
+                    Button("Start runner", systemImage: "play.circle") { model.wakeRunner() }.buttonStyle(.glass)
+                } else {
+                    Button("Stop runner", systemImage: "pause.circle") { model.pauseRunner() }.buttonStyle(.glass)
+                        .disabled(!model.approvals.isEmpty)
+                }
+                Spacer()
+            }
+            Picker("Stop when idle for", selection: $model.idleStopSeconds) {
+                Text("1 minute").tag(60)
+                Text("2 minutes").tag(120)
+                Text("5 minutes").tag(300)
+                Text("15 minutes").tag(900)
+                Text("Never").tag(0)
+            }
+            Text("A stopped runner removes the automation banner. The next request from an agent starts it again, which takes a few seconds.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).padding()
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
     private var approvalsCard: some View {

@@ -36,7 +36,8 @@ jobs:
           rustup target add aarch64-apple-ios
           cargo build --release --locked --target aarch64-apple-ios --manifest-path native/launcher/Cargo.toml
           ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
-          nm -gU native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a 2>/dev/null | grep -E ' _poki_(launcher|pair)_' | sort -u
+          # The C ABI's symbols, for the log (the app's link step is the real check).
+          (nm -g native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a 2>/dev/null | grep -E '_poki_(launcher|pair|string)_' | sort -u) || echo "nm listed no poki_ symbols"
 
       - name: PokiCore tests
         run: swift test --package-path native/ios/PokiCore
