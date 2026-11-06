@@ -185,7 +185,7 @@ async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let prefetcher =
         live::enabled().then(|| tokio::task::spawn_local(live::prefetch_loop(state.clone())));
     // Load the OCR models before the first type_text or ocr_region needs them.
-    if live::enabled() {
+    if live::enabled() && crate::ocr::enabled() {
         tokio::task::spawn_local(async { crate::ocr::shared().warm().await });
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1013,6 +1013,9 @@ impl Session {
         }
         let requested = Instant::now();
         let tree = Box::pin(self.watched_tree(timings)).await?;
+        if let Some(live) = &live {
+            live.note_points(&tree);
+        }
         let asked = self
             .ax
             .as_ref()
@@ -1023,6 +1026,7 @@ impl Session {
         let provenance = json!({
             "request_started_at": crate::ax::watch::stamp_at(wall),
             "request_epoch": live.as_ref().map(|live| live.epoch_at(asked)),
+            "request_generation": live.as_ref().map(|live| live.state(Duration::ZERO).session),
             "current": live.as_ref().map(|live| live.unchanged_since(asked)),
         });
         timings.tree = Some(provenance.clone());

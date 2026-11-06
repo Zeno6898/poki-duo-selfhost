@@ -86,6 +86,11 @@ pub struct Ocr {
     last_error: RefCell<Option<String>>,
 }
 
+/// Opt-in (POKI_LIVE_OCR=1): the worker, ocr_region/ocr_frame and type_text's fast return.
+pub fn enabled() -> bool {
+    std::env::var("POKI_LIVE_OCR").as_deref() == Ok("1")
+}
+
 thread_local! {
     static SHARED: Rc<Ocr> = Rc::new(Ocr::new(interpreter()));
 }

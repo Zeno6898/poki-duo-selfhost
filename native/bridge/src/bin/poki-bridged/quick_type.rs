@@ -8,7 +8,7 @@
 //! - With the live screen (POKI_LIVE_FRAMES=1), the first read-back waits for the pasted text to
 //!   show in pixels and settle, up to the same 400 ms poki-native always waits.
 //! - Restoring the clipboard, sending Return and removing the keyboard overlap.
-//! - Fast return (live screen and OCR available): once the paste has changed the field's pixels
+//! - Fast return (live screen, opt-in with POKI_LIVE_OCR=1): once the paste has changed the field's pixels
 //!   and the screen has settled, the field box is read by the persistent OCR worker and the answer
 //!   goes back at once, with `verified` "ocr" (the text is seen in the field) or "pixels_only"
 //!   (the field changed but OCR could not read it, as in a secure field). The accessibility
@@ -309,6 +309,9 @@ async fn type_with(
         .filter(|field| !baseline.iter().any(|chosen| chosen.id == field.id))
         .cloned()
         .collect();
+    if let Some(live) = live {
+        live.note_points(&initial);
+    }
     // Where the chosen field is on screen, for the fast return's pixel and OCR checks.
     let field_area = match &baseline[..] {
         [field] => field_box(&initial, &field.id),
@@ -434,7 +437,7 @@ async fn type_with(
         ));
     }
     stages.paste_ms = Some(ms(at));
-    if let Some(live) = live {
+    if let Some(live) = live.filter(|_| crate::ocr::enabled()) {
         let checking = Instant::now();
         let ocr = crate::ocr::shared();
         let fast = shown_in_field(live, &ocr, at, field_area, secure, text, stages).await;
