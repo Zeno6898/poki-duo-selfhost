@@ -140,7 +140,11 @@ struct Screen {
     thumbs: VecDeque<Thumb>,
     latest: Option<Latest>,
     last_change: Option<(Instant, Difference)>,
+    last_change_wall: Option<SystemTime>,
     last_input: Option<Instant>,
+    last_input_wall: Option<SystemTime>,
+    /// Set when the media session that carried this stream closed.
+    closed: bool,
     decoder_error: Option<String>,
     decoding_since: Option<Instant>,
     first_picture_after_ms: Option<u64>,
@@ -185,6 +189,10 @@ pub struct Frames {
 impl Drop for Frames {
     fn drop(&mut self) {
         self.receiver.abort();
+        let mut screen = self.live.screen.lock().unwrap();
+        screen.closed = true;
+        screen.generation += 1;
+        self.live.notify.send_replace(screen.generation);
     }
 }
 
@@ -250,7 +258,11 @@ pub struct State {
     pub quiet_since: Option<Instant>,
     pub latest: Option<Latest>,
     pub last_change: Option<(Instant, Difference)>,
+    pub last_change_wall: Option<SystemTime>,
     pub last_input: Option<Instant>,
+    pub last_input_wall: Option<SystemTime>,
+    /// The media session closed; a new one has a new stream.
+    pub closed: bool,
 }
 
 impl Live {
@@ -267,6 +279,7 @@ impl Live {
     pub fn note_input(&self) {
         let mut screen = self.screen.lock().unwrap();
         screen.last_input = Some(Instant::now());
+        screen.last_input_wall = Some(SystemTime::now());
         screen.generation += 1;
         self.notify.send_replace(screen.generation);
     }
@@ -291,7 +304,10 @@ impl Live {
             quiet_since,
             latest: screen.latest,
             last_change: screen.last_change,
+            last_change_wall: screen.last_change_wall,
             last_input: screen.last_input,
+            last_input_wall: screen.last_input_wall,
+            closed: screen.closed,
         }
     }
 
@@ -341,6 +357,11 @@ impl Live {
                 return false;
             }
         }
+    }
+
+    /// A receiver that changes at every picture and input.
+    pub fn watcher(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.clone()
     }
 
     /// The latest picture as a JPEG.
@@ -673,6 +694,7 @@ fn decode_loop(
                     {
                         screen.counters.changes += 1;
                         screen.last_change = Some((arrived, difference));
+                        screen.last_change_wall = Some(wall);
                     }
                     if let Some(thumb) = thumb {
                         while screen

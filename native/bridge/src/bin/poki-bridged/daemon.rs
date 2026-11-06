@@ -273,8 +273,15 @@ async fn connection(stream: UnixStream, state: Rc<State>) {
         let _ = closed_tx.send(true);
     });
     while let Some(line) = lines.recv().await {
+        if let Ok(text) = &line
+            && live::is_subscribe(text)
+        {
+            // The connection now carries the event feed until the client leaves.
+            Box::pin(live::subscribe(text, &state, closed.clone(), &mut write)).await;
+            break;
+        }
         let answer = match line {
-            Ok(line) => answer(&line, &state, closed.clone()).await,
+            Ok(line) => Box::pin(answer(&line, &state, closed.clone())).await,
             Err(error) => Some(failure(
                 Value::Null,
                 &*Box::<dyn std::error::Error + Send + Sync>::from(error),
