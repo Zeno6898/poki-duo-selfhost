@@ -300,9 +300,9 @@ pub async fn subscribe(
             }
             let heartbeat = tokio::time::Instant::now() + Duration::from_secs(30);
             let wake = now
-                .quiet_since
+                .settles_at
                 .filter(|_| !now.settled)
-                .map_or(heartbeat, |at| tokio::time::Instant::from_std(at + settle))
+                .map_or(heartbeat, tokio::time::Instant::from_std)
                 .min(heartbeat);
             tokio::select! {
                 _ = watcher.changed() => {},
@@ -918,9 +918,9 @@ pub async fn prefetch_while_open(
             }
         }
         let wake = now
-            .quiet_since
+            .settles_at
             .filter(|_| !now.settled)
-            .map(|at| tokio::time::Instant::from_std(at + settle));
+            .map(tokio::time::Instant::from_std);
         let tick = tokio::time::Instant::now() + Duration::from_secs(2);
         tokio::select! {
             _ = watcher.changed() => {},

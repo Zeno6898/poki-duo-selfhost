@@ -45,6 +45,17 @@ static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// How long the copies are kept for `frame_diff`.
 const RING: Duration = Duration::from_secs(5);
 
+/// How long after an input a screen that has not moved counts as unchanged by it
+/// (POKI_LIVE_NO_RESPONSE_MS, default 600).
+pub fn no_response_time() -> Duration {
+    Duration::from_millis(
+        std::env::var("POKI_LIVE_NO_RESPONSE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600),
+    )
+}
+
 pub fn settle_time() -> Duration {
     Duration::from_millis(
         std::env::var("POKI_LIVE_SETTLE_MS")
@@ -277,7 +288,7 @@ struct Animations {
     minor: VecDeque<(Instant, [f64; 4])>,
 }
 
-const IN_PLACE_FOR: Duration = Duration::from_millis(900);
+const IN_PLACE_FOR: Duration = Duration::from_millis(600);
 /// How long after an input no change counts as in place.
 const AFTER_INPUT: Duration = Duration::from_millis(300);
 const IN_PLACE_AREA: f64 = 0.10;
@@ -330,10 +341,12 @@ impl Animations {
         {
             self.minor.pop_front();
         }
+        // Only small changes say where something repeats: a transition that covered this place
+        // too (a push into a screen with a spinner) is not part of the spinner.
         let touching: Vec<&(Instant, [f64; 4])> = self
             .history
             .iter()
-            .filter(|(_, r)| intersects(*r, region))
+            .filter(|(_, r)| r[2] * r[3] < IN_PLACE_AREA && intersects(*r, region))
             .collect();
         let oldest = touching.iter().map(|(at, _)| *at).min();
         let place = touching.iter().map(|(_, r)| *r).reduce(union);
@@ -555,6 +568,9 @@ pub struct State {
     /// Where something kept changing in place over the last second (x, y, w, h as fractions):
     /// settled does not wait for it.
     pub animating_region: Option<[f64; 4]>,
+    /// The earliest moment the screen can be settled if nothing moves (the quiet time's end, or
+    /// after an input the screen has not answered, no_response_time after it).
+    pub settles_at: Option<Instant>,
 }
 
 impl Live {
@@ -602,6 +618,21 @@ impl Live {
             .max()
             .or(screen.decoding_since);
         let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
+        // After an input, quiet is not settled until the screen answered or had time to: apps
+        // take 100 to 300 ms to start reacting, so quiet before then proves nothing.
+        let changed_since_input = screen
+            .last_input
+            .map(|input| moved.is_some_and(|at| at > input));
+        let answer_by = screen
+            .last_input
+            .filter(|_| changed_since_input == Some(false))
+            .map(|input| input + no_response_time());
+        let awaiting_answer = answer_by.is_some_and(|by| Instant::now() < by);
+        let settles_at = quiet_since
+            .map(|at| at + settle)
+            .into_iter()
+            .chain(answer_by)
+            .max();
         // The newest picture is not older than the newest unit that meant movement: whatever
         // waits in the decoder's queue repeats it.
         let picture_current = !decoding
@@ -609,12 +640,13 @@ impl Live {
                 .latest
                 .is_some_and(|l| screen.activity.is_none_or(|a| l.0 >= a.at));
         State {
-            settled: quiet && (!decoding || (screen.latest.is_some() && picture_current)),
+            settled: quiet
+                && !awaiting_answer
+                && (!decoding || (screen.latest.is_some() && picture_current)),
+            settles_at,
             moving: moved.is_some_and(|at| at.elapsed() < settle),
             animating_region: screen.animations.region(Instant::now()),
-            changed_since_input: screen
-                .last_input
-                .map(|input| moved.is_some_and(|at| at > input)),
+            changed_since_input,
             activity: screen.activity,
             units_since_input: screen.units_since_input,
             picture_current,
@@ -692,8 +724,8 @@ impl Live {
             }
             // Wake when the quiet time would end, or at the next picture or input.
             let until = state
-                .quiet_since
-                .map_or(deadline, |at| tokio::time::Instant::from_std(at + settle))
+                .settles_at
+                .map_or(deadline, tokio::time::Instant::from_std)
                 .min(deadline)
                 .max(now + Duration::from_millis(1));
             let _ = tokio::time::timeout_at(until, changed.changed()).await;
@@ -1861,12 +1893,22 @@ mod tests {
                 assert!(!live.unchanged_since(started));
                 assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
 
-                // An input followed by idle units only: unchanged, once the settle time passes.
+                // An input followed by idle units only: quiet right after an input proves
+                // nothing (apps take a moment to react), so it settles as unchanged only after
+                // the no-response time.
                 let input = Instant::now();
                 live.note_input();
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(
+                    !live.state(settle).settled,
+                    "too early to call it unchanged"
+                );
                 assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
-                assert!(input.elapsed() < Duration::from_millis(200));
+                let waited = input.elapsed();
+                assert!(
+                    waited >= no_response_time() && waited < Duration::from_millis(800),
+                    "{waited:?}"
+                );
                 let state = live.state(settle);
                 assert_eq!(state.changed_since_input, Some(false));
                 assert_eq!(state.units_since_input, 0);
@@ -1877,6 +1919,36 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_png_becomes_a_jpeg() {
+        if let Err(error) = libav::available() {
+            println!("skipped: {error}");
+            return;
+        }
+        let Some(path) = fake::draw(
+            "shot",
+            "1206x2622",
+            "drawbox=x=100:y=200:w=300:h=80:c=black:t=fill",
+        ) else {
+            println!("skipped: ffmpeg cannot draw here");
+            return;
+        };
+        let png = std::fs::read(path).unwrap();
+        let started = Instant::now();
+        let (jpeg, width, height, source_width, source_height) =
+            libav::png_to_jpeg(&png, 600, 5).unwrap();
+        println!(
+            "png {} bytes to jpeg {} bytes in {} ms",
+            png.len(),
+            jpeg.len(),
+            started.elapsed().as_millis()
+        );
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+        assert_eq!((source_width, source_height), (1206, 2622));
+        assert_eq!(width, 600);
+        assert!((1300..=1306).contains(&height));
+    }
+
+    #[test]
     fn a_change_that_repeats_in_place_is_not_movement() {
         let mut animations = Animations::default();
         let start = Instant::now();
@@ -1884,10 +1956,10 @@ mod tests {
         let spinner = [0.80, 0.30, 0.04, 0.02];
         // The first second of a spinner is movement: nothing says yet that it repeats.
         assert!(!animations.in_place(at(0), spinner));
-        for ms in (50..900).step_by(50) {
+        for ms in (50..600).step_by(50) {
             assert!(!animations.in_place(at(ms), spinner), "{ms} ms");
         }
-        assert!(animations.in_place(at(950), spinner));
+        assert!(animations.in_place(at(650), spinner));
         assert!(animations.in_place(at(1000), [0.801, 0.301, 0.038, 0.019]));
         let region = animations.region(at(1000)).unwrap();
         assert!(contains(spinner, region, 0.001));
