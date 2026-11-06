@@ -12,25 +12,23 @@ dev/ios-core `docs/single-bundle.md` explains why.
 
 | Path | What |
 |---|---|
-| `Poki/App` | App entry, tabs, Home, the app model (session, events, approvals, pairing) |
-| `Poki/Setup` | The setup steps |
-| `Poki/Loopback` | Built-in tunnel control, proxy app detection and one-tap module install |
-| `Poki/Activity` | Live Activity controller (state, thumbnail in the App Group) |
+| `Poki/App` | App entry, tabs, Home, the app model (on/off, runner sleep and wake, events, approvals, pairing, setup steps) |
+| `Poki/Setup` | Setup, one guided page with live checks |
+| `Poki/Loopback` | Live 10.7.0.1 check, proxy app detection and one-tap module install |
+| `Poki/Activity` | Live Activity controller (state, steps, thumbnail in the App Group) |
 | `Poki/Connect` | Relay identity (Ed25519 key, label, connector secrets in the keychain), MCP address with QR |
-| `Poki/Runtime` | The shell's view of PokiCore and PokiLauncher, background keep-alive |
-| `Poki/Debug` | 10.7.0.1 checks and the background hold test |
-| `Shared` | Live Activity attributes and the Approve/Deny App Intents (app and widget) |
-| `PokiTunnel` | Packet tunnel that routes only 10.7.0.1 and reflects it back to the phone |
-| `PokiWidgets` | The Live Activity's lock screen and Dynamic Island views |
+| `Poki/Runtime` | PokiCore and PokiLauncher glue, background keep-alive (location, then silent audio) |
+| `Poki/Debug` | 10.7.0.1 checks, the background hold test, the Live Activity preview |
+| `Shared` | Live Activity attributes and views, the Approve/Deny/Stop App Intents (app and widget) |
+| `PokiWidgets` | The Live Activity widget |
 
-PokiCore (Swift) and PokiLauncher (Rust, C ABI) come from dev/ios-core (`docs/ios-core.md`). Until
-they are linked, `Poki/Runtime/CoreBridge.swift` provides stand-ins that say so on screen, so the
-whole shell builds and runs without them.
+PokiCore (Swift) and PokiLauncher (Rust, C ABI) come from dev/ios-core (`docs/ios-core.md`).
 
 ## Build
 
 GitHub Actions (`.github/workflows/ios-app.yml`) builds `Poki-unsigned.ipa` on every push to
-`dev/ios-app`. Locally on a Mac with Xcode 26 or later:
+`dev/ios-app`, runs it on the iOS Simulator and uploads a screenshot of every screen in light and
+dark mode (artifact `simulator-smoke`, folder `shots`). Locally on a Mac with Xcode 26 or later:
 
 ```sh
 native/ios-app/scripts/make-assets.sh
@@ -38,48 +36,60 @@ xcodegen generate --spec native/ios-app/project.yml
 open native/ios-app/Poki.xcodeproj
 ```
 
+`-pokiScreen home|setup|connect|debug|activity` opens that screen at launch.
+
+## How it runs
+
+- Poki stays on once turned on, and turns on again at launch. The runner, and with it iOS's
+  automation banner, starts only when an agent asks. It stops after the idle time (default 60 s),
+  from Stop on the Live Activity or in Poki, or when Poki is closed. The launcher ends the runner's
+  process at once instead of leaving it up for about 30 s.
+- Only Poki starts the runner. Opened by hand, Poki Runner starts no test (PokiRunnerHost,
+  `native/ios-runner/host`) and sends the person to Poki.
+- The Live Activity starts from the foreground, because iOS does not allow it from the background:
+  when Poki turns on, when pairing starts, and when a setup step opens Settings.
+
 ## Signing and entitlements
 
 | Entitlement | Needed for | Notes |
 |---|---|---|
-| App Groups `group.nz.zheha.poki` | Live Activity thumbnail, approvals between widget and app | AltStore and SideStore rewrite group ids per Apple ID; that works as long as all three targets get the same rewritten group. |
-| Network Extension `packet-tunnel-provider` | The built-in loopback | Needs a paid developer team. Free Apple ID signing (AltStore) strips it: the app still works with a proxy app's loopback module, and the built-in option shows the save error. With the paid team, sign the IPA with a profile that has the Network Extension capability for `nz.zheha.poki` and `nz.zheha.poki.tunnel` (the server session's `wda/sign-on-mac.sh` can be adapted). |
+| App Groups `group.nz.zheha.poki` | Live Activity thumbnail, approvals between widget and app | Signing tools rewrite group ids per Apple ID; that works as long as both targets get the same rewritten group. |
+
+There is no built-in VPN for now: a sideloaded app cannot use the Network Extension (it needs
+TestFlight or the App Store).
 
 ## Loopback choices
 
-- **Built-in**: `PokiTunnel` routes only 10.7.0.1/32 (IPv4, no DNS, no default route, MTU 1500) and
-  sends every packet for it back with source and destination swapped. The interface address is
-  10.7.0.2. It takes the VPN slot.
 - **Proxy app**: Surge (module, `surge:///install-module?url=`), Loon (plugin,
   `loon://import?plugin=`), Shadowrocket (its "Include route 10.7.0.1/32" toggle) or sing-box (one
   line in the tun inbound). Files in `deploy/proxy-modules/`, served from the fork's raw GitHub URL
   for now (`ProxyApps.modulesBase`).
+- **No proxy app**: LocalDevVPN (free, App Store), which takes the VPN slot.
 
 ## Device test checklist
 
-For the first install on the phone. Each line is one thing to look at; note what happened.
-
 Install and launch
-- [ ] Install `Poki-unsigned.ipa` (and the runner IPA) with the paid-team signing; the Poki icon is the bear on blue, the runner's is the bear with the play triangle.
-- [ ] Launch Poki: Home shows the bear, three status rows, Start; the tab bar is glass and shrinks on scroll.
+- [ ] Install `Poki-unsigned.ipa` and the runner IPA with the same signing.
+- [ ] Open Poki Runner by hand: no passcode prompt, no automation banner; it opens Poki (or shows Open Poki).
+- [ ] Launch Poki: the Setup tab shows a badge with the steps left.
 
 Setup
-- [ ] Developer Mode step: Open Settings works; the toggle ticks the step.
-- [ ] Pairing step: Start pairing; (once PokiLauncher pairing lands) Settings > Privacy & Security > Developer Mode shows Pair with Poki; the PIN appears in the Live Activity; pairing completes and the step ticks.
-- [ ] Import a pairing file (StikDebug/SideStore export): accepted; a non-plist file is refused with a message.
-- [ ] UI Automation step: Settings > Developer > Enable UI Automation is there after Developer Mode.
-- [ ] Loopback, built-in: Turn on asks to add a VPN configuration; status goes to On; Debug tab shows a 10.7.0.x interface with no IPv6, and 10.7.0.1:62078, :49152 and the random port all answer (connected, or refused for the random port).
-- [ ] Loopback, proxy: with Surge/Loon/Shadowrocket installed, its card says Installed; Install module/plugin opens the proxy app with the import prompt; with the module on, the Debug checks pass as above.
-- [ ] Passcode step reads clearly.
+- [ ] Each step opens in turn; Open Settings starts a Live Activity with the step number and what to tap.
+- [ ] Loopback: the status changes within 3 s when the proxy app's module is turned on or off.
+- [ ] Pairing: the code shows in the Live Activity and in Poki; the step ticks.
+- [ ] Let Poki stay on: Allow location shows iOS's prompt; Live Activities show as on.
 
-Session and Live Activity
-- [ ] Start: the Live Activity appears (lock screen and Dynamic Island) with the bear and "Starting".
-- [ ] Leave Poki for 5 minutes with a session on: Debug > Background hold (and the runner, once linked) shows no suspension gap; note how long it stays alive with and without the session's audio keep-alive.
-- [ ] (Once PokiCore is linked) an agent's look/do updates the headline, last action and thumbnail.
-- [ ] (Once PokiCore is linked) a sensitive action shows Approve/Deny in the Live Activity; Deny answers the agent "declined"; Approve on the lock screen asks for Face ID; while pending the agent's do calls return approval_pending.
-- [ ] Stop ends the Live Activity and the keep-alive.
+Turned on
+- [ ] Turn on: the Live Activity says "On. Waiting for an agent"; no automation banner yet.
+- [ ] An agent's first call starts the runner; its steps show on the Lock Screen and on Home.
+- [ ] Opening Poki Runner while in use shows "Poki is using this iPhone", not a black screen.
+- [ ] No banner flicker during a run; a slow swipe or drag does not restart the runner.
+- [ ] Stop on the Live Activity or in Poki: the banner goes away within seconds; the next call starts it again.
+- [ ] After the idle time with no calls, the banner goes away by itself.
+- [ ] Ten minutes in the background: the location pill shows and agents still reach the phone.
+- [ ] Close Poki from the app switcher: the banner goes away within seconds.
+- [ ] A sensitive action shows Approve/Deny in the Live Activity; Approve asks for Face ID.
 
 Connect
-- [ ] Add a connector named Claude: the sheet shows the URL, a QR that scans to the same URL, and Copy works.
-- [ ] Revoke by swiping: the connector disappears (and, once PokiCore is linked, the relay answers 404 for it).
-- [ ] The device label stays the same across app restarts (keychain).
+- [ ] Add a connector: the sheet shows the URL, a QR that scans to the same URL, and Copy works.
+- [ ] Revoke by swiping: the connector disappears and the relay answers 404 for it.
