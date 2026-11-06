@@ -17,14 +17,15 @@
 //! The feed is one JSON object per line. Times are UTC (2026-11-06T03:27:28.123Z); regions are
 //! [x, y, width, height] as fractions of the screen. After the acknowledgement
 //! `{"id":..,"ok":true,"event":"subscribed","settle_ms":150}` every event has `seq` (from 1) and
-//! `at` (when it was sent):
+//! `at` (when it was sent). `epoch` is a picture number: it grows by one per decoded picture, across
+//! media sessions, so comparing epochs tells which came first:
 //!
 //! - `media` {state: open | closed | unavailable, error?}: the stream started, ended (the media
 //!   session closed) or cannot be opened; the feed follows the next session by itself.
-//! - `input` {sent_at}: an input op ran.
-//! - `changed` {captured_at, changed, changed_fraction, region}: a picture differs from the one
+//! - `input` {sent_at, epoch}: an input op ran; epoch is the latest picture number then.
+//! - `changed` {epoch, captured_at, changed, changed_fraction, region}: a picture differs from the one
 //!   before it.
-//! - `settled` {captured_at, quiet_ms, size, since_last_settled?: {changed, changed_fraction,
+//! - `settled` {epoch, captured_at, quiet_ms, size, since_last_settled?: {changed, changed_fraction,
 //!   region}}: no change and no input for the settle time; sent once per quiet period.
 //!
 //! The client ends it by closing the connection.
@@ -203,8 +204,11 @@ pub async fn subscribe(
             let mut events = Vec::new();
             if now.last_input.is_some() && now.last_input != input_seen {
                 input_seen = now.last_input;
-                events
-                    .push(json!({"event": "input", "sent_at": now.last_input_wall.map(stamp_at)}));
+                events.push(json!({
+                    "event": "input",
+                    "sent_at": now.last_input_wall.map(stamp_at),
+                    "epoch": now.last_input_epoch,
+                }));
             }
             if let Some((at, difference)) = now.last_change
                 && change_seen != Some(at)
@@ -213,6 +217,7 @@ pub async fn subscribe(
                 let mut event = difference.json();
                 event["event"] = "changed".into();
                 event["captured_at"] = now.last_change_wall.map(stamp_at).into();
+                event["epoch"] = now.last_change_epoch.into();
                 events.push(event);
             }
             if now.settled && settled_for != Some(now.quiet_since) {
@@ -222,6 +227,7 @@ pub async fn subscribe(
                     "quiet_ms": now.quiet_since.map(|at| at.elapsed().as_millis() as u64),
                     "captured_at": now.latest.map(|l| stamp_at(l.1)),
                     "size": now.latest.map(|l| [l.2, l.3]),
+                    "epoch": now.epoch,
                 });
                 if let Some(previous) = last_settled_at
                     && let Some((difference, _, _)) = live.diff(previous.elapsed(), Duration::ZERO)
@@ -297,9 +303,13 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
         "encode_ms": (jpeg.encode_ms * 10.0).round() / 10.0,
         "settled": state.settled,
         "quiet_ms": state.quiet_since.map(ago),
+        "epoch": jpeg.epoch,
+        "latest_epoch": state.epoch,
+        "last_input_epoch": state.last_input_epoch,
         "last_change": state.last_change.map(|(at, difference)| {
             let mut change = difference.json();
             change["ms_ago"] = ago(at).into();
+            change["epoch"] = state.last_change_epoch.into();
             change
         }),
         "last_input_ms_ago": state.last_input.map(ago),

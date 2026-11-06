@@ -36,6 +36,8 @@ const SENDER_VIDEO_PORT: u16 = 50001;
 const THUMB_WIDTH: u32 = 96;
 /// A copy pixel that moved by more than this many gray levels changed.
 const PIXEL_DELTA: u8 = 12;
+/// Picture numbers, across every stream this daemon opens, so they only grow.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How long the copies are kept for `frame_diff`.
 const RING: Duration = Duration::from_secs(5);
 
@@ -139,8 +141,13 @@ struct Screen {
     counters: Counters,
     thumbs: VecDeque<Thumb>,
     latest: Option<Latest>,
+    /// The latest picture's number (see EPOCH).
+    epoch: u64,
     last_change: Option<(Instant, Difference)>,
     last_change_wall: Option<SystemTime>,
+    last_change_epoch: Option<u64>,
+    /// The epoch current when the last input was sent.
+    last_input_epoch: Option<u64>,
     last_input: Option<Instant>,
     last_input_wall: Option<SystemTime>,
     /// Set when the media session that carried this stream closed.
@@ -169,6 +176,8 @@ pub struct Jpeg {
     /// When the picture's unit arrived.
     pub arrived: Instant,
     pub wall: SystemTime,
+    /// The picture's number.
+    pub epoch: u64,
     pub encode_ms: f64,
 }
 
@@ -257,8 +266,12 @@ pub struct State {
     /// Since when nothing moved and no input was sent.
     pub quiet_since: Option<Instant>,
     pub latest: Option<Latest>,
+    /// The latest picture's number; numbers grow across streams (0 before the first).
+    pub epoch: u64,
     pub last_change: Option<(Instant, Difference)>,
     pub last_change_wall: Option<SystemTime>,
+    pub last_change_epoch: Option<u64>,
+    pub last_input_epoch: Option<u64>,
     pub last_input: Option<Instant>,
     pub last_input_wall: Option<SystemTime>,
     /// The media session closed; a new one has a new stream.
@@ -280,6 +293,7 @@ impl Live {
         let mut screen = self.screen.lock().unwrap();
         screen.last_input = Some(Instant::now());
         screen.last_input_wall = Some(SystemTime::now());
+        screen.last_input_epoch = Some(screen.epoch);
         screen.generation += 1;
         self.notify.send_replace(screen.generation);
     }
@@ -305,6 +319,9 @@ impl Live {
             latest: screen.latest,
             last_change: screen.last_change,
             last_change_wall: screen.last_change_wall,
+            epoch: screen.epoch,
+            last_change_epoch: screen.last_change_epoch,
+            last_input_epoch: screen.last_input_epoch,
             last_input: screen.last_input,
             last_input_wall: screen.last_input_wall,
             closed: screen.closed,
@@ -445,6 +462,7 @@ impl Live {
             "latest_age_ms": since(state.latest.map(|l| l.0)),
             "ms_since_change": since(state.last_change.map(|c| c.0)),
             "size": state.latest.map(|l| [l.2, l.3]),
+            "epoch": state.epoch,
             "decoding": screen.decoding_since.is_some(),
             "decoder_error": screen.decoder_error,
             "totals": {
@@ -603,7 +621,7 @@ fn decode_loop(
     let mut decoder: Option<libav::Decoder> = None;
     let mut thumbnailer = libav::Thumbnailer::default();
     let mut encoder = libav::JpegEncoder::default();
-    let mut latest: Option<(libav::Picture, Instant, SystemTime)> = None;
+    let mut latest: Option<(libav::Picture, Instant, SystemTime, u64)> = None;
     let mut previous: Option<Thumb> = None;
     ready.store(true, Ordering::SeqCst);
     while let Ok(job) = queue.recv() {
@@ -619,20 +637,20 @@ fn decode_loop(
                 reply,
             } => {
                 let started = Instant::now();
-                let answer =
-                    match &latest {
-                        None => Err("no picture decoded yet".to_string()),
-                        Some((picture, arrived, wall)) => encoder
-                            .encode(picture, width, quality)
-                            .map(|(bytes, width, height)| Jpeg {
-                                bytes,
-                                width,
-                                height,
-                                arrived: *arrived,
-                                wall: *wall,
-                                encode_ms: started.elapsed().as_secs_f64() * 1000.0,
-                            }),
-                    };
+                let answer = match &latest {
+                    None => Err("no picture decoded yet".to_string()),
+                    Some((picture, arrived, wall, epoch)) => encoder
+                        .encode(picture, width, quality)
+                        .map(|(bytes, width, height)| Jpeg {
+                            bytes,
+                            width,
+                            height,
+                            arrived: *arrived,
+                            wall: *wall,
+                            epoch: *epoch,
+                            encode_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        }),
+                };
                 let _ = reply.send(answer);
             }
             Job::Unit(unit, arrived) => {
@@ -676,7 +694,7 @@ fn decode_loop(
                         _ => None,
                     };
                     let size = (picture.width(), picture.height());
-                    latest = Some((picture, arrived, wall));
+                    latest = Some((picture, arrived, wall, 0));
                     let mut screen = screen.lock().unwrap();
                     let c = &mut screen.counters;
                     c.decoded += 1;
@@ -689,12 +707,18 @@ fn decode_loop(
                             .map(|s| decoded_at.duration_since(s).as_millis() as u64);
                     }
                     screen.latest = Some((arrived, wall, size.0, size.1));
+                    screen.epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+                    let epoch = screen.epoch;
+                    if let Some(latest) = latest.as_mut() {
+                        latest.3 = epoch;
+                    }
                     if let Some(difference) = difference
                         && difference.changed > 0.0
                     {
                         screen.counters.changes += 1;
                         screen.last_change = Some((arrived, difference));
                         screen.last_change_wall = Some(wall);
+                        screen.last_change_epoch = Some(epoch);
                     }
                     if let Some(thumb) = thumb {
                         while screen
