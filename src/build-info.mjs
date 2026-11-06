@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { readdir, stat, access, constants } from 'node:fs/promises';
+import { readdir, stat, access, constants, readFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
@@ -41,8 +41,10 @@ export async function requireCurrentCode() {
 }
 
 export async function buildInfo() {
+  // A container image has no git, so its build records the commit in build/commit (or POKI_BUILD_COMMIT).
+  const recorded = async () => process.env.POKI_BUILD_COMMIT?.trim() || (await readFile(join(root, 'build/commit'), 'utf8').catch(() => '')).trim() || 'unknown';
   const [commit, native] = await Promise.all([
-    execute('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, timeout: 1000 }).then(result => result.stdout.trim(), () => 'unknown'),
+    execute('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, timeout: 1000 }).then(result => result.stdout.trim() || recorded(), recorded),
     stat(bridge).catch(() => null),
   ]);
   return { commit, native_build: native?.mtime.toISOString() ?? 'unknown' };
