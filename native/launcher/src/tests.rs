@@ -118,3 +118,17 @@ fn an_unreadable_config_gives_null() {
         poki_launcher_free(launcher);
     }
 }
+
+#[test]
+fn disk_image_failures_name_their_own_fix() {
+    use crate::ddi::classify;
+    use idevice::IdeviceError;
+    use idevice::cryptexd::CryptexdError;
+    let refused = classify(&IdeviceError::UnexpectedResponse("TSS server responded with non-success status (STATUS=94&MESSAGE=This device isn't eligible)".into()));
+    assert_eq!(refused.code, Some("ddi_refused"));
+    let bad = classify(&IdeviceError::Cryptexd(CryptexdError::BadDdiBundle("no trustcache".into())));
+    assert_eq!(bad.code, Some("ddi_bad"));
+    let network = classify(&IdeviceError::Http("connection refused".into()));
+    assert_eq!(network.code, Some("network"));
+    assert_eq!(network.fix.as_deref(), Some(crate::device::NETWORK_FIX));
+}

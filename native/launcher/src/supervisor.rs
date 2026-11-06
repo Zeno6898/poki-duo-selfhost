@@ -4,7 +4,7 @@
 
 use crate::{
     ddi,
-    device::{Device, Failure, LOOPBACK_FIX, Pairing},
+    device::{DDI_TIMEOUT_FIX, Device, Failure, LOOPBACK_FIX, NETWORK_FIX, Pairing},
     launch,
 };
 use serde::Deserialize;
@@ -33,6 +33,9 @@ pub struct Config {
     #[serde(default = "default_wda_port")]
     pub wda_port: u16,
 }
+
+/// The longest a disk image mount may take (Apple's signing server plus the upload).
+const DDI_MOUNT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn default_address() -> IpAddr {
     IpAddr::from([10, 7, 0, 1])
@@ -92,8 +95,9 @@ impl Launcher {
     }
 
     fn fail(&self, attempt: u32, failure: &Failure) {
-        let state = if failure.fix.as_deref() == Some(LOOPBACK_FIX) { "waiting_network" } else { "failed" };
-        self.set(state, attempt, json!({"detail": failure.detail, "fix": failure.fix}));
+        let waiting = matches!(failure.fix.as_deref(), Some(LOOPBACK_FIX) | Some(NETWORK_FIX) | Some(DDI_TIMEOUT_FIX));
+        let state = if waiting { "waiting_network" } else { "failed" };
+        self.set(state, attempt, json!({"detail": failure.detail, "fix": failure.fix, "code": failure.code}));
     }
 
     /// Runs the supervisor on a thread of its own with a single-threaded runtime: idevice's futures
@@ -105,7 +109,7 @@ impl Launcher {
         }
         self.commands.send_replace(Command::Run);
         let me = self.clone();
-        *thread = Some(std::thread::Builder::new().name("poki-launcher".into()).spawn(move || {
+        *thread = Some(std::thread::Builder::new().name("poki-launcher".into()).stack_size(8 << 20).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("the launcher's runtime");
             runtime.block_on(me.run());
         }).expect("the launcher's thread"));
@@ -183,12 +187,26 @@ impl Launcher {
         let mut device = Device::open(config.device_address, &mut pairing, Duration::from_secs(20)).await?;
         if !ddi::mounted(&device) {
             me.set("mounting_ddi", attempt, json!({"pairing": kind}));
-            ddi::mount(&mut device, &config.ddi_dir).await?;
+            // Apple's signing server and a ~20 MB upload: bounded, so a stalled network cannot hold
+            // the supervisor in mounting_ddi (Stop would end it, Restart would not).
+            match tokio::time::timeout(DDI_MOUNT_TIMEOUT, ddi::mount(&mut device, &config.ddi_dir)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(Failure::new(format!("mounting the developer disk image took over {} s", DDI_MOUNT_TIMEOUT.as_secs())).fix(DDI_TIMEOUT_FIX).code("ddi_timeout")),
+            }
             drop(device);
             // The services list was fixed when the tunnel opened; a new one shows the mounted image.
-            device = Device::open(config.device_address, &mut pairing, Duration::from_secs(20)).await?;
-            if !ddi::mounted(&device) {
-                return Err(Failure::new("the developer disk image was installed but its services did not appear").fix("Restart the phone, then open Poki again."));
+            // It can take a moment to appear: up to three more tunnels, a second apart, before the
+            // person is asked to restart the phone (which costs a passcode and a new signature).
+            let mut tries = 0;
+            loop {
+                device = Device::open(config.device_address, &mut pairing, Duration::from_secs(20)).await?;
+                if ddi::mounted(&device) { break; }
+                tries += 1;
+                if tries > 3 {
+                    return Err(Failure::new("the developer disk image was installed but its services did not appear").fix("Restart the phone, then open Poki again."));
+                }
+                drop(device);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
         let ios = device.ios_version().await.unwrap_or_default();
