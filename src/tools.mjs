@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { version } from './build-info.mjs';
+import * as actAndObserve from './act-and-observe.mjs';
 
 const catalog = JSON.parse(readFileSync(new URL('./data/tools.json', import.meta.url), 'utf8'));
 const defaultTools = new Set([
@@ -36,6 +37,7 @@ Arguments of common steps: launch_app {bundle_id or name}; tap_text {text}; tap 
 };
 export const definitions = catalog.tools.map(tool => [tool.name, [tool.description, guidance[tool.name]].filter(Boolean).join('\n\n'), z.fromJSONSchema(tool.inputSchema), readOnly.has(tool.name)]);
 definitions.push(['poki_mcp_status', 'Report Poki MCP version, current Git commit, native bridge build time, tool count, connected-device count, selected device, and approval mode for this session.', z.object({}), true]);
+if (actAndObserve.registered()) { definitions.push(actAndObserve.definition); defaultTools.add(actAndObserve.name); }
 
 export function createServer(call) {
   const server = new McpServer({ name: 'poki-mcp', version }, { instructions });
