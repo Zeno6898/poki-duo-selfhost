@@ -15,6 +15,7 @@ import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
 import { version, buildInfo, requireCurrentCode, ocrStatus, ocrMissing, ocrPath } from './build-info.mjs';
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
+import { World } from './world.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -53,7 +54,7 @@ export function hidPoint(x, y, width, height) {
 
 export class Devices {
   selected; requested; frame; size; seen; elements = []; elementsAt = 0; lastInputAt = -Infinity; inBatch = false;
-  scales = new Map(); readCosts = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
+  scales = new Map(); readCosts = new Map(); worlds = new Map(); captureMs = 1500; physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
     const result = await execute(file, args, { timeout, input });
@@ -181,9 +182,16 @@ export class Devices {
     this.scales.set(target.id, scale); return scale;
   }
   capture() { return phase('screen_capture', () => this.captureFrame()); }
+  captureCost() { return this.captureMs; }
+  // The screen as state for the observe, act and run tools (see world.mjs).
+  async world() {
+    const target = await this.target();
+    if (!this.worlds.has(target.id)) this.worlds.set(target.id, new World(this));
+    return this.worlds.get(target.id);
+  }
   async captureFrame() {
     checkWork();
-    const started = new Date().toISOString();
+    const started = new Date().toISOString(), began = performance.now();
     const target = await this.target();
     const cache = join(stateDir, 'frames');
     await mkdir(cache, { recursive: true, mode: 0o700 });
@@ -201,6 +209,7 @@ export class Devices {
       checkWork();
       this.frame = { id: randomUUID(), device: target.id, revision: this.coordinator.revision(target.id), width, height, scale, data, original, at: Date.now(), capture_started_at: started, capture_completed_at: new Date().toISOString() };
       this.size = { device: target.id, width, height };
+      this.captureMs = performance.now() - began;
       return this.frame;
     } finally { await unlink(path).catch(() => {}); }
   }
@@ -354,6 +363,7 @@ export class Devices {
     try { result = await phase('input', () => this.bridge(command)); }
     catch (error) { result = { outcome: 'unknown', error: error.message, stopped: Boolean(stopped(error)), stop_reason: stopped(error) ? stoppingReason(error) : 'unknown', instruction: 'Input may have been delivered. Inspect the screen before retrying.', isError: true }; }
     this.lastInputAt = performance.now();
+    this.worlds.get(target.id)?.noteInput(command.op);
     if (target.kind === 'physical') {
       try { await phase('recording_recovery', () => resumeRecordings(this, target)); }
       catch (error) { result = { ...result, recording: { resumed: false, error: error.message }, stopped: Boolean(stopped(error)), ...(stopped(error) ? { stop_reason: stoppingReason(error) } : {}) }; }
