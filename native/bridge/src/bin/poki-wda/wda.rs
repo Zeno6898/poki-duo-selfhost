@@ -67,8 +67,19 @@ async fn run() -> Result<()> {
     emit(start, json!({"event": "connected"}));
     let version = device_ops::lockdown_get(&mut device.adapter, &mut device.rsd, None, "ProductVersion").await?;
     let major: u8 = version["value"].as_str().and_then(|v| v.split('.').next()).and_then(|v| v.parse().ok()).unwrap_or(17);
-    let bundle = std::env::var("POKI_WDA_BUNDLE").unwrap_or_else(|_| "com.facebook.WebDriverAgentRunner.xctrunner".into());
     let mut proxy = InstallationProxyClient::connect_rsd(&mut device.adapter, &mut device.rsd).await?;
+    // A sideloading tool (AltStore, Sideloadly) may rename the bundle, for example by adding the team
+    // ID, so without POKI_WDA_BUNDLE the runner is the installed user app whose ID names it.
+    let bundle = match std::env::var("POKI_WDA_BUNDLE") {
+        Ok(bundle) => bundle,
+        Err(_) => {
+            let apps = proxy.get_apps(Some("User"), None).await?;
+            let mut ids: Vec<String> = apps.keys().filter(|id| id.contains("WebDriverAgentRunner") && id.contains("xctrunner")).cloned().collect();
+            ids.sort();
+            emit(start, json!({"event": "runner_candidates", "ids": ids}));
+            ids.into_iter().next().ok_or("No WebDriverAgent runner is installed (no user app ID contains WebDriverAgentRunner and xctrunner).")?
+        }
+    };
     let config = TestConfig::from_installation_proxy(&mut proxy, &bundle, None).await?;
     emit(start, json!({"event": "runner_found", "bundle": bundle, "ios_major": major}));
     let mut runner_adapter = device.adapter.clone();
