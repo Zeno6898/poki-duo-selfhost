@@ -115,8 +115,8 @@ struct PairingStep: View {
 
     @ViewBuilder private var diskImageStatus: some View {
         switch model.diskImage.state {
-        case .ready: Label("Developer disk image downloaded", systemImage: "checkmark.circle").font(.footnote).foregroundStyle(.secondary)
-        case .downloading(let done): ProgressView("Downloading the developer disk image", value: done).font(.footnote)
+        case .ready(let build): Label("Developer disk image ready (\(build))", systemImage: "checkmark.circle").font(.footnote).foregroundStyle(.secondary)
+        case .downloading(let step): ProgressView { Text("Developer disk image: \(step)").font(.footnote) }
         case .missing: Button("Download the developer disk image", systemImage: "arrow.down.circle") { Task { await model.diskImage.download() } }.buttonStyle(.glass)
         case .failed(let why):
             VStack(alignment: .leading) {

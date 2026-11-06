@@ -44,8 +44,9 @@ jobs:
 
       - name: Developer disk image mirror answers
         run: |
-          for f in BuildManifest.plist Image.dmg Image.dmg.trustcache; do
-            code=$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/doronz88/DeveloperDiskImage/raw/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/$f")
+          # The files PokiCore's DeveloperDiskImage.ensure downloads on the phone.
+          for f in BuildManifest.plist Image.dmg Image.dmg.trustcache Image.dmg.cryptex_info Image.dmg.root_hash; do
+            code=$(curl -sL -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/$f")
             echo "$f $code"; test "$code" = 200
           done
 

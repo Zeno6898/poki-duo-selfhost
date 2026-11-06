@@ -9,7 +9,7 @@ final class AppModel {
     var setup = SetupState.load() { didSet { setup.save() } }
     let identity = RelayIdentity()
     let tunnel = TunnelController()
-    let diskImage = DeveloperDiskImage()
+    let diskImage = DiskImageStore()
     private(set) var runner = RunnerStatus.idle
     private(set) var relayStatus = RelayStatus.off
     private(set) var sessionOn = false
