@@ -1,0 +1,17 @@
+{
+  "name": "poki-cf-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "description": "Cloudflare Workers relay: Streamable HTTP MCP to a phone over its outbound WebSocket (relay frames v1), with a minimal OAuth server",
+  "scripts": {
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist && cp dist/index.js worker.js"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.6.0",
+    "vitest": "5.1.0",
+    "wrangler": "4.158.0"
+  }
+}

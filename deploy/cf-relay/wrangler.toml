@@ -1,0 +1,39 @@
+# Poki relay on Cloudflare Workers. Deploy with the bundled worker.js (see DEPLOY.md).
+name = "poki-relay"
+main = "src/index.js"
+compatibility_date = "2025-10-01"
+workers_dev = false
+
+# Path routing on one hostname (a free zone's Universal SSL covers one level of subdomain only,
+# so <label>.pokimcp.zheha.nz would need Advanced Certificate Manager).
+routes = [{ pattern = "pokimcp.zheha.nz", custom_domain = true }]
+
+# No logs, traces or analytics of requests.
+[observability]
+enabled = false
+
+[[durable_objects.bindings]]
+name = "DEVICE"
+class_name = "DeviceRelay"
+
+[[durable_objects.bindings]]
+name = "BUDGET"
+class_name = "Budget"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeviceRelay", "Budget"]
+
+# Hard caps (requests are MCP requests that reach the phone). See DEPLOY.md for the cost model.
+[vars]
+MAX_BODY = "4194304"
+REQ_TIMEOUT_MS = "60000"
+PER_MINUTE = "60"
+CONCURRENT = "4"
+LABEL_DAILY = "5000"
+GLOBAL_DAILY = "8000"
+GLOBAL_DAILY_SECONDS = "80000"
+REDIRECT_HOSTS = "claude.ai,claude.com,chatgpt.com,chat.openai.com,localhost,127.0.0.1"
+
+# Secret, not in this file: TOKEN_SECRET (32+ random characters), e.g.
+#   openssl rand -base64 48 | wrangler secret put TOKEN_SECRET
