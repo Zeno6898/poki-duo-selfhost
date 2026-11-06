@@ -73,6 +73,10 @@ impl AsyncWrite for Writer {
     }
 }
 
+fn log_line(message: &str) {
+    eprintln!("poki-bridged: {message}");
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Push {
     Auto,
@@ -388,11 +392,38 @@ async fn read_loop(mut read: ReadHalf<Socket>, inner: Rc<Inner>) {
     };
     let mut generation = 0;
     let mut tree = Tree::default();
+    let opened = Instant::now();
+    let mut messages = 0u64;
     loop {
         let message = match Message::from_reader(&mut read).await {
             Ok(message) => message,
-            Err(error) => return fail(format!("accessibility subscription ended: {error}")),
+            Err(error) => {
+                // How the subscription ended, so a device run shows whether the phone closes it
+                // right after its first tree.
+                let state = inner.state.borrow();
+                let since = |at: Option<Instant>| {
+                    at.map_or("never".into(), |t| {
+                        format!("{} ms ago", t.elapsed().as_millis())
+                    })
+                };
+                let detail = format!(
+                    "{} ms after opening, {messages} messages, {} trees, {} renewals, last tree {}, last input {}",
+                    opened.elapsed().as_millis(),
+                    state.trees,
+                    state.renewals,
+                    since(state.latest.as_ref().map(|(_, at)| *at)),
+                    since(state.invalidated),
+                );
+                drop(state);
+                log_line(&format!(
+                    "accessibility subscription ended: {error} ({detail})"
+                ));
+                return fail(format!(
+                    "accessibility subscription ended: {error} ({detail})"
+                ));
+            }
         };
+        messages += 1;
         if let Err(error) = acknowledge(&mut *inner.writer.lock().await, &message).await {
             return fail(format!("accessibility subscription ended: {error}"));
         }
