@@ -44,10 +44,7 @@ fn nal_types(annexb: &[u8]) -> Vec<u8> {
 }
 
 pub fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     if let Err(error) = runtime.block_on(run()) {
         eprintln!("{}", json!({"event": "error", "error": error.to_string()}));
         std::process::exit(1);
@@ -59,15 +56,8 @@ async fn run() -> Result<()> {
     let target = parse_args(&args)?;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    let plan: Plan = if input.trim().is_empty() {
-        Plan::default()
-    } else {
-        serde_json::from_str(&input)?
-    };
-    let plan = Plan {
-        seconds: plan.seconds.max(1),
-        ..plan
-    };
+    let plan: Plan = if input.trim().is_empty() { Plan::default() } else { serde_json::from_str(&input)? };
+    let plan = Plan { seconds: plan.seconds.max(1), ..plan };
     let start = Instant::now();
     let mut device = connect_device(&target).await?;
     event(start, json!({"event": "connected"}));
@@ -75,11 +65,7 @@ async fn run() -> Result<()> {
         .await
         .map_err(|e| format!("Cannot establish media session: {e}"))?;
     event(start, json!({"event": "media_started"}));
-    let stream::ScreenMediaStream {
-        mut client,
-        audio_udp,
-        video_udp,
-    } = media;
+    let stream::ScreenMediaStream { mut client, audio_udp, video_udp } = media;
     let audio = tokio::spawn(async move { while audio_udp.recv().await.is_ok() {} });
 
     let mut out = std::io::BufWriter::new(std::io::stdout());
@@ -107,22 +93,15 @@ async fn run() -> Result<()> {
                 event(start, json!({"event": "tap_sent", "x": x, "y": y}));
             }
         }
-        let wait = deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(200));
+        let wait = deadline.saturating_duration_since(now).min(Duration::from_millis(200));
         match tokio::time::timeout(wait, video_udp.recv()).await {
             Err(_) => continue,
             Ok(Err(error)) => {
-                event(
-                    start,
-                    json!({"event": "stream_error", "error": format!("{error:?}")}),
-                );
+                event(start, json!({"event": "stream_error", "error": format!("{error:?}")}));
                 break;
             }
             Ok(Ok(datagram)) => {
-                let Some(packet) = RtpPacket::parse(&datagram.data) else {
-                    continue;
-                };
+                let Some(packet) = RtpPacket::parse(&datagram.data) else { continue };
                 packets += 1;
                 unit_packets += 1;
                 depacketizer.push(packet.sequence_number, packet.timestamp, packet.payload);
@@ -137,10 +116,7 @@ async fn run() -> Result<()> {
                     if packet.marker {
                         units += 1;
                         let key = types.iter().any(|t| (16..=21).contains(t));
-                        event(
-                            start,
-                            json!({"event": "unit", "rtp_ts": packet.timestamp, "bytes": unit_bytes, "packets": unit_packets, "key": key, "nal": types}),
-                        );
+                        event(start, json!({"event": "unit", "rtp_ts": packet.timestamp, "bytes": unit_bytes, "packets": unit_packets, "key": key, "nal": types}));
                         unit_bytes = 0;
                         unit_packets = 0;
                     }
@@ -148,10 +124,7 @@ async fn run() -> Result<()> {
             }
         }
     }
-    event(
-        start,
-        json!({"event": "done", "packets": packets, "units": units}),
-    );
+    event(start, json!({"event": "done", "packets": packets, "units": units}));
     drop(touch);
     let _ = client.stop_media_stream().await;
     audio.abort();
