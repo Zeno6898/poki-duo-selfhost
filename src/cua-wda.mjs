@@ -93,7 +93,8 @@ export function wdaContext(ctx, url = process.env.POKI_WDA_URL) {
     async target() { return { id: 'wda', kind: 'physical', name: 'WebDriverAgent' }; },
     liveScreen() { return undefined; },
     async screenSize() {
-      if (!view.size) { const s = await wda.call('GET', '/window/size'); view.size = { device: 'wda', width: s.width, height: s.height }; }
+      // /wda/screen needs no session; a session's window size fails once the app it was opened on is gone.
+      if (!view.size) { const s = (await wda.raw('GET', '/wda/screen')).screenSize; view.size = { device: 'wda', width: s.width, height: s.height }; }
       return view.size;
     },
     async capture() {

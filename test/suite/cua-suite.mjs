@@ -20,7 +20,7 @@ if (!url) { const entry = JSON.parse(await readFile(endpointFile, 'utf8')); url 
 const only = arg('task');
 
 const client = new Client({ name: 'cua-suite', version: '1' });
-await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: token ? { Authorization: `Bearer ${token}` } : {} } }));
+await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { 'x-poki-mcp-session': 'cua-suite', ...(token ? { Authorization: `Bearer ${token}` } : {}) } } }));
 const listed = (await client.listTools()).tools.map(t => t.name);
 if (!listed.includes('do') || !listed.includes('look')) { console.error(`This server does not list look and do (it lists ${listed.join(', ')}). Start it with POKI_TOOL_PROFILE=cua.`); process.exit(2); }
 
