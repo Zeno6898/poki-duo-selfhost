@@ -1,0 +1,42 @@
+# systemd unit for running Poki MCP from a checkout without Docker.
+#   sudo install -m 0644 deploy/poki-mcp.service /etc/systemd/system/
+#   sudo install -d -m 0700 -o poki /var/lib/poki
+#   sudo install -m 0600 -o root deploy/poki.env /etc/poki/poki.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now poki-mcp
+# Adjust User and WorkingDirectory to your checkout.
+[Unit]
+Description=Poki MCP daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=poki
+Group=poki
+WorkingDirectory=/opt/poki
+EnvironmentFile=/etc/poki/poki.env
+Environment=POKI_MCP_STATE_DIR=/var/lib/poki
+Environment=NODE_ENV=production
+# Optional stable local token as a systemd credential instead of an environment variable:
+#   LoadCredential=poki-mcp-token:/etc/poki/token
+#   Environment=POKI_MCP_TOKEN_FILE=%d/poki-mcp-token
+ExecStart=/usr/bin/node src/daemon.mjs
+Restart=on-failure
+RestartSec=5
+# Hardening. The daemon needs the network and its state directory, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/poki
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

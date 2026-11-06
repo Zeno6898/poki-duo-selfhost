@@ -1,0 +1,13 @@
+# BuildKit reads this file for deploy/Dockerfile. Keep secrets and device files out of the image.
+.git
+node_modules
+build
+.deps
+.runtime
+**/*.plist
+**/pairing*
+**/*.env
+.env
+.env.*
+*.log
+deploy/state
