@@ -28,6 +28,9 @@ const settleMs = 600, readbackMs = 5000, maxReadbackMs = 12000;
 const reportsScreen = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'swipe', 'drag', 'scroll', 'pinch', 'type_text', 'fill', 'press_key', 'press_button', 'go_back', 'handle_alert', 'system_gesture']);
 // These exist to act on a control, so the reply says when nothing was seen to change after one.
 const touchesControl = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'go_back', 'handle_alert']);
+// Touches aimed by coordinates. A run of them in a batch (selecting photos, paging a carousel) is
+// written for one screen, so the steps between them are not held back to read it.
+const geometricTouches = new Set(['tap', 'double_tap', 'long_press', 'swipe', 'drag', 'scroll', 'pinch']);
 const unchangedAdvice = 'The touch was sent, and no change was observed after it: accessibility reports the same elements, text, values, state (selected, enabled, focused) and positions. That is not proof it failed: its effect may be one accessibility does not report, such as a redrawn image or canvas, or may not have appeared yet. Nothing else was done. If a change was expected, check that the target is not covered or still loading before sending it again.';
 const onScreen = ({ width, height }) => element => {
   const box = element.frame ?? element;
@@ -258,11 +261,22 @@ export class Devices {
   // current orientation, so it keeps taking a fresh frame.
   async screenSize() {
     const target = await this.target();
-    return target.kind === 'simulator' && this.size?.device === target.id ? this.size : this.viewport();
+    // Inside a batch a phone keeps the size its first step measured; a rotate step clears it.
+    return (target.kind === 'simulator' || this.inBatch) && this.size?.device === target.id ? this.size : this.viewport();
   }
   // Reading the result back saves the caller a round trip to look. The action has already happened,
   // so a failed read only loses the report; a stop request still surfaces as a stop.
   readCost() { return this.readCosts.get(this.resolved?.id) ?? 0; }
+  // Within a batch, a read is as fresh as the time another would take to arrive.
+  reuseMs() { return Math.max(justReadMs, this.readCost()); }
+  // A batch compares a touch with the screen before it only when that can hold back a later step:
+  // with stop_on_error off nothing is held back, and a next step aimed by coordinates is written
+  // for the same screen. The batch still ends with one read of the screen.
+  checksStep() {
+    if (!this.inBatch) return true;
+    const { next, stopOnError } = this.batchStep ?? {};
+    return stopOnError !== false && !geometricTouches.has(next?.tool);
+  }
   observationBudget(target) {
     const cost = this.readCosts.get(target.id);
     if (target.kind === 'simulator' || cost === undefined) return readbackMs;
@@ -435,10 +449,10 @@ export class Devices {
         // Without await, the finally below restores the device state while the first step is still looking up its device.
         case 'batch_commands': return await runBatch(this, args);
         default: {
-          const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name);
+          const looks = reportsScreen.has(name) && !this.inBatch, touches = touchesControl.has(name) && this.checksStep();
           this.beforeInput = undefined;
           // A batch step may reuse the read its predecessor just took of the same screen.
-          const before = looks || touches ? await this.readBefore(this.inBatch ? justReadMs : 0) : undefined;
+          const before = looks || touches ? await this.readBefore(this.inBatch ? this.reuseMs() : 0) : undefined;
           let result = await interaction(this,name,args);
           if(result===undefined) throw new Error(`No implementation for ${name}`);
           const delivered = result.sent === true && !result.isError && !result.stopped;
