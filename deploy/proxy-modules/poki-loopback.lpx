@@ -1,0 +1,10 @@
+#!name=Poki Device Loopback
+#!desc=Reflects 10.7.0.1 back to this iPhone so Poki can reach the phone's own developer services (lockdown 62078, RemotePairing 49152).
+#!loon_version=3.5.3(1007)
+
+[General]
+ipv6-vif = off
+include-tun = 10.7.0.1/32
+
+[IP Rewrite]
+10.7.0.1 = reflect

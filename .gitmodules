@@ -1,0 +1,3 @@
+[submodule "native/ios-runner/WebDriverAgent"]
+	path = native/ios-runner/WebDriverAgent
+	url = https://github.com/appium/WebDriverAgent.git

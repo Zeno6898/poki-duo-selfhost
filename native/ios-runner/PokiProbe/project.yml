@@ -1,0 +1,34 @@
+# Poki Probe: a one-screen app that tests whether the phone can reach its own developer services
+# through 10.7.0.1, the loopback address the user's proxy app reflects (lockdown 62078 and
+# RemotePairing 49152 and a random port), and on its Wi-Fi address, loopback and link-local IPv6. Generated with
+# XcodeGen in the ios-runner workflow. It also measures how long a TCP connection held to
+# 10.7.0.1 survives in the background; there is no checked-in .xcodeproj.
+name: PokiProbe
+options:
+  bundleIdPrefix: nz.zheha.poki
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    DEBUG_INFORMATION_FORMAT: dwarf
+targets:
+  PokiProbe:
+    type: application
+    platform: iOS
+    sources: [PokiProbe]
+    info:
+      path: PokiProbe/Info.plist
+      properties:
+        CFBundleDisplayName: Poki Probe
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # Background modes for the hold experiment only (comparing against none); not for shipping.
+        UIBackgroundModes: [audio, location]
+        NSLocationWhenInUseUsageDescription: Poki Probe uses location only in its background experiment, to test whether the app keeps running while it is in the background.
+        NSLocalNetworkUsageDescription: Poki Probe connects to this phone's own network addresses to test whether it can reach its developer services.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nz.zheha.poki.probe

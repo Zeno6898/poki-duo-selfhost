@@ -26,6 +26,10 @@ Poki MCP's simulator helper is a local implementation using these protocol refer
 
 The optional `bin/setup-channels` command downloads the unmodified [BlueBubbles Server 1.9.12](https://github.com/BlueBubblesApp/bluebubbles-server/releases/tag/v1.9.12) release from BlueBubblesApp. BlueBubbles is licensed under Apache-2.0; its complete upstream license is retained in [docs/licenses/BlueBubbles-LICENSE](docs/licenses/BlueBubbles-LICENSE). Its packaged dependencies retain their respective notices. The installer pins the official release asset's SHA-256 digest and preserves the app bundle, including its third-party notices. The application archive is not stored in this repository.
 
+## Appium WebDriverAgent
+
+The on-phone runner is built from [appium/WebDriverAgent](https://github.com/appium/WebDriverAgent) v16.15.3 (commit `02cb92f0e93c8b021443bcbb8eeb80932c113220`), vendored as a git submodule at [native/ios-runner/WebDriverAgent](native/ios-runner/WebDriverAgent). WebDriverAgent is BSD-3-Clause licensed (Copyright (c) 2015-present, Facebook, Inc.); its complete license is in the submodule's [LICENSE](https://github.com/appium/WebDriverAgent/blob/02cb92f0e93c8b021443bcbb8eeb80932c113220/LICENSE) and is shipped unchanged with the source. Poki's build only adds branding (icon, display name, launch screen) to the built app; WebDriverAgent's code is not modified.
+
 ## JavaScript packages
 
 The exact installed versions come from `package-lock.json`. These packages provide the MCP server/client transports, image processing, input validation and property lists:
