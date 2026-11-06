@@ -112,8 +112,16 @@ jobs:
           pro = [x for x in phones if 'Pro' in x['name'] and 'Max' not in x['name']]
           print((pro or phones)[0]['udid'])" "$(xcrun --sdk iphonesimulator --show-sdk-version)")
           echo "UDID=$UDID" >> "$GITHUB_ENV"
-          # The keyboard's slide-to-type introduction is left on: it loops an animation over the keyboard
-          # the first time a field is typed in, the case accessibilityDeadline is set for (Runner.swift).
+          # A phone in use has long dismissed the keyboard's slide-to-type introduction. On a fresh
+          # simulator it loops an animation over the keyboard and WDA's tree reads time out while it
+          # shows (Poki stays answerable: accessibilityDeadline, the text-from-picture fallback), so it
+          # is set as shown before the first boot, as on a used phone.
+          prefs="$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Library/Preferences"
+          mkdir -p "$prefs"
+          for domain in com.apple.Preferences com.apple.keyboard.preferences; do
+            defaults write "$prefs/$domain" DidShowContinuousPathIntroduction -bool true
+            defaults write "$prefs/$domain" KeyboardContinuousPathEnabled -bool false
+          done
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl list devices | grep "$UDID"
