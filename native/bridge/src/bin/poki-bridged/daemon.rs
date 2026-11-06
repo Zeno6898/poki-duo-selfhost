@@ -44,7 +44,7 @@
 use super::*;
 use idevice::core_device::DisplayServiceClient;
 use serde_json::Map;
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, rc::Rc, time::Instant};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -112,7 +112,7 @@ fn idle_env(name: &str, default_ms: u64) -> Option<Duration> {
 
 async fn run(socket: PathBuf, target: Target) -> Result<()> {
     let listener = bind(&socket).await?;
-    let state = Arc::new(State::new(target));
+    let state = Rc::new(State::new(target));
     eprintln!("poki-bridged: ready (pid {})", std::process::id());
     let result = serve(listener, state.clone()).await;
     state.session.lock().await.reset().await;
@@ -165,7 +165,7 @@ fn executable_version() -> u64 {
         .unwrap_or_default()
 }
 
-async fn serve(listener: UnixListener, state: Arc<State>) -> Result<()> {
+async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let reaper = tokio::task::spawn_local(reap(state.clone()));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -186,7 +186,7 @@ async fn serve(listener: UnixListener, state: Arc<State>) -> Result<()> {
 }
 
 /// Closes the input services and ends the daemon after their idle times.
-async fn reap(state: Arc<State>) {
+async fn reap(state: Rc<State>) {
     let input_idle = idle_env("POKI_BRIDGED_INPUT_IDLE_MS", 60_000);
     let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 1_800_000);
     loop {
@@ -212,7 +212,7 @@ fn log(message: &str) {
 }
 
 /// One client. Its requests are answered in order; when it disconnects, a running op is cancelled.
-async fn connection(stream: UnixStream, state: Arc<State>) {
+async fn connection(stream: UnixStream, state: Rc<State>) {
     let (read, mut write) = stream.into_split();
     let (closed_tx, closed) = watch::channel(false);
     let (lines_tx, mut lines) =
@@ -272,6 +272,9 @@ struct Timings {
     reused_tunnel: bool,
     reused_input: bool,
     retried: bool,
+    /// How an ax_tree read was served by the held subscription.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ax: Option<crate::ax::watch::Served>,
 }
 
 fn ms(since: Instant) -> u64 {
@@ -334,6 +337,11 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                 pong["tunnel"] = session.link.is_some().into();
                 pong["input"] = session.input.is_some().into();
                 pong["ops"] = session.ops.into();
+                pong["ax"] = session
+                    .ax
+                    .as_ref()
+                    .map(|w| w.stats())
+                    .unwrap_or(Value::Null);
             }
             return Some(json!({"id": id, "ok": true, "pong": pong}));
         }
@@ -402,6 +410,8 @@ struct Session {
     target: Target,
     link: Option<Link>,
     input: Option<Input>,
+    /// The held accessibility subscription, inside the tunnel.
+    ax: Option<crate::ax::watch::Watch>,
     last_used: Instant,
     ops: u64,
 }
@@ -476,6 +486,7 @@ impl Session {
             target,
             link: None,
             input: None,
+            ax: None,
             last_used: Instant::now(),
             ops: 0,
         }
@@ -495,6 +506,7 @@ impl Session {
 
     async fn reset(&mut self) {
         self.close_input().await;
+        self.ax = None;
         self.link = None;
     }
 
@@ -512,6 +524,28 @@ impl Session {
 
     async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
         let request = parse(&object)?;
+        let changes = !reads_only(&request);
+        let result = Box::pin(self.run(request, object, timings)).await;
+        // Whatever it did, an op that may change the screen makes the held tree stale.
+        if changes && let Some(watch) = self.ax.as_mut() {
+            watch.invalidate();
+        }
+        result
+    }
+
+    async fn run(
+        &mut self,
+        request: Request,
+        object: Map<String, Value>,
+        timings: &mut Timings,
+    ) -> Result<Value> {
+        if let Request::AxTree {
+            include_offscreen: false,
+        } = request
+            && std::env::var("POKI_BRIDGED_AX_WATCH").as_deref() != Ok("0")
+        {
+            return Box::pin(self.watched_tree(timings)).await;
+        }
         if matches!(
             request,
             Request::InstallApp { .. } | Request::UninstallApp { .. }
@@ -526,7 +560,7 @@ impl Session {
             return Box::pin(execute(&self.target, request)).await;
         }
         if is_input(&request) {
-            return self.input_op(request, &object, timings).await;
+            return Box::pin(self.input_op(request, &object, timings)).await;
         }
         let retry = reads_only(&request) || matches!(request, Request::LaunchApp(_));
         let mut request = Some(request);
@@ -538,7 +572,7 @@ impl Session {
             };
             let launch = matches!(current, Request::LaunchApp(_));
             let result = match self.connect(timings).await {
-                Ok(()) => self.tunnel_op(current).await,
+                Ok(()) => Box::pin(self.tunnel_op(current)).await,
                 Err(error) => Err(error),
             };
             if result.is_ok() {
@@ -554,6 +588,56 @@ impl Session {
                 };
             }
             timings.retried = true;
+        }
+    }
+
+    /// An on-screen tree from the held subscription, opening it when there is none. When the
+    /// subscription fails, it is dropped and this read is made as poki-native makes it.
+    async fn watched_tree(&mut self, timings: &mut Timings) -> Result<Value> {
+        let mut attempt = 0;
+        loop {
+            let reused = self.link.is_some();
+            let result = async {
+                self.connect(timings).await?;
+                let device = &mut self.link.as_mut().expect("connected").device;
+                if self.ax.is_none() {
+                    let settings = crate::ax::watch::Settings::from_env();
+                    self.ax = Some(
+                        crate::ax::watch::Watch::open(&mut device.adapter, &device.rsd, settings)
+                            .await?,
+                    );
+                }
+                let (tree, served) = self
+                    .ax
+                    .as_mut()
+                    .expect("open")
+                    .read(Duration::from_secs(20))
+                    .await?;
+                timings.ax = Some(served);
+                Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(tree)
+            }
+            .await;
+            match result {
+                Ok(tree) => return Ok(tree),
+                Err(error) => {
+                    log(&format!(
+                        "held accessibility subscription failed ({error}); reading once without it"
+                    ));
+                    self.ax = None;
+                    if let Some(link) = self.link.as_mut()
+                        && let Ok(tree) =
+                            ax::read_tree(&mut link.device.adapter, &link.device.rsd, false).await
+                    {
+                        return Ok(tree);
+                    }
+                    self.reset().await;
+                    if !reused || attempt > 0 {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                    timings.retried = true;
+                }
+            }
         }
     }
 
@@ -688,7 +772,7 @@ impl Session {
             }
             request => request,
         };
-        let result = self.input_action(request).await;
+        let result = Box::pin(self.input_action(request)).await;
         if result.is_err() {
             self.reset().await;
         }
@@ -971,7 +1055,7 @@ mod daemon_tests {
             bind(&socket).await.err().map(|e| e.to_string()).as_deref(),
             Some(ALREADY_RUNNING)
         );
-        let state = Arc::new(State::new(target));
+        let state = Rc::new(State::new(target));
         let server = tokio::task::spawn_local(serve(listener, state.clone()));
         let mut client = BufReader::new(UnixStream::connect(&socket).await.unwrap());
 

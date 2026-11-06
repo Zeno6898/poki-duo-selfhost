@@ -14,9 +14,14 @@
 // main.rs. They are the same aliases and the same module source.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Touch = idevice::core_device::hid::UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>;
-#[allow(clippy::duplicate_mod)]
-#[path = "../../ax.rs"]
-mod ax;
+// The same source again, with a child that holds a subscription open (see ax_watch.rs).
+#[path = "."]
+mod ax {
+    include!("../../ax.rs");
+
+    #[path = "ax_watch.rs"]
+    pub mod watch;
+}
 
 #[path = "../.."]
 mod src {
