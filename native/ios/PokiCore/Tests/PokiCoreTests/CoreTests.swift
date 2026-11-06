@@ -269,3 +269,17 @@ final class RelayTests: XCTestCase {
         core.stop()
     }
 }
+
+final class EventTests: XCTestCase {
+    func testAFinishedCallCarriesTheAppAndAThumbnail() async {
+        let (core, _, _) = makeCore()
+        let events = LockedBox<[CoreEvent]>([])
+        Task { for await e in core.events { events.update { $0.append(e) } } }
+        _ = await core.call("look", [:])
+        let finished = await eventually { events.value.contains { if case .toolFinished = $0 { return true }; return false } }
+        XCTAssertTrue(finished)
+        guard case .toolFinished(_, .done, let facts)? = events.value.last else { return XCTFail("\(events.value)") }
+        XCTAssertEqual(facts.app, "Settings")
+        XCTAssertNotNil(facts.thumbnail)
+    }
+}

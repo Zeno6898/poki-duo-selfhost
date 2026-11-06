@@ -78,10 +78,17 @@ public enum ToolOutcome: Sendable, Equatable {
     case failed(String)
 }
 
+/// What the Live Activity shows after a call: the app in front and a small JPEG of the screen
+/// (about 96 pixels wide, a few kB; store it in the app group, since ActivityKit's state is 4 kB).
+public struct ToolFacts: Sendable, Equatable {
+    public var app: String?
+    public var thumbnail: Data?
+}
+
 public enum CoreEvent: Sendable, Equatable {
     case relay(RelayState)
     case toolStarted(ToolActivity)
-    case toolFinished(ToolActivity, ToolOutcome)
+    case toolFinished(ToolActivity, ToolOutcome, ToolFacts)
     case approvalRequested(Approval)
     case approvalEnded(id: String, approved: Bool?)
 }
@@ -266,7 +273,8 @@ public final class PokiCore: @unchecked Sendable {
         gate.current = nil
         gate.leave()
         let line = output.text.split(separator: "\n").first.map(String.init) ?? ""
-        emit(.toolFinished(activity, output.isError ? .failed(line) : .done(line)))
+        let thumbnail = computer.lastPNG.flatMap { try? host?.jpeg(fromPNG: $0, width: 96, quality: 0.5) }
+        emit(.toolFinished(activity, output.isError ? .failed(line) : .done(line), ToolFacts(app: computer.lastForeground?.describe, thumbnail: thumbnail)))
         return output
     }
 

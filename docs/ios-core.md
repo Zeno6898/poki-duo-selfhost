@@ -20,7 +20,7 @@ Three interfaces, each owned by one side:
 | 3. PokiLauncher C ABI | PokiLauncher; used by PokiCore and dev/ios-app |
 | 4. What the launcher needs from the loopback | dev/ios-app's packet tunnel, or the user's proxy module |
 
-Version: 1. Every change to a section below bumps its version and is announced to the other threads.
+Version: 1.1 (2026-11-06: on-device pairing in §3, ToolFacts on toolFinished in §2, tunnel facts in §4, keep-alive). Every change to a section below bumps its version and is announced to the other threads.
 
 ## 1. Relay frames, v1
 
@@ -136,11 +136,15 @@ public final class PokiCore: Sendable {
 public enum CoreEvent: Sendable {
     case relay(RelayState)                    // connecting, ready, offline(reason)
     case toolStarted(ToolActivity)            // name, summary ("tap 'Send'"), started
-    case toolFinished(ToolActivity, ToolOutcome)
+    case toolFinished(ToolActivity, ToolOutcome, ToolFacts)   // ToolFacts: app name, ~96 px JPEG thumbnail
     case approvalRequested(Approval)          // id, app, summary, expires
     case approvalEnded(id: String, approved: Bool?)  // nil: expired
 }
 ```
+
+`ToolFacts.thumbnail` is a JPEG about 96 pixels wide (a few kB). ActivityKit's content state is
+limited to 4 kB, so the app writes the thumbnail to its app group and the Live Activity reads it from
+there.
 
 The app shell maps `events` to the Live Activity and resolves approvals from the Live Activity's
 buttons (App Intents). PokiCore never touches the screen for an approval: while one is pending, every
@@ -212,6 +216,27 @@ void poki_string_free(char *s);
 void poki_launcher_free(PokiLauncher *launcher);
 ```
 
+On-device pairing (iOS 27, like StikPair). Poki plays the "pairable host":
+
+```c
+typedef struct PokiPairing PokiPairing;
+// config_json: {"host_name": "Poki", "out_path": "<app container>/pairing.plist", "identity_path": "<app container>/pairing-host.key"}
+PokiPairing *poki_pair_start(const char *config_json, poki_launcher_event_cb cb, void *context);
+void poki_pair_cancel(PokiPairing *pairing);   // stops it if running, and frees it
+```
+
+Events, in order:
+- `{"event":"advertise","service_type":"_remotepairing-pairable-host._tcp","instance":"<id>","port":n,"txt":{"name","identifier","authTag","model","flags","ver","minVer"}}`.
+  The launcher listens on that TCP port; the app publishes the service with Bonjour (NetService or
+  NWListener's service, with `instance` as the name and the TXT record). It needs
+  `NSBonjourServices` = `_remotepairing-pairable-host._tcp` and `NSLocalNetworkUsageDescription`.
+- `{"event":"pin","pin":"123456"}`: show it (Live Activity). The person types it on the phone.
+- `{"event":"paired","path":"…"}`: the RPPairing file is saved; give it to `poki_launcher_new` as
+  `pairing_file`.
+- `{"event":"failed","detail":"…"}`.
+`identity_path` keeps the host's 16-byte identity, so the phone recognizes Poki next time. One
+pairing per call.
+
 Events (and `status`) are JSON:
 `{"state":"…","detail":"…","attempt":n,"since_ms":…,"ios":"26.1","pairing":"remote|lockdown"}`, with
 state one of `idle`, `connecting`, `pairing`, `tunnel`, `mounting_ddi`, `launching`, `running`,
@@ -221,7 +246,7 @@ loopback in Shadowrocket: Settings → Other → Include route 10.7.0.1/32").
 What it does:
 
 1. Connects to `device_address`: RemotePairing on 49152 (RPPairing file), or lockdown on 62078
-   (lockdown pairing plist) and then CoreDeviceProxy. The pairing file decides; `auto` tries both.
+   (lockdown pairing plist) and then CoreDeviceProxy. The pairing file decides which.
 2. Opens the CDTunnel in-process (userspace TCP/IP), then RSD.
 3. Mounts the personalized DDI from `ddi_dir` if it is not mounted (needs internet once per boot for
    Apple's TSS signature).
@@ -231,7 +256,9 @@ What it does:
 
 The launcher's process must stay alive for the runner to stay alive (the runner dies 23 to 32 s after
 the session's connections close). Keeping the app alive in the background is the app shell's job
-(background audio session plus the Live Activity); see `docs/single-bundle.md` for one IPA vs two.
+(a silent `AVAudioEngine` with `mixWithOthers`, plus the Live Activity); see `docs/single-bundle.md`
+for one IPA vs two. The supervisor runs on its own thread with a single-threaded runtime;
+callbacks arrive on that thread.
 
 ## 4. What the launcher needs from the loopback
 
@@ -240,7 +267,8 @@ destination swapped. The phone needs nothing else from it: no UDP, no IPv6, no D
 no other addresses. The ports used are 49152 or 62078, plus one dynamic tunnel port per session that
 the phone picks.
 
-- The built-in packet tunnel (dev/ios-app): includedRoutes 10.7.0.1/32 only, IPv4, reflect every
-  packet to 10.7.0.1 back with source and destination swapped; no DNS settings; MTU 1500.
+- The built-in packet tunnel (dev/ios-app): interface address 10.7.0.2/24, includedRoutes 10.7.0.1/32
+  only, IPv4 only, no DNS settings, no IPv6, MTU 1500. Every packet to 10.7.0.1 goes back with source
+  and destination swapped.
 - Surge / Loon: `10.7.0.1 = reflect` with the route included and IPv6 VIF off. sing-box:
   `loopback_address: ["10.7.0.1"]`. Shadowrocket: "Include route 10.7.0.1/32".

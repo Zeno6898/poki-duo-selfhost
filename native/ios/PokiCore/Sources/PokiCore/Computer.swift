@@ -29,6 +29,7 @@ final class Computer: @unchecked Sendable {
     var lastElements: [Element] = []
     var lastForeground: Foreground?
     var size: ScreenSize?
+    var lastPNG: Data?
 
     static let settle: [String: Double] = ["tap": 0.45, "type": 0.25, "key": 0.3, "swipe": 0.6, "drag": 0.6, "long_press": 0.4, "pinch": 0.6, "button": 0.7, "launch": 0.9, "scroll_to": 0.2, "wait": 0]
     static let imageWidth = 300
@@ -66,6 +67,7 @@ final class Computer: @unchecked Sendable {
             return ToolResult(text: lines.joined(separator: "\n"), jpeg: nil, isError: true)
         }
         lastForeground = reading.foreground ?? lastForeground
+        lastPNG = reading.png ?? lastPNG
         // Numbers refer to this read only.
         refs = [:]
         var keysNow = Set<String>()
