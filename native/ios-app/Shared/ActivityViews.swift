@@ -290,7 +290,8 @@ struct Meta: View {
     }
 }
 
-/// A running clock. Text(timerInterval:) takes all the width it is offered, so it gets a fixed frame.
+/// A running clock. Text(timerInterval:) is sized for its longest value and shows dashes when its
+/// frame is narrower, so the frame fits h:mm:ss.
 struct ElapsedMeta: View {
     var since: Date
     var body: some View {
@@ -298,7 +299,7 @@ struct ElapsedMeta: View {
             Image(systemName: "timer").font(.system(size: 10, weight: .semibold))
             Text(timerInterval: since...since.addingTimeInterval(12 * 3600), countsDown: false)
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
-                .frame(width: 40, alignment: .leading)
+                .frame(width: 58, alignment: .leading)
         }
         .foregroundStyle(.white.opacity(0.6))
         .lineLimit(1)
@@ -403,7 +404,7 @@ struct Countdown: View {
             Image(systemName: "clock.fill").font(.system(size: 10, weight: .bold))
             Text(timerInterval: Countdown.range(until), countsDown: true)
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                .frame(width: 34, alignment: .leading)
+                .frame(width: 44, alignment: .leading)
         }
         .foregroundStyle(Brand.approval)
         .padding(.horizontal, 8).frame(height: 22)

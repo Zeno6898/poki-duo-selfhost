@@ -33,7 +33,10 @@ struct ActivityPreview: View {
         .navigationTitle("Live Activity")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            if let demo, let state = Self.samples.first(where: { $0.0 == demo })?.1 { await DemoActivity.run(state) }
+            if let demo, let state = Self.samples.first(where: { $0.0 == demo })?.1 {
+                // Detached: going to the background must not cancel the demo's wait for its alert.
+                Task.detached { await DemoActivity.run(state) }
+            }
         }
     }
 
@@ -197,8 +200,12 @@ enum DemoActivity {
             AppLog.shared.add("activity", "demo did not start")
             return
         }
-        try? await Task.sleep(for: .seconds(5))
-        await activity.update(.init(state: state, staleDate: nil, relevanceScore: 100),
-                              alertConfiguration: AlertConfiguration(title: "Poki", body: "\(state.headline)", sound: .default))
+        // Two alerts: one while another app is in front (the island expands), one on the Lock Screen.
+        for wait in [5.0, 6.0] {
+            try? await Task.sleep(for: .seconds(wait))
+            await activity.update(.init(state: state, staleDate: nil, relevanceScore: 100),
+                                  alertConfiguration: AlertConfiguration(title: "Poki", body: "\(state.headline)", sound: .default))
+            AppLog.shared.add("activity", "demo alert sent")
+        }
     }
 }
