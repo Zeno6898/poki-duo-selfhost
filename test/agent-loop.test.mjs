@@ -188,18 +188,20 @@ test('refs name elements of one frame, and an earlier screen\'s ref is refused w
   assert.ok(answer.now.elements.some(e => e.label === 'Entries'), 'the current refs come with the refusal');
 });
 
-test('with frames that cannot be shown to be newer than the input, the outcome is unverified', { timeout: 30000 }, async () => {
-  // A live source that numbers its frames: after the input, nothing newer than it arrived.
-  const picture = async (phone, observation) => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(Date.now() - 2000).toISOString(), settled: true, quietMs: 2000, observation });
-  let observation = 'no_input';
-  const live = phone => ({ latestFrame: () => picture(phone, observation), waitSettled: () => picture(phone, observation), op: async () => { throw new Error('no OCR'); } });
+test('a picture from before the input never yields a verdict, whatever the bridge says with it', { timeout: 30000 }, async () => {
+  // Every picture is two seconds old, and no screenshot can be had: nothing newer than the input exists.
+  let extra = { observation: 'no_input' }, fresh = false;
+  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(Date.now() - (fresh ? 0 : 2000)).toISOString(), settled: true, quietMs: 2000, ...extra });
+  const live = phone => ({ latestFrame: ({ source } = {}) => source === 'screenshot' && !fresh ? Promise.reject(new Error('no screenshot service')) : picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); } });
   const phone = new LedgerPhone({ live });
   await phone.call('observe', {});
-  observation = 'unverified';
-  const result = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } }));
-  assert.equal(result.now.outcome, 'unverified');
-  assert.match(result.now.reason, /no frame newer than the input/);
-  observation = 'after_input';
+  for (extra of [{ observation: 'unverified' }, { observation: 'after_input', changedSinceInput: false }, { observation: 'after_input', changedSinceInput: true }]) {
+    const result = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, timeout_ms: 1500 }));
+    assert.equal(result.now.outcome, 'unverified', JSON.stringify(extra));
+    assert.equal(result.now.reason, 'no picture newer than the input');
+    assert.ok(Date.parse(result.now.frame.captured_at) < Date.parse(result.now.frame.action_sent_at));
+  }
+  fresh = true; extra = { observation: 'after_input' };
   const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } }, expect: { foreground: 'local.ledger' } }));
   assert.equal(opened.now.outcome, 'as_expected');
 });
@@ -340,17 +342,22 @@ test('a step returns at its deadline with what the World has, and a dead accessi
   assert.equal(late.sent, true);
 });
 
-test('the bridge\'s activity verdict: settled with nothing moving after the input is unchanged, with no newer picture', { timeout: 30000 }, async () => {
-  let answer = { observation: 'no_input' };
-  const picture = async phone => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(Date.now() - 3000).toISOString(), settled: true, ...answer });
-  const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); } });
+test('when the video brings nothing newer than the input, one screenshot decides the verdict before the deadline', { timeout: 30000 }, async () => {
+  // A broken video: its newest picture is ten seconds old. The screenshot service still works.
+  let shots = 0;
+  const picture = async (phone, at) => ({ jpeg: await sharp(await phone.app.render()).jpeg().toBuffer(), capturedAt: new Date(at).toISOString(), settled: true, observation: 'unverified' });
+  const live = phone => ({ latestFrame: ({ source } = {}) => source === 'screenshot' ? (shots++, picture(phone, Date.now())) : picture(phone, Date.now() - 10000), waitSettled: () => picture(phone, Date.now() - 10000), op: async () => { throw new Error('no OCR'); } });
   const phone = new LedgerPhone({ live });
   await phone.call('observe', {});
-  answer = { observation: 'unverified', changedSinceInput: false };
-  assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } })).now.outcome, 'unchanged');
-  // Without that verdict, the same old picture proves nothing.
-  answer = { observation: 'unverified', changedSinceInput: null };
-  assert.equal(body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } } })).now.outcome, 'unverified');
+  const started = performance.now();
+  const blank = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 150, y: 300 } }, timeout_ms: 2000 }));
+  assert.equal(blank.now.outcome, 'unchanged', JSON.stringify(blank.now));
+  assert.ok(Date.parse(blank.now.frame.captured_at) >= Date.parse(blank.now.frame.action_sent_at));
+  assert.ok(performance.now() - started < 3000, `${Math.round(performance.now() - started)} ms`);
+  assert.equal(shots, 1);
+  const opened = body(await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } }, expect: { text: 'Entries' }, timeout_ms: 2000 }));
+  assert.equal(opened.now.outcome, 'as_expected');
+  assert.equal(shots, 2);
 });
 
 test('a screenshot taken in place of a stalled video is a current picture, and names the app without a tree', async () => {

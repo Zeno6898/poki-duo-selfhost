@@ -20,7 +20,9 @@ const coordinateTouches = new Set(['tap', 'double_tap', 'long_press']);
 // caller allowed it. This is a generic pattern over the target's label, not a list of apps.
 export const destructive = /\b(delete|remove|erase|send|pay|purchase|buy|confirm|sign out|log out|reset|discard)\b/i;
 // A wait after an input is cut into slices, so an expectation is checked while a screen keeps moving.
-const sliceMs = 800, lookMs = 3000;
+const sliceMs = 800, lookMs = 3000, shotMs = 1200;
+// Whether a frame was taken after the input was sent (a capture counts from when it started).
+const newerThan = (frame, sentMs) => Boolean(frame) && (frame.startedMs ?? frame.capturedMs) >= sentMs;
 // Whether the call itself was stopped (its deadline or a cancel), as opposed to one read failing.
 const cancelled = () => { try { checkWork(); return false; } catch { return true; } };
 const stepTimeoutMs = 3000, maxTimeoutMs = 30000, runKeptMs = 10 * 60 * 1000, lineLimit = 40, treeWaitMs = 400;
@@ -113,30 +115,39 @@ const treeKey = view => view.tree === 'current' ? JSON.stringify(view.lines) : u
 async function baseOf(world) {
   const frame = world.lastFrame && world.lastFrame.epoch === world.epoch ? world.lastFrame : await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current();
   const tree = world.tree?.epoch === frame.epoch ? world.tree : undefined;
-  return { frame, elements: tree?.elements, foreground: tree?.foreground?.pid ?? null, key: tree ? JSON.stringify(world.view(frame, { elements: tree.elements, foreground: tree.foreground }).lines) : undefined, page: tree ? world.view(frame, { elements: tree.elements, foreground: tree.foreground }).page?.id : undefined };
+  return { frame, elements: tree?.elements, foreground: tree?.foreground?.pid ?? frame.foreground?.pid ?? null, key: tree ? JSON.stringify(world.view(frame, { elements: tree.elements, foreground: tree.foreground }).lines) : undefined, page: tree ? world.view(frame, { elements: tree.elements, foreground: tree.foreground }).page?.id : undefined };
 }
 
 // Waits for the screen after an input: until the expectation holds on a settled frame, the screen
 // settles without it, a system prompt is up, or time runs out. Without an expectation, until the
 // first settled frame.
-async function judge(world, base, { expect, timeoutMs }) {
+async function judge(world, base, { expect, timeoutMs, sentMs }) {
   // A hard deadline: every settle, picture, tree and OCR read races it, and the answer at the end is
   // whatever the World has then.
   const until = performance.now() + timeoutMs, left = () => until - performance.now();
-  let previous, frame, view;
+  let previous, frame, view, shot = false;
   for (;;) {
     checkWork();
-    const settled = await within(left(), () => world.settle(Math.max(150, Math.min(left(), sliceMs))), undefined);
+    // Until a picture newer than the input arrives, the wait leaves room for one screenshot at the end.
+    const reserve = sentMs && !newerThan(frame, sentMs) ? shotMs : 0;
+    const settled = await within(left() - reserve, () => world.settle(Math.max(150, Math.min(left() - reserve, sliceMs))), undefined);
     frame = settled ?? frame;
     // Never a picture older than the newest: a screen that does not settle is shown as it is now.
-    if (!settled?.settled) frame = await within(Math.max(300, left()), () => world.current(), frame) ?? frame ?? world.lastFrame ?? base.frame;
+    if (!settled?.settled) frame = await within(Math.max(300, left() - reserve), () => world.current(), frame) ?? frame ?? world.lastFrame ?? base.frame;
+    // No newer picture by now (a still screen sends none, a broken video none at all): take one.
+    if (sentMs && !newerThan(frame, sentMs) && left() <= shotMs && !shot) {
+      shot = true;
+      frame = await within(Math.max(left(), shotMs), () => world.screenshot(), undefined) ?? frame;
+    }
     view = await within(Math.max(300, left()), () => world.read(frame, { waitMs: world.live ? treeWaitMs : left(), budgetMs: Math.max(300, left()) }), undefined)
       ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
     const met = holds(expect, view, base);
     // A screen that keeps animating (a spinner, a clock) never settles; its text holding still across
     // two reads of a tree current for each frame is as good a sign that it has arrived.
     const textStill = Boolean(previous) && view.tree === 'current' && previous.view.tree === 'current' && JSON.stringify(view.lines) === JSON.stringify(previous.view.lines);
-    const still = frame.settled || textStill;
+    // Nothing is decided on a picture from before the input: the wait goes on to the screenshot.
+    const fresh = !sentMs || newerThan(frame, sentMs);
+    const still = fresh && (frame.settled || textStill);
     if (met && still) return { expectation: 'met', frame, view };
     if (view.prompt) return { expectation: expect ? 'blocked' : undefined, frame, view };
     if (!expect && still) return { frame, view };
@@ -144,22 +155,23 @@ async function judge(world, base, { expect, timeoutMs }) {
     // spinner, a page sliding in), so it is believed when it settles twice on the same picture.
     const moved = compare(base.frame.thumb, frame.thumb)?.changed;
     // Only a tree read for this frame can say what is missing: a lagging one is waited out.
-    if (expect && view.tree === 'current' && (frame.settled && (!moved || previous?.frame.settled && world.same(previous.frame, frame)) || textStill)) return { expectation: 'missed', frame, view };
-    if (left() <= 0) return { expectation: expect ? (met ? 'met' : 'timeout') : undefined, frame, view };
+    if (expect && fresh && view.tree === 'current' && (frame.settled && (!moved || previous?.frame.settled && world.same(previous.frame, frame)) || textStill)) return { expectation: 'missed', frame, view };
+    if (left() <= 0 || shot) return { expectation: expect ? (met ? 'met' : 'timeout') : undefined, frame, view };
     previous = { frame, view };
   }
 }
 
 // One verdict on the last input, from pixels, then the app in front, then the tree.
-function outcomeOf(judged, base, inputSent) {
+function outcomeOf(judged, base, inputSent, sentMs) {
   const { frame, view } = judged;
+  // A picture from before the input says nothing about its effect, whatever else is reported with it.
+  if (inputSent && sentMs && !newerThan(frame, sentMs)) return { outcome: 'unverified', reason: 'no picture newer than the input' };
   if (judged.expectation === 'met') return { outcome: 'as_expected' };
   if (!inputSent) return { outcome: 'unchanged', reason: 'no input was sent' };
   if (!frame.proven) return { outcome: 'unverified', reason: 'no frame newer than the input arrived: the screen may not have changed, or the picture may be the one the input was sent to' };
-  // The bridge's own verdict from the video's activity: nothing moved after the input.
-  const quiet = frame.settled && frame.changedSinceInput === false;
-  const moved = !quiet && compare(base.frame.thumb, frame.thumb)?.changed;
-  const app = view.tree === 'current' && base.foreground !== null && (view.foreground?.pid ?? null) !== base.foreground;
+  const moved = compare(base.frame.thumb, frame.thumb)?.changed;
+  // Another process in front is a change, from a tree or from the app named with the picture.
+  const app = view.foregroundFresh && base.foreground !== null && (view.foreground?.pid ?? null) !== base.foreground;
   const tree = base.key !== undefined && treeKey(view) !== undefined && treeKey(view) !== base.key;
   if (!frame.settled) return { outcome: 'unknown', reason: `the screen was still changing when time ran out${moved ? ' (it did change after the input)' : ''}` };
   if (moved || app || tree) return { outcome: 'changed' };
@@ -167,10 +179,12 @@ function outcomeOf(judged, base, inputSent) {
 }
 
 // The `now` block, the last thing in every result: what is on the screen, read for one frame.
-async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = false, refsInvalid = false, typed, stop }) {
+async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = false, refsInvalid = false, typed, stop, held }) {
   const agent = state(ctx), { frame, view } = judged;
-  // A stalled video or a lost connection comes first: everything below it is read in that light.
-  const condition = await world.condition(frame);
+  // A stalled video or a lost connection comes first: everything below it is read in that light. What
+  // held an input back is reported as it was then, even if it has cleared since.
+  let condition = await world.condition(frame);
+  if (held) condition = { ...condition, lost: held };
   if (condition?.stalled) verdict = { ...verdict, outcome: 'unverified', reason: 'the screen video is stalled, so no picture after the input exists' };
   const since = world.sinceLastLook(agent, view);
   const lines = view.lines.slice(0, lineLimit);
@@ -190,7 +204,7 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
     text: { of: condition?.stalled ? new Date().toISOString() : new Date(frame.capturedMs).toISOString(), source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
     ...(view.tree === 'pending' ? { tree: 'pending' } : {}),
     ...(full || refsInvalid ? { elements } : {}),
-    ...(condition?.lost ? { blocked: { kind: condition.lost.kind ?? 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, text: lines.slice(0, 6) } } : {}),
+    ...(condition?.lost ? { blocked: { kind: condition.lost.kind ?? 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, reason: 'system_prompt', text: lines.length ? lines.slice(0, 6) : [`A system prompt (${view.prompt.kind}) is on screen.`] } } : {}),
     ...(typed ? { typed } : {}),
   };
 }
@@ -275,12 +289,14 @@ async function step(ctx, world, agent, item, { timeoutMs }) {
   // A launch that returned a pid reached the device even when its app did not come to the front, and
   // one whose outcome is unknown may have: neither is reported as not sent.
   const delivered = appTools.has(item.tool) && (!answer.isError || Number.isSafeInteger(answer.pid) || answer.outcome === 'unknown');
-  if (delivered && !(world.lastInput?.sentMs >= started)) world.noteInput(item.tool);
+  // Pictures count from when the launch was asked for: the app may have opened before it answered.
+  if (delivered && !(world.lastInput?.sentMs >= started)) world.noteInput(item.tool, started);
   const sent = answer.sent === true || delivered || world.lastInput?.sentMs >= started;
   // The app service started the app, yet it is not in front: on a phone that is mostly a lock screen.
   if (item.tool === 'launch_app' && answer.isError && Number.isSafeInteger(answer.pid)) answer.message = `${String(answer.error ?? 'The launched app did not come to the front').replace(/\.$/, '')}, although the app service launched it as pid ${answer.pid}. If the phone is locked or its screen is off, unlock it.`;
-  const judged = await judge(world, base, { expect: item.expect, timeoutMs });
-  return { base, judged, sent, answer, expect: item.expect, sentMs: sent ? world.lastInput?.sentMs : undefined };
+  const sentMs = sent ? world.lastInput?.sentMs : undefined;
+  const judged = await judge(world, base, { expect: item.expect, timeoutMs, sentMs });
+  return { base, judged, sent, answer, expect: item.expect, sentMs };
 }
 
 export async function observe(ctx, args = {}) {
@@ -296,8 +312,8 @@ export async function act(ctx, args) {
   const timeoutMs = Math.min(args.timeout_ms ?? stepTimeoutMs, maxTimeoutMs);
   const lost = await heldBack(world);
   if (lost) {
-    const frame = await world.current(), view = await world.read(frame, { waitMs: treeWaitMs });
-    return { isError: true, ...await reply(ctx, world, { sent: false, expectation: args.expect ? 'blocked' : undefined, now: await nowBlock(ctx, world, { frame, view }, {}) }, frame) };
+    const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(), view = await world.read(frame, { waitMs: treeWaitMs, budgetMs: lookMs });
+    return { isError: true, ...await reply(ctx, world, { sent: false, expectation: args.expect ? 'blocked' : undefined, blocked: lost, now: await nowBlock(ctx, world, { frame, view }, { held: lost }) }, frame) };
   }
   let done;
   try { done = await step(ctx, world, agent, { ...args.action, expect: args.expect }, { timeoutMs }); }
@@ -309,7 +325,7 @@ export async function act(ctx, args) {
     return { isError: true, ...await reply(ctx, world, { sent: false, error: error.message, now }, frame) };
   }
   const { base, judged, sent, answer, sentMs } = done;
-  const verdict = { ...outcomeOf(judged, base, sent), expectation: judged.expectation, expected: args.expect ? describeExpect(args.expect) : undefined };
+  const verdict = { ...outcomeOf(judged, base, sent, sentMs), expectation: judged.expectation, expected: args.expect ? describeExpect(args.expect) : undefined };
   const now = await nowBlock(ctx, world, judged, { base, sentMs, verdict, full: args.full, typed: typedOf(answer) });
   const body = {
     sent, ...(args.expect ? { expectation: judged.expectation } : {}), waited_ms: sentMs ? Math.max(0, Date.now() - sentMs) : 0,
@@ -335,12 +351,12 @@ export async function run(ctx, args) {
   }
   saved.at = Date.now();
   agent.runs.set(saved.id, saved);
-  let last, stoppedAt = null, typed;
+  let last, stoppedAt = null, typed, held;
   for (; saved.next < saved.steps.length; saved.next++) {
     const index = saved.next, item = saved.steps[index];
     if (!stepTools.includes(item.tool)) { stoppedAt = { step: index + 1, tool: item.tool, reason: 'error', detail: `${item.tool} is not a run step. Steps: ${stepTools.join(', ')}.` }; break; }
     const lost = await heldBack(world);
-    if (lost) { stoppedAt = { step: index + 1, tool: item.tool, reason: 'blocked', detail: `${lost.text} Step ${index + 1} was not sent.` }; break; }
+    if (lost) { held = lost; stoppedAt = { step: index + 1, tool: item.tool, reason: 'blocked', detail: `${lost.text} Step ${index + 1} was not sent.` }; break; }
     // The destructive check reads the label the step will touch, on the screen it will touch it on.
     const current = world.tree?.epoch === world.epoch && world.lastFrame ? world.view(world.lastFrame, { elements: world.tree.elements, foreground: world.tree.foreground }) : undefined;
     const target = targetOf(item, current, agent);
@@ -375,8 +391,8 @@ export async function run(ctx, args) {
   if (finished) agent.runs.delete(saved.id);
   // The last step's frame, or the screen now when the run stopped before sending anything.
   const judged = last?.judged ?? await (async () => { const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(); return { frame, view: await world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs }) }; })();
-  const verdict = last ? { ...outcomeOf(judged, last.base, last.sent), expectation: judged.expectation, expected: last.expect ? describeExpect(last.expect) : undefined } : undefined;
-  const now = await nowBlock(ctx, world, judged, { base: last?.base, sentMs: last?.sentMs, verdict, full: args.full, typed, stop: stoppedAt?.reason === 'checkpoint' ? stoppedAt : undefined });
+  const verdict = last ? { ...outcomeOf(judged, last.base, last.sent, last.sentMs), expectation: judged.expectation, expected: last.expect ? describeExpect(last.expect) : undefined } : undefined;
+  const now = await nowBlock(ctx, world, judged, { base: last?.base, sentMs: last?.sentMs, verdict, full: args.full, typed, held, stop: stoppedAt?.reason === 'checkpoint' ? stoppedAt : undefined });
   const body = { run_id: saved.id, completed_steps: stoppedAt ? stoppedAt.step - 1 : saved.steps.length, stopped: stoppedAt, now };
   return { ...(stoppedAt && stoppedAt.reason !== 'checkpoint' ? { isError: true } : {}), ...await reply(ctx, world, body, judged.frame, args.full) };
 }
