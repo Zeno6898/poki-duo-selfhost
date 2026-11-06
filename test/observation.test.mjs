@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fixture, value } from './fixture.mjs';
 
 // A phone over a network tunnel takes seconds per accessibility read; the fixture's delay stands in for it.
@@ -61,4 +63,15 @@ test('a gated tool says who approved it, and the status names the tools approval
  assert.notEqual(opened.isError,true,JSON.stringify(opened));
  assert.deepEqual(value(opened).approval,{mode:'operator-preapproved',approved_by:'operator'});
  assert.equal(value(await f.call('tap',{x:10,y:10})).approval,undefined);
+});
+
+test('a server without the OCR helper says so in status and in a failed text fallback', { timeout: 30000 }, async t => {
+ const f=await fixture(t,{beforeStart:dir=>rm(join(dir,'build/ocr'))});
+ const status=value(await f.call('poki_mcp_status'));
+ assert.equal(status.ocr.available,false);assert.match(status.ocr.path,/build\/ocr$/);
+ await f.set({axEmpty:true});
+ const listed=await f.call('list_elements');
+ assert.equal(listed.isError,true);
+ assert.match(listed.content[0].text,/Accessibility returned nothing.*Text recognition is not installed.*bin\/build-ocr-linux/s);
+ assert.doesNotMatch(listed.content[0].text,/ENOENT/);
 });

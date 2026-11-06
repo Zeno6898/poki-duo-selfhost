@@ -13,7 +13,7 @@ import { interaction, promptWarning, readScreen, describeScreen, screenChanged, 
 import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
-import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
+import { version, buildInfo, requireCurrentCode, ocrStatus, ocrMissing, ocrPath } from './build-info.mjs';
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
@@ -214,10 +214,11 @@ export class Devices {
     return frame.ocr ??= phase('ocr', () => this.readOCR(frame));
   }
   async readOCR(frame) {
+    if (!(await ocrStatus()).available) throw new Error(ocrMissing);
     const file = join(stateDir, 'frames', `${randomUUID()}-ocr.png`);
     try {
       await writeFile(file, frame.data, { mode: 0o600 });
-      const { stdout } = await this.run(join(root, 'build/ocr'), [file]);
+      const { stdout } = await this.run(ocrPath, [file]);
       return JSON.parse(stdout).map(e => ({ ...e, label: e.text, type: 'StaticText', frame: { x:e.x,y:e.y,width:e.width,height:e.height } }));
     } finally { await unlink(file).catch(() => {}); }
   }
@@ -233,7 +234,8 @@ export class Devices {
       } catch (error) { if (stopped(error)) throw error; nativeError = error.message; if (args.source === 'accessibility' || args.source === 'ax') throw error; }
     }
     if (!elements) {
-      elements = await this.ocr(frame);
+      try { elements = await this.ocr(frame); }
+      catch (error) { if (stopped(error) || !nativeError) throw error; throw new Error(`Accessibility returned nothing (${nativeError}), and the text fallback failed: ${error.message}`); }
       source = 'ocr';
     }
     if (!args.include_offscreen) elements = elements.filter(onScreen(frame));
@@ -375,7 +377,7 @@ export class Devices {
       }
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
-        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
+        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), ocr: await ocrStatus(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });
         case 'list_devices': return text({ devices: await this.describeDevices(args.include_all_simulators), ...(args.include_all_simulators ? { simulator_models: await simulatorModels() } : {}) });
         case 'select_device': {
           this.requested = args.device;
