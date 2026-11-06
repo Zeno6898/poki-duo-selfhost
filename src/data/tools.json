@@ -798,7 +798,7 @@
     },
     {
       "name": "launch_app",
-      "description": "Launch an application by bundle_id or unambiguous name. Optional language, locale, arguments, and environment affect launch. Physical-device launch uses the paired device AppService directly and verifies its returned PID against the observed foreground. Physical-device name lookup uses installed names and available localized Home Screen aliases, preferring an exact match then a unique case-insensitive substring; ambiguous matches require an explicit bundle_id. A per-device directory is shared across sessions for up to five minutes; misses or ambiguous cached results refresh once. Explicit bundle_id skips lookup. Name lookup requires the device streaming app-list service. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Launch an application by bundle_id or unambiguous name. Optional language, locale, arguments, and environment affect launch. Physical-device launch uses the paired device AppService directly and verifies its returned PID against the observed foreground. Physical-device name lookup uses installed names and available localized Home Screen aliases, preferring an exact match then a unique case-insensitive substring; ambiguous matches require an explicit bundle_id. A per-device directory is shared across sessions for up to five minutes; misses or ambiguous cached results refresh once. Explicit bundle_id skips lookup. An app that is already running resumes where it was (resumed=true); fresh=true terminates it first. On a physical device the reply ends with the visible text, so a first-run sheet shows without another look. Name lookup requires the device streaming app-list service. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -828,6 +828,9 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "fresh": {
+            "type": "boolean"
           }
         }
       }

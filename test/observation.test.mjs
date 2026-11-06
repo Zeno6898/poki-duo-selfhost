@@ -75,3 +75,15 @@ test('a server without the OCR helper says so in status and in a failed text fal
  assert.match(listed.content[0].text,/Accessibility returned nothing.*Text recognition is not installed.*bin\/build-ocr-linux/s);
  assert.doesNotMatch(listed.content[0].text,/ENOENT/);
 });
+
+test('launch_app on a phone ends with the screen, says when the app resumed, and fresh relaunches it', { timeout: 60000 }, async t => {
+ const f=await fixture(t);
+ const first=value(await f.call('launch_app',{bundle_id:'local.fixture'}));
+ assert.equal(first.foreground_verified,true);assert.equal(first.resumed,false);
+ assert.ok(first.screen.text.includes('Button: First'),JSON.stringify(first));
+ const again=value(await f.call('launch_app',{bundle_id:'local.fixture'}));
+ assert.equal(again.resumed,true);assert.match(again.notice,/fresh=true/);
+ const fresh=value(await f.call('launch_app',{bundle_id:'local.fixture',fresh:true}));
+ assert.equal(fresh.resumed,false);
+ assert.equal((await f.events()).filter(e=>e.op==='launch_app').at(-1).request.terminate_existing,true);
+});

@@ -206,6 +206,7 @@ async function launch(ctx, target, args) {
   if (args.language) argv.push('-AppleLanguages', `(${args.language})`);
   if (args.locale) argv.push('-AppleLocale', args.locale);
   const testLaunch = argv.length || Object.keys(args.environment ?? {}).length;
+  const terminate = Boolean(testLaunch || args.fresh);
   let result;
   if (target.kind === 'physical') {
     const query = args.bundle_id ?? args.name ?? args.app;
@@ -223,9 +224,12 @@ async function launch(ctx, target, args) {
     }
     const metadata = lookup ? { _meta: { app_lookup: { cache_hit: lookup.cache_hit } } } : {};
     let launched = {};
+    // The launch service answers with the running process when there is one, so a pid seen before means
+    // the app resumed where it was, open drafts and all.
+    const known = [ctx.launchedPids?.get(`${target.id} ${bundle}`), ctx.lastForeground?.device === target.id ? ctx.lastForeground.pid : undefined];
     try {
       launched = await phase('app_launch', () => ctx.bridge({ op: 'launch_app', bundle_id: bundle,
-        arguments: argv, environment: args.environment ?? {}, terminate_existing: Boolean(testLaunch) }));
+        arguments: argv, environment: args.environment ?? {}, terminate_existing: terminate }));
       if (launched.isError) return { ...launched, ...metadata, foreground_verified: false, ...(launched.outcome === 'unknown' ? { stop_reason: 'unknown' } : {}) };
       if (!Number.isSafeInteger(launched.pid) || launched.pid <= 0) throw new Error('Launch service returned no valid PID.');
       ctx.frame = undefined; ctx.elements = [];
@@ -244,7 +248,12 @@ async function launch(ctx, target, args) {
         }
         throw lastError;
       }));
-      return { ...launched, ...(lookup ? { name: lookup.app.name } : {}), ...metadata, foreground_verified: true };
+      (ctx.launchedPids ??= new Map()).set(`${target.id} ${bundle}`, launched.pid);
+      const resumed = !terminate && known.includes(launched.pid);
+      // A physical launch has no readiness wait, so the screen it shows (a first-run sheet, say) is read back here.
+      const screen = ctx.inBatch ? {} : { screen: (await ctx.readback()).screen };
+      return { ...launched, ...(lookup ? { name: lookup.app.name } : {}), ...metadata, foreground_verified: true, resumed,
+        ...(resumed ? { notice: 'The app was already running and resumed where it was left. Use fresh=true to start it anew, for example to check that something was saved.' } : {}), ...screen };
     } catch (error) {
       return { ...launched, ...metadata, isError: true, outcome: 'unknown', foreground_verified: false,
         stop_reason: stopped(error) ? stoppingReason(error) : 'unknown', error: error.message,
@@ -255,7 +264,7 @@ async function launch(ctx, target, args) {
   if (target.kind === 'simulator') {
     const env = { ...process.env };
     for (const [key, value] of Object.entries(args.environment ?? {})) env[`SIMCTL_CHILD_${key}`] = value;
-    const command = ['simctl', 'launch', ...(testLaunch ? ['--terminate-running-process'] : []), target.id, app.bundle_id, ...argv];
+    const command = ['simctl', 'launch', ...(terminate ? ['--terminate-running-process'] : []), target.id, app.bundle_id, ...argv];
     await selectKeyboard(target.id);
     openInput(target.id);
     const response = await platformRun('xcrun', command, { env });
