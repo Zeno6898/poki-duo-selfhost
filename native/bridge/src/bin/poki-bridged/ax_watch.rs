@@ -124,6 +124,9 @@ impl Settings {
 struct State {
     /// The latest ready tree of the current subscription, and when it arrived.
     latest: Option<(Json, Instant)>,
+    /// When the subscription that the latest tree answered was made; None for a tree sent unasked.
+    /// An answer to a subscription made before a change can show the screen before it.
+    latest_asked: Option<Instant>,
     /// When the current subscription was made, and whether its first tree is still awaited.
     subscribed_at: Option<Instant>,
     awaiting: bool,
@@ -139,6 +142,17 @@ struct State {
     renewals: u64,
     /// Trees that arrived unasked, well after a subscription's answer: the phone sends changes.
     pushed: u64,
+}
+
+impl State {
+    /// Whether the latest tree shows the screen after the last change.
+    fn current(&self) -> bool {
+        let Some((_, at)) = &self.latest else {
+            return false;
+        };
+        self.invalidated
+            .is_none_or(|t| *at > t && self.latest_asked.is_none_or(|asked| asked > t))
+    }
 }
 
 struct Inner {
@@ -296,12 +310,12 @@ impl Watch {
         let delay = self.settings.rearm;
         self.rearm = Some(tokio::task::spawn_local(async move {
             tokio::time::sleep(delay).await;
-            let stale = inner
-                .state
-                .borrow()
-                .latest
-                .as_ref()
-                .is_none_or(|(_, at)| *at <= now);
+            // Unless a tree after the change is there, or a read already asked for one.
+            let stale = {
+                let state = inner.state.borrow();
+                let asked = state.awaiting && state.subscribed_at.is_some_and(|s| s > now);
+                !state.current() && !asked
+            };
             if stale && inner.renew().await.is_err() {
                 inner.changed.notify_waiters();
             }
@@ -334,7 +348,7 @@ impl Watch {
                 if state.foreground_changed && !state.awaiting {
                     renew = true;
                 } else if let Some((tree, at)) = &state.latest {
-                    let current = state.invalidated.is_none_or(|t| *at > t);
+                    let current = state.current();
                     if current && !state.awaiting && (push || at.elapsed() < self.settings.max_age)
                     {
                         let served = match (renewed, waited) {
@@ -468,6 +482,7 @@ async fn read_loop(mut read: ReadHalf<Socket>, inner: Rc<Inner>) {
                     state.pushed += 1;
                 }
                 state.latest = Some((tree.json(), now));
+                state.latest_asked = state.awaiting.then_some(state.subscribed_at).flatten();
                 state.awaiting = false;
                 state.trees += 1;
             }
@@ -683,6 +698,27 @@ mod tests {
             let (tree, served, _) = timed(&mut watch).await;
             assert_eq!((tree.as_str(), served), ("Three", Served::Renewed));
             assert_eq!(watch.stats()["push_mode"], json!(false));
+            phone.task.abort();
+        });
+    }
+
+    #[test]
+    fn an_answer_to_a_subscription_made_before_a_change_is_not_served_after_it() {
+        local(async {
+            let (mut watch, phone) = connect(Push::Off).await;
+            phone.answer(&[1], "Before");
+            assert_eq!(timed(&mut watch).await.0, "Before");
+
+            // A read renews just before a tap (tap_text locating its target), and the answer, which
+            // shows the screen before the tap, arrives after the tap.
+            phone.answer(&[1], "Before");
+            phone.answer(&[1], "After");
+            watch.inner.renew().await.unwrap();
+            watch.invalidate();
+            let (tree, served, ms) = timed(&mut watch).await;
+            println!("read after a change with an older answer under way: {ms} ms ({served:?})");
+            assert_eq!(tree, "After");
+            assert_eq!(phone.subscriptions.get(), 3);
             phone.task.abort();
         });
     }

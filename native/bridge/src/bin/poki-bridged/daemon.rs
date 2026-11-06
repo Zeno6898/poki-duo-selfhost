@@ -382,10 +382,14 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
         Some(Ok(result)) => result,
     };
     log(&format!(
-        "{op}: {} in {} ms{}",
+        "{op}: {} in {} ms{}{}",
         if result.is_ok() { "ok" } else { "error" },
         timings.total_ms,
-        if timings.reused_tunnel { " (warm)" } else { "" }
+        if timings.reused_tunnel { " (warm)" } else { "" },
+        timings
+            .ax
+            .map_or(String::new(), |served| format!(" ax={served:?}")
+                .to_lowercase())
     ));
     Some(match result {
         Ok(output) => success(id, &output, timings),
