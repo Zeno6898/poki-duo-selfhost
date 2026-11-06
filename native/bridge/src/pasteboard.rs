@@ -189,7 +189,11 @@ pub async fn paste_text(
     // Return still waits for the read-back below.
     let mut answered = false;
     for _ in 0..2 {
-        let Verification::Permission(Prompt { allow: Some((x, y)), .. }) = checked.status else {
+        let Verification::Permission(Prompt {
+            allow: Some((x, y)),
+            ..
+        }) = checked.status
+        else {
             break;
         };
         super::trace("paste permission: tapping allow");
@@ -402,7 +406,10 @@ fn paste_prompt(tree: &serde_json::Value) -> Option<Prompt> {
     let screen = elements.iter().find_map(|element| {
         (element.get("role")?.as_str()? == "Application").then_some(())?;
         let frame = element.get("frame")?;
-        Some((frame.get("width")?.as_f64()?, frame.get("height")?.as_f64()?))
+        Some((
+            frame.get("width")?.as_f64()?,
+            frame.get("height")?.as_f64()?,
+        ))
     });
     let mut found = false;
     let mut prompt = Prompt {
@@ -448,7 +455,8 @@ fn touch_point(element: &serde_json::Value, (width, height): (f64, f64)) -> Opti
     let number = |key| frame.get(key)?.as_f64();
     let x = number("x")? + number("width")? / 2.0;
     let y = number("y")? + number("height")? / 2.0;
-    let scale = |at: f64, across: f64| (at / (across - 1.0) * 65535.0).round().clamp(0.0, 65535.0) as u16;
+    let scale =
+        |at: f64, across: f64| (at / (across - 1.0) * 65535.0).round().clamp(0.0, 65535.0) as u16;
     Some((scale(x, width), scale(y, height)))
 }
 
@@ -776,7 +784,10 @@ mod tests {
     fn the_field_being_edited_passes_only_when_it_is_the_target() {
         let all = fields(&tree(EDITING, "搜索"));
         let chosen = select_fields(&all, Some(&target(SEARCH, "搜索")), true).ok();
-        assert_eq!(chosen.map(|fields| fields[0].id.clone()), Some(SEARCH.into()));
+        assert_eq!(
+            chosen.map(|fields| fields[0].id.clone()),
+            Some(SEARCH.into())
+        );
     }
 
     #[test]
@@ -802,7 +813,8 @@ mod tests {
 
     // The prompt as the phone sent it over Chrome: Springboard's root and the sheet.
     fn prompt_tree() -> serde_json::Value {
-        let at = |x: u32, y: u32, w: u32, h: u32| serde_json::json!({"x":x,"y":y,"width":w,"height":h});
+        let at =
+            |x: u32, y: u32, w: u32, h: u32| serde_json::json!({"x":x,"y":y,"width":w,"height":h});
         serde_json::json!({"elements":[
             {"role":"Application","label":" ","frame":at(0,0,402,874)},
             {"role":"StaticText","label":"“Chrome”想从“dtpasteboardd”粘贴","frame":at(71,386,260,42)},
@@ -826,12 +838,21 @@ mod tests {
 
     #[test]
     fn an_unconfirmed_input_is_an_error_with_a_next_step_for_the_model() {
-        for reason in ["paste_permission", "text_not_verified", "clear_not_verified"] {
+        for reason in [
+            "paste_permission",
+            "text_not_verified",
+            "clear_not_verified",
+        ] {
             let result = unconfirmed(reason, true, true);
             assert_eq!(result["isError"], true);
             assert_eq!(result["reason"], reason);
             assert_eq!(result["submit_sent"], false);
-            assert!(result["instruction"].as_str().unwrap().contains("Return was not sent"));
+            assert!(
+                result["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Return was not sent")
+            );
             assert!(result.get("needs_human_action").is_none());
         }
     }
@@ -840,6 +861,9 @@ mod tests {
     fn clearing_without_a_known_editing_field_is_refused_but_appending_is_not() {
         let all = fields(&tree(IDLE, "搜索"));
         assert!(select_fields(&all, None, true).is_err());
-        assert_eq!(select_fields(&all, None, false).ok().map(|f| f.len()), Some(1));
+        assert_eq!(
+            select_fields(&all, None, false).ok().map(|f| f.len()),
+            Some(1)
+        );
     }
 }

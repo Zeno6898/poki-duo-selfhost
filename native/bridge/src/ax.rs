@@ -41,7 +41,13 @@ pub async fn read_tree_with_timeout(
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let answer = subscribe(adapter, rsd, include_offscreen, remaining.min(ANSWER_WITHIN)).await?;
+        let answer = subscribe(
+            adapter,
+            rsd,
+            include_offscreen,
+            remaining.min(ANSWER_WITHIN),
+        )
+        .await?;
         if let Some(tree) = answer {
             return Ok(tree);
         }

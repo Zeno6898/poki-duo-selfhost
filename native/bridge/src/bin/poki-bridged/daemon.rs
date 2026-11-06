@@ -62,6 +62,8 @@ mod lock_state;
 mod media;
 
 const DAEMON_USAGE: &str = "usage: poki-bridged --socket PATH --udid ID\n       poki-bridged --socket PATH --host IP --pairing-file PATH\n       poki-bridged --socket PATH --host IP --rp-pairing-file PATH [--rp-host-name NAME]";
+/// The shortest time between two media sessions opened because a stream asked for one.
+const MEDIA_REOPEN_EVERY: Duration = Duration::from_secs(5);
 /// poki-native reads at most 2 MiB of request; the margin covers the `id`.
 const LINE_LIMIT: u64 = 2 * 1024 * 1024 + 4096;
 
@@ -740,8 +742,10 @@ struct Session {
     ax_link: Option<Link>,
     last_used: Instant,
     ops: u64,
-    /// Media sessions closed because their stream asked for a new one.
+    /// Media sessions closed because their stream asked for a new one, and when the current one
+    /// opened.
     media_reopens: u64,
+    input_opened_at: Option<Instant>,
     /// Why the last tunnel attempt failed, while there is no tunnel.
     tunnel_down: Option<TunnelDown>,
     tunnels_opened: u64,
@@ -884,6 +888,7 @@ impl Session {
             tunnels_lost: 0,
             ops: 0,
             media_reopens: 0,
+            input_opened_at: None,
             ax_gate: ax_gate::AxGateCell::default(),
             foreground: live::ForegroundCell::default(),
         }
@@ -993,6 +998,14 @@ impl Session {
     /// whether it was closed. Called before every op as well as by the reaper, which cannot run
     /// while ops hold the session (Nov 6: asked for again and again for 40 s, never done).
     async fn restart_media_if_asked(&mut self) -> bool {
+        // Not more often than MEDIA_REOPEN_EVERY: a new session needs its own key unit, which
+        // can take over a second; the request waits until then.
+        if self
+            .input_opened_at
+            .is_some_and(|at| at.elapsed() < MEDIA_REOPEN_EVERY)
+        {
+            return false;
+        }
         if !self
             .input
             .as_ref()
@@ -1024,9 +1037,14 @@ impl Session {
         if let Some(live) = &noted {
             live.note_input();
         }
+        let asked = Instant::now();
         let result = Box::pin(self.run(request, object, timings)).await;
         if tree && let Ok(tree) = &result {
-            live::note_tree(&self.foreground, tree);
+            live::note_tree(&self.foreground, tree, asked);
+        }
+        if changes {
+            // Counted from the end of the input too: the screen answers after the press.
+            self.foreground.borrow_mut().last_input = Some(Instant::now());
         }
         if changes && let Some(input) = self.input.as_ref() {
             input.frames.live().note_input();
@@ -1256,6 +1274,7 @@ impl Session {
                 input.touch = Some(Touch::connect_rsd(&mut device.adapter, &mut device.rsd).await?);
             }
             self.input = Some(input);
+            self.input_opened_at = Some(Instant::now());
             timings.input_open_ms = Some(ms(started));
             return Ok(());
         }
@@ -1756,6 +1775,7 @@ mod daemon_tests {
         live::note_tree(
             &state.foreground,
             &json!({"foreground_app": {"pid": 77, "bundle_id": "com.apple.mobilenotes", "name": "Notes"}}),
+            Instant::now(),
         );
         let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
         assert_eq!(
@@ -1767,6 +1787,7 @@ mod daemon_tests {
         live::note_tree(
             &state.foreground,
             &json!({"foreground_app": {"pid": 78, "bundle_id": null}}),
+            Instant::now(),
         );
         let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
         assert_eq!(pong["pong"]["foreground"]["resolving"], true);
