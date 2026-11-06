@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rm } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
+import { Devices } from '../src/device.mjs';
 import { join } from 'node:path';
 import { fixture, value } from './fixture.mjs';
 
@@ -128,4 +129,18 @@ test('launch_app gives the app a moment to come to the front and says how long i
  assert.notEqual(result.isError,true,result.content[0].text);
  const launched=value(result);
  assert.equal(launched.foreground_verified,true);assert.ok(launched.foreground_after_ms>0);
+});
+
+test('the Home Screen is named com.apple.springboard, and later reads of it say so too', async () => {
+ const devices=new Devices(),id='fixture-phone';
+ devices.target=async()=>({id,kind:'physical',name:'Phone'});devices.size={device:id,width:100,height:200};
+ devices.bridge=async request=>request.op==='ax'?{foreground:{object_id:'o1',name:' ',bundle_id:null,pid:34},elements:[{label:'Phone',role:'Icon',frame:{x:10,y:10,width:40,height:40}}]}:{pid:34,running:true,executable:'/System/Library/CoreServices/SpringBoard.app/SpringBoard',bundle_id:null,name:null};
+ const front=JSON.parse((await devices.dispatch('get_foreground_app',{})).content[0].text);
+ assert.equal(front.bundle_id,'com.apple.springboard');assert.equal(front.bundle_id_source,'executable');
+ assert.equal((await devices.structure()).foreground.bundle_id,'com.apple.springboard');
+});
+
+test('the status shows the commit recorded at build time when git is not there', { timeout: 30000 }, async t => {
+ const f=await fixture(t,{beforeStart:dir=>writeFile(join(dir,'build/commit'),'abc1234\n')});
+ assert.equal(value(await f.call('poki_mcp_status')).commit,'abc1234');
 });

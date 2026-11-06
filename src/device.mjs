@@ -26,6 +26,7 @@ const platformTools = new Set(['start_simulator', 'shut_down_simulator', 'start_
 // A simulator reads its screen in about 0.2 s, so five seconds covers the two reads that call a screen
 // still. A phone over a network tunnel can take two seconds or more per read, so its budget follows
 // the reads it has just measured, up to a cap.
+const springBoardId = 'com.apple.springboard', springBoardExecutable = /(?:^|\/)SpringBoard(?:\.app\/SpringBoard)?$/;
 const settleMs = 600, readbackMs = 5000, maxReadbackMs = 12000;
 const reportsScreen = new Set(['tap', 'double_tap', 'long_press', 'tap_text', 'swipe', 'drag', 'scroll', 'pinch', 'type_text', 'fill', 'press_key', 'press_button', 'go_back', 'handle_alert', 'system_gesture']);
 // These exist to act on a control, so the reply says when nothing was seen to change after one.
@@ -260,6 +261,7 @@ export class Devices {
     // A long-lived bridge says whether it answered from a held subscription (see bridge-daemon.mjs).
     const served = timingsSince(timings).findLast(entry => typeof entry.ax === 'string')?.ax;
     if (tree.foreground?.pid) this.lastForeground = { device: target.id, pid: tree.foreground.pid };
+    if (tree.foreground && !tree.foreground.bundle_id && this.springBoard?.device === target.id && tree.foreground.pid === this.springBoard.pid) tree.foreground = { ...tree.foreground, bundle_id: springBoardId, name: 'SpringBoard' };
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     // The app in front is part of the screen: a switch counts as a change even before its tree arrives.
@@ -445,6 +447,11 @@ export class Devices {
             try {
               const app = await this.bridge({ op: 'app_for_pid', pid: tree.foreground.pid });
               if (app.bundle_id) return text({ ...tree.foreground, bundle_id: app.bundle_id, name: tree.foreground.name ?? app.name, bundle_id_source: 'app_service' });
+              // SpringBoard is not an installed app, so AppService knows it only by its executable.
+              if (springBoardExecutable.test(app.executable ?? '')) {
+                this.springBoard = { device: (await this.target()).id, pid: tree.foreground.pid };
+                return text({ ...tree.foreground, bundle_id: springBoardId, name: 'SpringBoard', bundle_id_source: 'executable' });
+              }
             } catch (error) { if (stopped(error)) throw error; }
           }
           return text(tree.foreground);
