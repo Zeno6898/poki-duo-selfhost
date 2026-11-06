@@ -33,8 +33,9 @@ struct HomeView: View {
 
     private var header: some View {
         VStack(spacing: 8) {
-            Image("Bear").resizable().scaledToFit().frame(width: 120, height: 120)
-                .padding(24).glassEffect(.regular.tint(Brand.blue.opacity(0.25)), in: .circle)
+            Image("Bear").resizable().scaledToFit().frame(width: 112, height: 112)
+                .clipShape(.rect(cornerRadius: 26, style: .continuous))
+                .shadow(color: Brand.blue.opacity(0.3), radius: 16, y: 6)
             Text(model.sessionOn ? model.activityText : "Your iPhone, for your agents")
                 .font(.headline).foregroundStyle(.secondary)
         }

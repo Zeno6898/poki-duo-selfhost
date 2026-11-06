@@ -1,6 +1,6 @@
 #!/bin/bash
 # Makes the asset catalogs from docs/images/poki-icon.png (macOS, needs swift): the app icon (the bear
-# on brand blue) and the Bear image for the app and the Live Activity. They are generated, not
+# full-bleed: the logo flattened on brand blue, no margin; iOS applies its own corner mask) and the Bear image for the app and the Live Activity. They are generated, not
 # checked in, so the one source image stays the only copy. Run before xcodegen.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,7 +20,7 @@ bear() {
 APP="$HERE/Poki/Assets.xcassets"
 catalog "$APP"
 mkdir -p "$APP/AppIcon.appiconset"
-swift "$COMPOSE" "$ICON" "$APP/AppIcon.appiconset/icon-1024.png" 1024 0.78 "$BLUE"
+swift "$COMPOSE" "$ICON" "$APP/AppIcon.appiconset/icon-1024.png" 1024 1.0 "$BLUE"
 echo '{"images":[{"filename":"icon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"version":1,"author":"poki"}}' > "$APP/AppIcon.appiconset/Contents.json"
 mkdir -p "$APP/AccentColor.colorset"
 echo '{"colors":[{"idiom":"universal","color":{"color-space":"srgb","components":{"red":"0x20","green":"0x84","blue":"0xFD","alpha":"1.000"}}}],"info":{"version":1,"author":"poki"}}' > "$APP/AccentColor.colorset/Contents.json"
