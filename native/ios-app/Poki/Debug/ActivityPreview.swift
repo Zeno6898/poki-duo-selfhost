@@ -200,12 +200,22 @@ enum DemoActivity {
             AppLog.shared.add("activity", "demo did not start")
             return
         }
-        // Two alerts: one while another app is in front (the island expands), one on the Lock Screen.
-        for wait in [5.0, 6.0] {
-            try? await Task.sleep(for: .seconds(wait))
-            await activity.update(.init(state: state, staleDate: nil, relevanceScore: 100),
-                                  alertConfiguration: AlertConfiguration(title: "Poki", body: "\(state.headline)", sound: .default))
-            AppLog.shared.add("activity", "demo alert sent")
-        }
+        // Each `notifyutil -p nz.zheha.poki.demo-alert` from the build sends an alert, so the
+        // screenshot is taken right after it (simulator screenshots take seconds; fixed delays miss it).
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        CFNotificationCenterAddObserver(center, UnsafeRawPointer(bitPattern: 0x5051), { _, _, _, _, _ in
+            Task { @MainActor in await DemoActivity.alert() }
+        }, "nz.zheha.poki.demo-alert" as CFString, nil, .deliverImmediately)
+        current = (activity, state)
+        try? await Task.sleep(for: .seconds(28))
+    }
+
+    private static var current: (Activity<PokiActivityAttributes>, PokiState)?
+
+    static func alert() async {
+        guard let (activity, state) = current else { return }
+        await activity.update(.init(state: state, staleDate: nil, relevanceScore: 100),
+                              alertConfiguration: AlertConfiguration(title: "Poki", body: "\(state.headline)", sound: .default))
+        AppLog.shared.add("activity", "demo alert sent")
     }
 }

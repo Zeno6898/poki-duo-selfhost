@@ -89,19 +89,15 @@ jobs:
             xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityDemo "$s" > /dev/null
             sleep 2
             xcrun simctl launch "$UDID" com.apple.Preferences > /dev/null
-            sleep 2
+            sleep 1.5
+            alert() { xcrun simctl spawn "$UDID" notifyutil -p nz.zheha.poki.demo-alert; }
+            # An alert while another app is in front expands the island; then the compact island.
+            alert; sleep 0.4; shot "shots/real/$s-alert-1.png"; shot "shots/real/$s-alert-2.png"
             shot "shots/real/$s-compact.png"
-            # The alert goes out five seconds after the start.
-            sleep 0.9; shot "shots/real/$s-alert-1.png"
-            sleep 0.7; shot "shots/real/$s-alert-2.png"
-            sleep 0.7; shot "shots/real/$s-alert-3.png"
-            sleep 0.7; shot "shots/real/$s-alert-4.png"
-            # Lock the simulator (Device > Lock, Cmd-L) for the Lock Screen view.
-            osascript -e 'tell application "Simulator" to activate' -e 'delay 0.5' -e 'tell application "System Events" to keystroke "l" using command down' 2>&1 || echo "lock keystroke failed"
-            sleep 1.4; shot "shots/real/$s-lock.png"
-            # The second alert (eleven seconds in) lights the Lock Screen.
-            sleep 2.2; shot "shots/real/$s-lock-alert-1.png"
-            sleep 1.0; shot "shots/real/$s-lock-alert-2.png"
+            # Lock the simulator (Device > Lock, Cmd-L), then an alert on the Lock Screen.
+            osascript -e 'tell application "Simulator" to activate' -e 'tell application "System Events" to keystroke "l" using command down' 2>&1 || echo "lock keystroke failed"
+            sleep 1; shot "shots/real/$s-lock.png"
+            alert; sleep 0.4; shot "shots/real/$s-lock-alert.png"
             xcrun simctl shutdown "$UDID"; boot
           done
           ls -R shots
