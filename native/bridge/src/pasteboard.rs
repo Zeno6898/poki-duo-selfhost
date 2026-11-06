@@ -27,6 +27,43 @@ pub async fn paste_text(
     submit: bool,
     target: Option<&Target>,
 ) -> Result<serde_json::Value> {
+    let result = enter_text(adapter, rsd, keyboard, text, clear, submit, target).await?;
+    Ok(with_clipboard_fields(result))
+}
+
+/// Every reply says what happened to the user's clipboard, including the ones that never touched it,
+/// so an agent never has to guess whether there is a side effect to report.
+fn with_clipboard_fields(mut result: serde_json::Value) -> serde_json::Value {
+    let status = result["clipboard_restore_status"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if result["clipboard_changed_by_this_request"] == true {
+                "retained_pending_paste".to_owned()
+            } else {
+                "not_modified".to_owned()
+            }
+        });
+    if result.get("clipboard_changed_by_this_request").is_none() {
+        result["clipboard_changed_by_this_request"] =
+            (!matches!(status.as_str(), "restored" | "not_modified")).into();
+    }
+    if result.get("clipboard_snapshot").is_none() {
+        result["clipboard_snapshot"] = "not_needed".into();
+    }
+    result["clipboard_restore_status"] = status.into();
+    result
+}
+
+async fn enter_text(
+    adapter: &mut AdapterHandle,
+    rsd: &RsdHandshake,
+    keyboard: &mut Keyboard,
+    text: &str,
+    clear: bool,
+    submit: bool,
+    target: Option<&Target>,
+) -> Result<serde_json::Value> {
     super::trace("paste AX initial");
     let Ok(mut initial) = observe(adapter, rsd).await else {
         return Ok(unconfirmed(
@@ -833,6 +870,28 @@ mod tests {
             assert_eq!(result["submit_sent"], false);
             assert!(result["instruction"].as_str().unwrap().contains("Return was not sent"));
             assert!(result.get("needs_human_action").is_none());
+        }
+    }
+
+    #[test]
+    fn every_reply_says_what_happened_to_the_clipboard() {
+        let untouched = with_clipboard_fields(completed(0, false, true, &[]));
+        assert_eq!(untouched["clipboard_restore_status"], "not_modified");
+        assert_eq!(untouched["clipboard_changed_by_this_request"], false);
+        let refused = with_clipboard_fields(unconfirmed("no_accessible_text_field", false, false));
+        assert_eq!(refused["clipboard_restore_status"], "not_modified");
+        let pending = with_clipboard_fields(unconfirmed("text_not_verified", true, true));
+        assert_eq!(pending["clipboard_restore_status"], "retained_pending_paste");
+        assert_eq!(pending["clipboard_changed_by_this_request"], true);
+        for (status, changed) in [
+            ("restored", false),
+            ("unavailable", true),
+            ("restore_failed", true),
+        ] {
+            let pasted = clipboard_result(completed(3, false, status == "restored", &[]), "complete", status);
+            let pasted = with_clipboard_fields(pasted);
+            assert_eq!(pasted["clipboard_restore_status"], status);
+            assert_eq!(pasted["clipboard_changed_by_this_request"], changed);
         }
     }
 
