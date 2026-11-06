@@ -1,0 +1,93 @@
+# Checks, on a simulator, Poki Runner's own host executable (native/ios-runner/host/main.m) in place of
+# Xcode's XCTRunner: started as a test (as Poki starts it) WebDriverAgent must still come up; opened by
+# hand it must show its screen and start no test. Also prints where XCTest's runner app delegate lives.
+name: Runner host check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev/ios-runner]
+    paths: [native/ios-runner/host/**, native/ios-runner/patches/**, .github/workflows/runner-host-check.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      PRODUCTS: build/wda/Build/Products/Debug-iphonesimulator
+      RUNNER: WebDriverAgentRunner-Runner.app
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Apply Poki's runner patch
+        run: git -C native/ios-runner/WebDriverAgent apply ../patches/wda-poki-runner.patch
+      - name: Boot a simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys;d=json.load(sys.stdin)["devices"];print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")))')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
+      - name: Build for testing (simulator)
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing -project native/ios-runner/WebDriverAgent/WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda \
+            CODE_SIGNING_ALLOWED=NO | grep -E "^error|BUILD (SUCCEEDED|FAILED)|\*\* " || true
+          test -d "$PRODUCTS/$RUNNER"
+      - name: Where XCTRunner's pieces live
+        run: |
+          BIN="$PRODUCTS/$RUNNER/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PRODUCTS/$RUNNER/Info.plist")"
+          echo "executable: $BIN"; ls -la "$BIN"
+          otool -L "$BIN"
+          echo "--- defined classes in the executable"; nm -gU "$BIN" | grep -i objc_class || true
+          echo "--- undefined symbols"; nm -u "$BIN" | head -40
+          echo "--- Info.plist"; plutil -p "$PRODUCTS/$RUNNER/Info.plist"
+          PLAT="$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer"
+          for f in $(find "$PLAT/Library" -name '*.framework' -maxdepth 3) ; do
+            b="$f/$(basename "$f" .framework)"; [ -f "$b" ] && nm -gU "$b" 2>/dev/null | grep -q 'XCTRunnerAppDelegate' && echo "XCTRunnerAppDelegate in $f"
+          done; true
+      - name: Stock host, started as a test
+        run: |
+          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" TEST_RUNNER_POKI_LAUNCHER=1 > stock.log 2>&1 &
+          for i in $(seq 1 90); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "stock: WDA answered after $i s"; break; }; sleep 1; done
+          curl -s -m 2 localhost:8100/status | head -c 300; echo
+          pkill -f test-without-building || true; sleep 5; tail -20 stock.log
+      - name: Poki host in place of XCTRunner
+        run: |
+          APP="$PRODUCTS/$RUNNER"; BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          cp "$BIN" stock-executable
+          xcrun -sdk iphonesimulator clang -fobjc-arc -target arm64-apple-ios15.0-simulator -framework UIKit -framework Foundation \
+            native/ios-runner/host/main.m -o "$BIN"
+          codesign -f -s - "$APP"
+          xcodebuild test-without-building -xctestrun "$(ls build/wda/Build/Products/*.xctestrun | head -1)" -destination "id=$UDID" TEST_RUNNER_POKI_LAUNCHER=1 > poki.log 2>&1 &
+          ok=0; for i in $(seq 1 90); do curl -s -m 2 localhost:8100/status > /dev/null && { echo "poki host: WDA answered after $i s"; ok=1; break; }; sleep 1; done
+          curl -s -m 2 localhost:8100/status | head -c 300; echo
+          mkdir -p shots; xcrun simctl io "$UDID" screenshot shots/as-test-home.png || true
+          xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" || true
+          sleep 4; xcrun simctl io "$UDID" screenshot shots/as-test-opened.png || true
+          pkill -f test-without-building || true; sleep 5; tail -30 poki.log
+          echo "POKI_HOST_TEST=$ok" >> "$GITHUB_ENV"
+      - name: Poki host opened by hand
+        run: |
+          APP="$PRODUCTS/$RUNNER"; ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          xcrun simctl terminate "$UDID" "$ID" || true
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$ID"; sleep 5
+          xcrun simctl io "$UDID" screenshot shots/by-hand.png
+          if curl -s -m 2 localhost:8100/status > /dev/null; then echo "by hand: WDA is up (a test started)"; byhand=bad; else echo "by hand: no test, WDA is not up"; byhand=ok; fi
+          xcrun simctl spawn "$UDID" launchctl list | grep -i webdriver || true
+          echo "POKI_HOST_BYHAND=$byhand" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runner-host-check
+          path: |
+            shots/
+            *.log
+      - name: Verdict
+        run: |
+          echo "as a test: $POKI_HOST_TEST, by hand: $POKI_HOST_BYHAND"
+          [ "$POKI_HOST_TEST" = 1 ] && [ "$POKI_HOST_BYHAND" = ok ]
