@@ -27,7 +27,7 @@ jobs:
         run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
 
       - name: Apply Poki's runner patch (opened by hand it sends people to Poki; its screen while in use)
-        run: cd native/ios-runner/WebDriverAgent && git apply "$GITHUB_WORKSPACE/native/ios-runner/patches/wda-poki-runner.patch" && git diff --stat
+        run: cd native/ios-runner/WebDriverAgent && git apply < "$GITHUB_WORKSPACE/native/ios-runner/patches/wda-poki-runner.patch" && git diff --stat
 
       - name: Build for testing (iOS device SDK, unsigned)
         run: |
@@ -44,6 +44,9 @@ jobs:
       - name: Brand as Poki
         run: native/ios-runner/branding/brand.sh "$PRODUCTS/$RUNNER" docs/images/poki-icon.png docs/images/runner/AppIcon-1024.png
 
+      - name: PokiRunnerHost (opened by hand, the runner starts no test and sends people to Poki)
+        run: native/ios-runner/host/install.sh "$PRODUCTS/$RUNNER" iphoneos
+
       - name: Package the IPA
         run: |
           set -euo pipefail
@@ -52,7 +55,8 @@ jobs:
           find Payload -name '*.dSYM' -prune -exec rm -rf {} +
           # As WebDriverAgent's own real-device package does: the XCTest libraries Xcode copied into the
           # runner come from the phone's developer image instead.
-          rm -rf "Payload/$RUNNER/Frameworks"
+          find "Payload/$RUNNER/Frameworks" -mindepth 1 -maxdepth 1 ! -name libPokiRunnerHost.dylib -exec rm -rf {} +
+          ls "Payload/$RUNNER/Frameworks"
           ditto -c -k --keepParent --norsrc Payload out/poki-runner-unsigned.ipa
           # The same runner keeping Xcode's copies, for an install that runs it without the developer image.
           mkdir -p full/Payload && ditto "$PRODUCTS/$RUNNER" "full/Payload/$RUNNER" && find full -name '*.dSYM' -prune -exec rm -rf {} +

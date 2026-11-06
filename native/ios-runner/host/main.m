@@ -1,14 +1,14 @@
-// Poki Runner's own host executable, in place of Xcode's XCTRunner. The XCTest machinery comes in with
-// the libraries testmanagerd injects when Poki starts the runner (DYLD_INSERT_LIBRARIES and the XCTest
-// configuration in the environment); then this hands over to XCTest's own app delegate and nothing
-// changes. Opened by hand from the home screen there is no such environment: no test, no UI
-// Automation, no passcode prompt; it shows one screen that sends the person to Poki.
+// PokiRunnerHost: a small library loaded into Poki Runner (Xcode's XCTRunner host) before its own code.
+// Started by Poki (through testmanagerd, with the XCTest session in the environment) it does nothing
+// and XCTRunner runs as always. Opened by hand from the home screen, it takes over before XCTRunner's
+// main: no test, no UI Automation, no passcode prompt; one screen that sends the person to Poki.
 #import <UIKit/UIKit.h>
 
 static BOOL PokiStartedByTestManager(void) {
   NSDictionary<NSString *, NSString *> *env = NSProcessInfo.processInfo.environment;
-  return env[@"XCTestConfigurationFilePath"] != nil || env[@"XCTestSessionIdentifier"] != nil ||
-         [env[@"DYLD_INSERT_LIBRARIES"] containsString:@"XCTest"];
+  // Any of these (some may be empty) means testmanagerd launched the runner for a test session.
+  return env[@"XCTestSessionIdentifier"] != nil || env[@"XCTestConfigurationFilePath"] != nil ||
+         env[@"XCTestBundlePath"] != nil || env[@"XCTestManagerVariant"] != nil;
 }
 
 static UIColor *PokiBlue(void) { return [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1]; }
@@ -91,14 +91,11 @@ static UIColor *PokiBlue(void) { return [UIColor colorWithRed:0x20/255.0 green:0
 }
 @end
 
-int main(int argc, char *argv[]) {
+/// Runs before XCTRunner's main (dyld runs a library's initializers first) and, opened by hand, never
+/// returns to it.
+__attribute__((constructor)) static void PokiRunnerHostTakeOver(int argc, char **argv, char **envp) {
+  if (PokiStartedByTestManager()) { return; }
   @autoreleasepool {
-    if (PokiStartedByTestManager()) {
-      // What XCTRunner does: XCTest's app delegate, from the injected libraries.
-      Class xctest = NSClassFromString(@"_XCTRunnerAppDelegate") ?: NSClassFromString(@"XCTRunnerAppDelegate");
-      if (xctest) { return UIApplicationMain(argc, argv, nil, NSStringFromClass(xctest)); }
-      return UIApplicationMain(argc, argv, nil, nil);
-    }
-    return UIApplicationMain(argc, argv, nil, NSStringFromClass(PokiRunnerAppDelegate.class));
+    exit(UIApplicationMain(argc, argv, nil, NSStringFromClass(PokiRunnerAppDelegate.class)));
   }
 }
