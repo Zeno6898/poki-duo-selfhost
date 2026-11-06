@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 @testable import PokiCore
 
 final class BasicsTests: XCTestCase {
@@ -281,5 +284,38 @@ final class EventTests: XCTestCase {
         guard case .toolFinished(_, .done, let facts)? = events.value.last else { return XCTFail("\(events.value)") }
         XCTAssertEqual(facts.app, "Settings")
         XCTAssertNotNil(facts.thumbnail)
+    }
+}
+
+final class DDITests: XCTestCase {
+    final class Mirror: HTTPTransport, @unchecked Sendable {
+        var files: [String: Data] = [:]
+        func send(method: String, url: URL, body: Data?, timeout: Double) async throws -> (status: Int, body: Data) {
+            files[url.lastPathComponent].map { (200, $0) } ?? (404, Data())
+        }
+    }
+
+    func testDownloadsIntoPlaceAndKeepsAVerifiedCopy() async throws {
+        let mirror = Mirror()
+        var manifestEntries: [String: Any] = [:]
+        for (key, path) in zip(DeveloperDiskImage.payloadKeys, ["Image.dmg", "Image.dmg.trustcache", "Image.dmg.cryptex_info", "Image.dmg.root_hash"]) {
+            #if canImport(CryptoKit)
+            let digest = Data(SHA384.hash(data: Data(path.utf8)))
+            #else
+            let digest = Data([1])
+            #endif
+            manifestEntries[key] = ["Info": ["Path": path], "Digest": digest]
+            mirror.files[path] = Data(path.utf8)
+        }
+        let manifest: [String: Any] = ["ProductBuildVersion": "22A1", "BuildIdentities": [["Manifest": manifestEntries]]]
+        mirror.files["BuildManifest.plist"] = try PropertyListSerialization.data(fromPropertyList: manifest, format: .xml, options: 0)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ddi-\(UUID().uuidString)")
+        let build = try await DeveloperDiskImage.ensure(in: dir, from: URL(string: "https://mirror.invalid/x")!, transport: mirror)
+        XCTAssertEqual(build, "22A1")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("Image.dmg").path))
+        mirror.files = [:]  // a verified copy is not downloaded again
+        let again = try await DeveloperDiskImage.ensure(in: dir, from: URL(string: "https://mirror.invalid/x")!, transport: mirror)
+        XCTAssertEqual(again, "22A1")
+        try? FileManager.default.removeItem(at: dir)
     }
 }
