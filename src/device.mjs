@@ -15,6 +15,8 @@ import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
 import { version, buildInfo, requireCurrentCode, ocrStatus, ocrMissing, ocrPath } from './build-info.mjs';
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
+import { routes as routesToBridgeDaemon, runThroughDaemon } from './bridge-daemon.mjs';
+import { actAndObserve } from './act-and-observe.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -55,6 +57,7 @@ export class Devices {
   scales = new Map(); readCosts = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
+    if (routesToBridgeDaemon(file, input)) return runThroughDaemon(args, { timeout, input });
     const result = await execute(file, args, { timeout, input });
     return { stdout: result.stdout.trimEnd(), stderr: result.stderr.trimEnd() };
   }
@@ -376,6 +379,7 @@ export class Devices {
         if (name === 'start_simulator') usedSimulators.add(this.selected);
         return { ...text(result), ...(result.isError ? { isError: true } : {}), ...(_meta || result.stop_reason ? { _meta: { ..._meta, ...(result.stop_reason ? { stop_reason: result.stop_reason } : {}) } } : {}) };
       }
+      if (name === 'act_and_observe') return await actAndObserve(this, args, (tool, values) => definitions.find(d => d[0] === tool)[2].parse(values));
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
         case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), ocr: await ocrStatus(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human', approval_covers: [...approvedTools], approval_scope: 'Only the tools in approval_covers ask for approval. Taps, typing and other input inside apps, including a delete confirmed with a tap, are not gated.' });

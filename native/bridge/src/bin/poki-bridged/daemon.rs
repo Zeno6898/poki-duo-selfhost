@@ -1,0 +1,1138 @@
+//! The daemon behind poki-bridged. It is a child of poki-native's crate root (see main.rs next to this
+//! file), so `super` is poki-native's main.rs and every op below calls poki-native's own functions.
+//!
+//! # Protocol
+//!
+//! One JSON object per line on a Unix socket, answered by one JSON object per line, in order. A
+//! request is the object poki-native reads on stdin, plus an optional `id` that the answer echoes:
+//!
+//! ```text
+//! {"id":1,"op":"tap","x":30000,"y":40000}
+//! ```
+//!
+//! An answer carries what poki-native would have printed, verbatim, so a caller can hand it on as if
+//! poki-native had run: `stdout` on success, `stderr` (poki-native's error object) on failure.
+//!
+//! ```text
+//! {"id":1,"ok":true,"stdout":"{\"screen_change_verified\":false,\"sent\":true}","timings":{...}}
+//! {"id":1,"ok":false,"stderr":"{\"error\":\"...\",\"screen_change_verified\":false}","timings":{...}}
+//! ```
+//!
+//! Control requests: `{"op":"ping"}`, `{"op":"reset"}` (close the tunnel and the input services) and
+//! `{"op":"shutdown"}`.
+//!
+//! # What is held
+//!
+//! For its one device the daemon keeps the remote pairing (or CoreDeviceProxy) tunnel with its RSD
+//! handshake, and, once an input op has run, the screen media session that the HID services need,
+//! the touch connection and the button connection. The virtual keyboard is still added and removed
+//! per op, because iOS hides the on-screen keyboard while a hardware keyboard is attached. The media
+//! session streams video, which the daemon drains and discards; it is closed after
+//! `POKI_BRIDGED_INPUT_IDLE_MS` (default 60000, 0 keeps it) without input, and the daemon exits after
+//! `POKI_BRIDGED_EXIT_IDLE_MS` (default 1800000, 0 never) without any op.
+//!
+//! # Failures
+//!
+//! Ops run one at a time. A client that disconnects while its op runs cancels it, and the input
+//! services are then closed so that no touch is left down. Any op error closes the tunnel and the
+//! next op reconnects. An op that only reads is retried once on a fresh tunnel when it fails on a
+//! reused one. An input op is retried only when nothing was sent: when opening its services or its
+//! first touch report fails on a reused tunnel.
+//!
+//! `install_app` and `uninstall_app` run exactly as in poki-native, on their own connection. A held
+//! `location` `set` keeps its process alive until it is killed, so it stays with poki-native.
+use super::*;
+use idevice::core_device::DisplayServiceClient;
+use serde_json::Map;
+use std::{path::Path, rc::Rc, time::Instant};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+    sync::{Mutex, watch},
+    task::JoinHandle,
+};
+
+const DAEMON_USAGE: &str = "usage: poki-bridged --socket PATH --udid ID\n       poki-bridged --socket PATH --host IP --pairing-file PATH\n       poki-bridged --socket PATH --host IP --rp-pairing-file PATH [--rp-host-name NAME]";
+/// poki-native reads at most 2 MiB of request; the margin covers the `id`.
+const LINE_LIMIT: u64 = 2 * 1024 * 1024 + 4096;
+
+pub fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let code = match parse_daemon_args(&args) {
+        // One thread: ops run one at a time anyway, and the connection tasks need not be Send.
+        Ok((socket, target)) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(Into::into)
+            .and_then(|runtime| {
+                runtime.block_on(tokio::task::LocalSet::new().run_until(run(socket, target)))
+            }),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = code {
+        eprintln!("poki-bridged: {error}");
+        std::process::exit(if error.to_string() == ALREADY_RUNNING {
+            3
+        } else {
+            1
+        });
+    }
+}
+
+const ALREADY_RUNNING: &str = "another poki-bridged already serves this socket";
+
+/// `--socket PATH` followed by, or mixed with, poki-native's target arguments.
+fn parse_daemon_args(args: &[String]) -> Result<(PathBuf, Target)> {
+    let at = args
+        .iter()
+        .skip(1)
+        .position(|a| a == "--socket")
+        .map(|i| i + 1)
+        .ok_or(DAEMON_USAGE)?;
+    let socket = args
+        .get(at + 1)
+        .filter(|p| !p.is_empty() && !p.starts_with("--"))
+        .ok_or(DAEMON_USAGE)?;
+    let mut rest = args.to_vec();
+    rest.drain(at..at + 2);
+    if rest.iter().any(|a| a == "--socket") {
+        return Err(DAEMON_USAGE.into());
+    }
+    let target = parse_args(&rest).map_err(|_| DAEMON_USAGE)?;
+    Ok((PathBuf::from(socket), target))
+}
+
+fn idle_env(name: &str, default_ms: u64) -> Option<Duration> {
+    let ms = std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_ms);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+async fn run(socket: PathBuf, target: Target) -> Result<()> {
+    let listener = bind(&socket).await?;
+    let state = Rc::new(State::new(target));
+    eprintln!("poki-bridged: ready (pid {})", std::process::id());
+    let result = serve(listener, state.clone()).await;
+    state.session.lock().await.reset().await;
+    let _ = std::fs::remove_file(&socket);
+    result
+}
+
+/// Binds the socket, replacing a stale file but never a live daemon.
+async fn bind(socket: &Path) -> Result<UnixListener> {
+    if socket.exists() {
+        if UnixStream::connect(socket).await.is_ok() {
+            return Err(ALREADY_RUNNING.into());
+        }
+        std::fs::remove_file(socket)?;
+    }
+    let listener = UnixListener::bind(socket)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+struct State {
+    session: Mutex<Session>,
+    /// Set to true to stop serving.
+    stop: watch::Sender<bool>,
+    started: Instant,
+    version: u64,
+}
+
+impl State {
+    fn new(target: Target) -> Self {
+        Self {
+            session: Mutex::new(Session::new(target)),
+            stop: watch::channel(false).0,
+            started: Instant::now(),
+            version: executable_version(),
+        }
+    }
+}
+
+/// The modification time of this executable when it started, so a client can tell a daemon that
+/// predates a rebuild.
+fn executable_version() -> u64 {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+async fn serve(listener: UnixListener, state: Rc<State>) -> Result<()> {
+    let mut stop = state.stop.subscribe();
+    let reaper = tokio::task::spawn_local(reap(state.clone()));
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                tokio::task::spawn_local(connection(stream, state.clone()));
+            }
+            _ = stop.wait_for(|stop| *stop) => break,
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
+        }
+    }
+    reaper.abort();
+    Ok(())
+}
+
+/// Closes the input services and ends the daemon after their idle times.
+async fn reap(state: Rc<State>) {
+    let input_idle = idle_env("POKI_BRIDGED_INPUT_IDLE_MS", 60_000);
+    let exit_idle = idle_env("POKI_BRIDGED_EXIT_IDLE_MS", 1_800_000);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Ok(mut session) = state.session.try_lock() else {
+            continue;
+        };
+        let idle = session.last_used.elapsed();
+        if input_idle.is_some_and(|limit| idle >= limit) && session.input.is_some() {
+            log("input services idle; closing them");
+            session.close_input().await;
+        }
+        if exit_idle.is_some_and(|limit| idle >= limit) {
+            log("idle; exiting");
+            let _ = state.stop.send(true);
+            return;
+        }
+    }
+}
+
+fn log(message: &str) {
+    eprintln!("poki-bridged: {message}");
+}
+
+/// One client. Its requests are answered in order; when it disconnects, a running op is cancelled.
+async fn connection(stream: UnixStream, state: Rc<State>) {
+    let (read, mut write) = stream.into_split();
+    let (closed_tx, closed) = watch::channel(false);
+    let (lines_tx, mut lines) =
+        tokio::sync::mpsc::unbounded_channel::<std::result::Result<String, String>>();
+    tokio::task::spawn_local(async move {
+        let mut reader = BufReader::new(read);
+        loop {
+            let mut line = Vec::new();
+            match (&mut reader)
+                .take(LINE_LIMIT)
+                .read_until(b'\n', &mut line)
+                .await
+            {
+                Ok(0) | Err(_) => break,
+                Ok(_) if !line.ends_with(b"\n") && line.len() as u64 >= LINE_LIMIT => {
+                    let _ = lines_tx.send(Err("request line exceeds 2 MiB".into()));
+                    break;
+                }
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line).trim().to_owned();
+                    if !text.is_empty() && lines_tx.send(Ok(text)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = closed_tx.send(true);
+    });
+    while let Some(line) = lines.recv().await {
+        let answer = match line {
+            Ok(line) => answer(&line, &state, closed.clone()).await,
+            Err(error) => Some(failure(
+                Value::Null,
+                &*Box::<dyn std::error::Error + Send + Sync>::from(error),
+                Timings::default(),
+            )),
+        };
+        let Some(answer) = answer else { break };
+        let mut bytes = answer.to_string().into_bytes();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() {
+            break;
+        }
+    }
+}
+
+#[derive(Default, serde::Serialize)]
+struct Timings {
+    /// Time spent opening the tunnel, when this op opened it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connect_ms: Option<u64>,
+    /// Time spent opening the input media session and its wait, when this op opened them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_open_ms: Option<u64>,
+    /// The whole op, including any connect.
+    total_ms: u64,
+    reused_tunnel: bool,
+    reused_input: bool,
+    retried: bool,
+    /// How an ax_tree read was served by the held subscription.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ax: Option<crate::ax::watch::Served>,
+}
+
+fn ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
+}
+
+fn success(id: Value, output: &Value, timings: Timings) -> Value {
+    // poki-native prints the result with `println!("{result}")`.
+    json!({"id": id, "ok": true, "stdout": output.to_string(), "timings": timings})
+}
+
+fn failure(id: Value, error: &(dyn std::error::Error + Send + Sync), timings: Timings) -> Value {
+    // poki-native's error line on stderr.
+    let stderr = json!({"error": error.to_string(), "screen_change_verified": false});
+    json!({"id": id, "ok": false, "stderr": stderr.to_string(), "timings": timings})
+}
+
+/// A request line split into its id, its op name and poki-native's request object.
+type Split = (Value, String, Map<String, Value>);
+
+fn split(line: &str) -> std::result::Result<Split, (Value, String)> {
+    let mut object = match serde_json::from_str::<Value>(line) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => return Err((Value::Null, "request must be a JSON object".into())),
+        Err(error) => return Err((Value::Null, error.to_string())),
+    };
+    let id = object.remove("id").unwrap_or(Value::Null);
+    let op = object
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((id, op, object))
+}
+
+/// Answers one line, or None when the client left before its op could finish.
+async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) -> Option<Value> {
+    let started = Instant::now();
+    let (id, op, object) = match split(line) {
+        Ok(parts) => parts,
+        Err((id, error)) => {
+            return Some(failure(
+                id,
+                &*Box::<dyn std::error::Error + Send + Sync>::from(error),
+                Timings::default(),
+            ));
+        }
+    };
+    match op.as_str() {
+        "ping" => {
+            let mut pong = json!({
+                "pid": std::process::id(),
+                "version": state.version,
+                "uptime_ms": ms(state.started),
+                "busy": true,
+            });
+            // A running op holds the session; ping does not wait for it.
+            if let Ok(session) = state.session.try_lock() {
+                pong["busy"] = false.into();
+                pong["tunnel"] = session.link.is_some().into();
+                pong["input"] = session.input.is_some().into();
+                pong["ops"] = session.ops.into();
+                pong["ax"] = json!({
+                    "watch": session.ax.as_ref().map(|w| w.stats()),
+                    "opened": session.ax_opened,
+                    "fallbacks": session.ax_fallbacks,
+                    "last_error": session.ax_last_error,
+                });
+            }
+            return Some(json!({"id": id, "ok": true, "pong": pong}));
+        }
+        "reset" => {
+            state.session.lock().await.reset().await;
+            return Some(json!({"id": id, "ok": true}));
+        }
+        "shutdown" => {
+            let _ = state.stop.send(true);
+            return Some(json!({"id": id, "ok": true}));
+        }
+        _ => {}
+    }
+    let mut session = tokio::select! {
+        session = state.session.lock() => session,
+        _ = closed.wait_for(|closed| *closed) => return None,
+    };
+    let mut timings = Timings::default();
+    let limit = Duration::from_secs(if op == "install_app" { 180 } else { 90 });
+    let outcome = tokio::select! {
+        outcome = tokio::time::timeout(limit, Box::pin(session.handle(object, &mut timings))) => Some(outcome),
+        _ = closed.wait_for(|closed| *closed) => None,
+    };
+    session.ops += 1;
+    session.last_used = Instant::now();
+    timings.total_ms = ms(started);
+    let result = match outcome {
+        None => {
+            log(&format!("{op}: client left; cancelled"));
+            session.reset().await;
+            return None;
+        }
+        Some(Err(elapsed)) => {
+            session.reset().await;
+            Err(elapsed.into())
+        }
+        Some(Ok(result)) => result,
+    };
+    log(&format!(
+        "{op}: {} in {} ms{}",
+        if result.is_ok() { "ok" } else { "error" },
+        timings.total_ms,
+        if timings.reused_tunnel { " (warm)" } else { "" }
+    ));
+    Some(match result {
+        Ok(output) => success(id, &output, timings),
+        Err(error) => failure(id, &*error, timings),
+    })
+}
+
+struct Link {
+    device: Device,
+}
+
+/// The screen media session the HID services need, and the HID connections made inside it.
+struct Input {
+    client: DisplayServiceClient<Box<dyn ReadWrite>>,
+    /// Tasks that read and discard the RTP the phone streams to the media session's UDP sockets;
+    /// the tunnel's UDP queues are unbounded.
+    drains: Vec<JoinHandle<()>>,
+    touch: Option<Touch>,
+    buttons: Option<Indigo>,
+}
+
+struct Session {
+    target: Target,
+    link: Option<Link>,
+    input: Option<Input>,
+    /// The held accessibility subscription, inside the tunnel.
+    ax: Option<crate::ax::watch::Watch>,
+    /// Subscriptions opened, and reads that gave one up and read without it, since the daemon
+    /// started; the last reason.
+    ax_opened: u64,
+    ax_fallbacks: u64,
+    ax_last_error: Option<String>,
+    /// The subscription's own tunnel, with POKI_BRIDGED_AX_TUNNEL=separate.
+    ax_link: Option<Link>,
+    last_used: Instant,
+    ops: u64,
+}
+
+fn parse(object: &Map<String, Value>) -> Result<Request> {
+    let request: Request = serde_json::from_value(Value::Object(object.clone()))?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn is_input(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Tap { .. }
+            | Request::DoubleTap { .. }
+            | Request::LongPress { .. }
+            | Request::Drag { .. }
+            | Request::Pinch { .. }
+            | Request::Key { .. }
+            | Request::Button { .. }
+            | Request::TypeText { .. }
+    )
+}
+
+/// Ops that change nothing on the phone, so running one twice is harmless.
+fn reads_only(request: &Request) -> bool {
+    match request {
+        Request::DisplayInfo
+        | Request::ListApps
+        | Request::AxTree { .. }
+        | Request::AppForPid { .. }
+        | Request::LockdownGet { .. }
+        | Request::Screenshot { .. } => true,
+        Request::Pasteboard { action, .. } => action != "set",
+        Request::Configuration { method, .. } => method.starts_with("get_"),
+        _ => false,
+    }
+}
+
+/// The ops `tunnel_op` runs on the held tunnel.
+fn on_tunnel(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::LaunchApp(_)
+            | Request::ListApps
+            | Request::Configuration { .. }
+            | Request::AxTree { .. }
+            | Request::AppForPid { .. }
+            | Request::LockdownGet { .. }
+            | Request::Screenshot { .. }
+            | Request::Rotate { .. }
+            | Request::Pasteboard { .. }
+            | Request::Location { .. }
+            | Request::DisplayInfo
+    )
+}
+
+fn uses_touch(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Tap { .. }
+            | Request::DoubleTap { .. }
+            | Request::LongPress { .. }
+            | Request::Drag { .. }
+            | Request::Pinch { .. }
+    )
+}
+
+impl Session {
+    fn new(target: Target) -> Self {
+        Self {
+            target,
+            link: None,
+            input: None,
+            ax: None,
+            ax_opened: 0,
+            ax_fallbacks: 0,
+            ax_last_error: None,
+            ax_link: None,
+            last_used: Instant::now(),
+            ops: 0,
+        }
+    }
+
+    async fn close_input(&mut self) {
+        if let Some(mut input) = self.input.take() {
+            drop(input.touch.take());
+            drop(input.buttons.take());
+            let _ = tokio::time::timeout(Duration::from_secs(2), input.client.stop_media_stream())
+                .await;
+            for drain in input.drains {
+                drain.abort();
+            }
+        }
+    }
+
+    async fn reset(&mut self) {
+        self.close_input().await;
+        self.ax = None;
+        self.ax_link = None;
+        self.link = None;
+    }
+
+    async fn connect(&mut self, timings: &mut Timings) -> Result<()> {
+        if self.link.is_some() {
+            timings.reused_tunnel = true;
+            return Ok(());
+        }
+        let started = Instant::now();
+        let device = connect_device(&self.target).await?;
+        timings.connect_ms = Some(ms(started));
+        self.link = Some(Link { device });
+        Ok(())
+    }
+
+    async fn handle(&mut self, object: Map<String, Value>, timings: &mut Timings) -> Result<Value> {
+        let request = parse(&object)?;
+        let changes = !reads_only(&request);
+        let result = Box::pin(self.run(request, object, timings)).await;
+        // Whatever it did, an op that may change the screen makes the held tree stale.
+        if changes && let Some(watch) = self.ax.as_mut() {
+            watch.invalidate();
+        }
+        result
+    }
+
+    async fn run(
+        &mut self,
+        request: Request,
+        object: Map<String, Value>,
+        timings: &mut Timings,
+    ) -> Result<Value> {
+        if let Request::AxTree {
+            include_offscreen: false,
+        } = request
+            && std::env::var("POKI_BRIDGED_AX_WATCH").as_deref() != Ok("0")
+        {
+            return Box::pin(self.watched_tree(timings)).await;
+        }
+        if matches!(
+            request,
+            Request::InstallApp { .. } | Request::UninstallApp { .. }
+        ) {
+            return Box::pin(execute(&self.target, request)).await;
+        }
+        if is_held_location(&request) {
+            return Err("A held location set runs in its own poki-native process.".into());
+        }
+        if !on_tunnel(&request) && !is_input(&request) {
+            // An op this daemon does not know yet runs as poki-native runs it, on its own connection.
+            return Box::pin(execute(&self.target, request)).await;
+        }
+        if is_input(&request) {
+            return Box::pin(self.input_op(request, &object, timings)).await;
+        }
+        let retry = reads_only(&request) || matches!(request, Request::LaunchApp(_));
+        let mut request = Some(request);
+        loop {
+            let reused = self.link.is_some();
+            let current = match request.take() {
+                Some(request) => request,
+                None => parse(&object)?,
+            };
+            let launch = matches!(current, Request::LaunchApp(_));
+            let result = match self.connect(timings).await {
+                Ok(()) => Box::pin(self.tunnel_op(current)).await,
+                Err(error) => Err(error),
+            };
+            if result.is_ok() {
+                return result;
+            }
+            self.reset().await;
+            if !(retry && reused) || timings.retried {
+                // poki-native reports a failed launch as a result rather than an error.
+                return if launch {
+                    Ok(apps::not_sent(result.unwrap_err()))
+                } else {
+                    result
+                };
+            }
+            timings.retried = true;
+        }
+    }
+
+    /// An on-screen tree from the held subscription, opening it when there is none. When the
+    /// subscription fails, it is dropped and this read is made as poki-native makes it.
+    async fn watched_tree(&mut self, timings: &mut Timings) -> Result<Value> {
+        let mut attempt = 0;
+        loop {
+            let reused = self.link.is_some();
+            let result = async {
+                self.connect(timings).await?;
+                // With POKI_BRIDGED_AX_TUNNEL=separate the subscription gets a tunnel of its own,
+                // which input never uses.
+                let separate = std::env::var("POKI_BRIDGED_AX_TUNNEL").as_deref() == Ok("separate");
+                if separate && self.ax_link.is_none() {
+                    self.ax = None;
+                    let started = Instant::now();
+                    self.ax_link = Some(Link {
+                        device: connect_device(&self.target).await?,
+                    });
+                    timings.connect_ms = Some(timings.connect_ms.unwrap_or(0) + ms(started));
+                }
+                let link = if separate {
+                    &mut self.ax_link
+                } else {
+                    &mut self.link
+                };
+                let device = &mut link.as_mut().expect("connected").device;
+                // A read on a held subscription that is not answered soon is given up: a plain read
+                // on a new connection is answered more reliably than a renewal that hangs. A new
+                // subscription gets the time a first answer takes.
+                let mut cap =
+                    idle_env("POKI_BRIDGED_AX_CAP_MS", 1500).unwrap_or(Duration::from_secs(20));
+                if self.ax.is_none() {
+                    let settings = crate::ax::watch::Settings::from_env();
+                    self.ax = Some(
+                        crate::ax::watch::Watch::open(&mut device.adapter, &device.rsd, settings)
+                            .await?,
+                    );
+                    self.ax_opened += 1;
+                    cap = cap.max(Duration::from_secs(3));
+                }
+                let (tree, served) = self.ax.as_mut().expect("open").read(cap).await?;
+                timings.ax = Some(served);
+                Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(tree)
+            }
+            .await;
+            match result {
+                Ok(tree) => return Ok(tree),
+                Err(error) => {
+                    log(&format!(
+                        "held accessibility subscription failed ({error}); reading once without it"
+                    ));
+                    self.ax = None;
+                    self.ax_link = None;
+                    self.ax_fallbacks += 1;
+                    self.ax_last_error = Some(error.to_string());
+                    timings.ax = Some(crate::ax::watch::Served::Fallback);
+                    if let Some(link) = self.link.as_mut()
+                        && let Ok(tree) =
+                            ax::read_tree(&mut link.device.adapter, &link.device.rsd, false).await
+                    {
+                        return Ok(tree);
+                    }
+                    self.reset().await;
+                    if !reused || attempt > 0 {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                    timings.retried = true;
+                }
+            }
+        }
+    }
+
+    /// The ops of poki-native's `execute` that need only the tunnel. A launch error is returned as an
+    /// error here so the caller can retry it; poki-native reports it as a not-sent result.
+    async fn tunnel_op(&mut self, request: Request) -> Result<Value> {
+        let Device {
+            adapter,
+            rsd,
+            provider,
+            ..
+        } = &mut self.link.as_mut().expect("connected").device;
+        match request {
+            Request::LaunchApp(request) => apps::launch(adapter, rsd, request).await,
+            Request::ListApps => apps::list(adapter, rsd, provider.as_deref()).await,
+            Request::Configuration { method, value } => {
+                configuration::execute(adapter, rsd, &method, value).await
+            }
+            Request::AxTree { include_offscreen } => {
+                ax::read_tree(adapter, rsd, include_offscreen).await
+            }
+            Request::AppForPid { pid } => apps::app_for_pid(adapter, rsd, pid).await,
+            Request::LockdownGet { domain, key } => {
+                device_ops::lockdown_get(adapter, rsd, domain.as_deref(), &key).await
+            }
+            Request::Screenshot { path } => device_ops::screenshot(adapter, rsd, &path).await,
+            Request::Rotate { direction } => device_ops::rotate(adapter, rsd, &direction).await,
+            Request::Pasteboard { action, text } => {
+                device_ops::pasteboard(adapter, rsd, &action, text.as_deref()).await
+            }
+            Request::Location {
+                action,
+                latitude,
+                longitude,
+            } => device_ops::location(adapter, rsd, &action, latitude.zip(longitude)).await,
+            Request::DisplayInfo => {
+                let mut display = DisplayServiceClient::connect_rsd(adapter, rsd).await?;
+                let info = display.get_media_support_info().await?;
+                Ok(serde_json::to_value(info)?)
+            }
+            _ => unreachable!("on_tunnel"),
+        }
+    }
+
+    /// Opens what an input op needs and is not open yet: the tunnel, the media session (then
+    /// `POKI_HID_OPEN_MS`, as poki-native waits) and, for touches, the touch connection.
+    async fn prepare_input(&mut self, touch: bool, timings: &mut Timings) -> Result<()> {
+        self.connect(timings).await?;
+        let device = &mut self.link.as_mut().expect("connected").device;
+        if self.input.is_none() {
+            let started = Instant::now();
+            let media = stream::start_screen_media_stream(&mut device.adapter, &mut device.rsd, 1)
+                .await
+                .map_err(|e| format!("Cannot establish input media session: {e}"))?;
+            trace("media ready");
+            let stream::ScreenMediaStream {
+                client,
+                audio_udp,
+                video_udp,
+            } = media;
+            let drains = [audio_udp, video_udp]
+                .into_iter()
+                .map(|socket| tokio::spawn(async move { while socket.recv().await.is_ok() {} }))
+                .collect();
+            let mut input = Input {
+                client,
+                drains,
+                touch: None,
+                buttons: None,
+            };
+            tokio::time::sleep(hid_wait("POKI_HID_OPEN_MS", 1000)).await;
+            if touch {
+                input.touch = Some(Touch::connect_rsd(&mut device.adapter, &mut device.rsd).await?);
+            }
+            self.input = Some(input);
+            timings.input_open_ms = Some(ms(started));
+            return Ok(());
+        }
+        timings.reused_input = true;
+        let input = self.input.as_mut().expect("open");
+        if touch && input.touch.is_none() {
+            input.touch = Some(Touch::connect_rsd(&mut device.adapter, &mut device.rsd).await?);
+        }
+        Ok(())
+    }
+
+    /// Opens the input services, retrying once on a fresh tunnel when a reused one fails.
+    async fn prepare_input_or_retry(&mut self, touch: bool, timings: &mut Timings) -> Result<()> {
+        let reused = self.link.is_some();
+        match self.prepare_input(touch, timings).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.reset().await;
+                if !reused || timings.retried {
+                    return Err(error);
+                }
+                timings.retried = true;
+                log(&format!(
+                    "input services failed on a reused tunnel ({error}); reconnecting"
+                ));
+                self.prepare_input(touch, timings).await
+            }
+        }
+    }
+
+    async fn input_op(
+        &mut self,
+        request: Request,
+        object: &Map<String, Value>,
+        timings: &mut Timings,
+    ) -> Result<Value> {
+        let touch = uses_touch(&request);
+        self.prepare_input_or_retry(touch, timings).await?;
+        // A tap's first report is the only point where a failure means nothing reached the phone.
+        let request = match request {
+            Request::Tap { x, y, .. }
+            | Request::LongPress { x, y, .. }
+            | Request::DoubleTap { x, y, .. } => {
+                if let Err(error) = self.contact(x, y).await {
+                    self.reset().await;
+                    if timings.retried {
+                        return Err(error);
+                    }
+                    timings.retried = true;
+                    log(&format!(
+                        "touch report failed on a reused connection ({error}); reconnecting"
+                    ));
+                    self.prepare_input(true, timings).await?;
+                    self.contact(x, y).await?;
+                }
+                parse(object)?
+            }
+            request => request,
+        };
+        let result = Box::pin(self.input_action(request)).await;
+        if result.is_err() {
+            self.reset().await;
+        }
+        result
+    }
+
+    async fn contact(&mut self, x: u16, y: u16) -> Result<()> {
+        let touch = self
+            .input
+            .as_mut()
+            .and_then(|i| i.touch.as_mut())
+            .ok_or("no touch connection")?;
+        touch
+            .send_touchscreen(TOUCHSCREEN_STATE_CONTACT, x, y, None)
+            .await?;
+        Ok(())
+    }
+
+    /// poki-native's input actions, on held connections. For taps the first contact has already been
+    /// sent by `input_op`.
+    async fn input_action(&mut self, request: Request) -> Result<Value> {
+        let device = &mut self.link.as_mut().expect("connected").device;
+        let input = self.input.as_mut().expect("open");
+        let (adapter, rsd) = (&mut device.adapter, &mut device.rsd);
+        match request {
+            Request::Tap { x, y, duration_ms } | Request::LongPress { x, y, duration_ms } => {
+                let hid = input.touch.as_mut().expect("touch");
+                tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                hid.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, x, y, None)
+                    .await?;
+            }
+            Request::DoubleTap { x, y, duration_ms } => {
+                let hid = input.touch.as_mut().expect("touch");
+                tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                hid.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, x, y, None)
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                held_tap(hid, x, y, duration_ms).await?;
+            }
+            Request::Drag {
+                x1,
+                y1,
+                x2,
+                y2,
+                duration_ms,
+                hold_ms,
+                end_hold_ms,
+            } => {
+                Drag {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    duration_ms,
+                    hold_ms,
+                    end_hold_ms,
+                }
+                .send(input.touch.as_mut().expect("touch"))
+                .await?;
+            }
+            Request::Pinch {
+                x,
+                y,
+                start_distance,
+                end_distance,
+                angle,
+                duration_ms,
+            } => {
+                Pinch {
+                    x,
+                    y,
+                    start_distance,
+                    end_distance,
+                    angle,
+                    duration_ms,
+                }
+                .send(input.touch.as_mut().expect("touch"))
+                .await?;
+            }
+            Request::Key {
+                key,
+                modifiers,
+                count,
+            } => {
+                let mut keyboard = Keyboard::connect(adapter, rsd).await?;
+                let usages = modifiers
+                    .iter()
+                    .map(|m| modifier_usage(m))
+                    .collect::<Result<Vec<_>>>()?;
+                let outcome: Result<()> = async {
+                    for _ in 0..count {
+                        chord(&mut keyboard, key_usage(&key)?, &usages).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                let cleanup = keyboard.close().await;
+                outcome?;
+                cleanup?;
+            }
+            Request::Button {
+                button,
+                count,
+                interval_ms,
+            } => {
+                if input.buttons.is_none() {
+                    input.buttons = Some(Indigo::connect_rsd(adapter, rsd).await?);
+                }
+                let buttons = input.buttons.as_mut().expect("buttons");
+                let (code, duration) = button_usage(&button)?;
+                for index in 0..count {
+                    if index > 0 {
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    }
+                    buttons.send_button(0x0c, code, ButtonState::Down).await?;
+                    tokio::time::sleep(Duration::from_millis(duration)).await;
+                    buttons.send_button(0x0c, code, ButtonState::Up).await?;
+                }
+            }
+            Request::TypeText {
+                text,
+                clear,
+                submit,
+                target,
+            } => {
+                let mut keyboard = Keyboard::connect(adapter, rsd).await?;
+                let outcome = pasteboard::paste_text(
+                    adapter,
+                    rsd,
+                    &mut keyboard,
+                    &text,
+                    clear,
+                    submit,
+                    target.as_ref(),
+                )
+                .await;
+                let cleanup = keyboard.close().await;
+                let result = outcome?;
+                cleanup?;
+                return Ok(result);
+            }
+            _ => unreachable!("not an input op"),
+        }
+        Ok(json!({"sent":true,"screen_change_verified":false}))
+    }
+}
+
+#[cfg(test)]
+mod daemon_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("poki-bridged")
+            .chain(list.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn socket_argument_comes_with_the_native_target_arguments() {
+        let (socket, target) = parse_daemon_args(&args(&[
+            "--socket",
+            "/run/poki/a.sock",
+            "--host",
+            "192.0.2.1",
+            "--rp-pairing-file",
+            "/tmp/rp.plist",
+        ]))
+        .unwrap();
+        assert_eq!(socket, PathBuf::from("/run/poki/a.sock"));
+        assert!(matches!(target, Target::RemotePairing { .. }));
+        let (_, target) =
+            parse_daemon_args(&args(&["--udid", "X", "--socket", "/tmp/b.sock"])).unwrap();
+        assert_eq!(target, Target::Usbmuxd { udid: "X".into() });
+        for list in [
+            &["--udid", "X"][..],
+            &["--socket", "/tmp/a.sock"],
+            &["--socket", "--udid", "X"],
+            &["--socket", "", "--udid", "X"],
+            &["--socket", "/a", "--socket", "/b", "--udid", "X"],
+            &["--socket", "/a", "--udid"],
+        ] {
+            assert!(parse_daemon_args(&args(list)).is_err(), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn requests_keep_their_id_out_of_the_native_request() {
+        let (id, op, object) = split(r#"{"id":7,"op":"tap","x":1,"y":2}"#).unwrap();
+        assert_eq!(id, json!(7));
+        assert_eq!(op, "tap");
+        assert!(parse(&object).is_ok());
+        let (id, _, object) = split(r#"{"op":"ax_tree"}"#).unwrap();
+        assert_eq!(id, Value::Null);
+        assert!(matches!(
+            parse(&object).unwrap(),
+            Request::AxTree {
+                include_offscreen: false
+            }
+        ));
+        assert!(split("[1]").is_err());
+        assert!(split("{").is_err());
+        let (_, _, object) = split(r#"{"id":"a","op":"tap","x":1,"y":2,"extra":1}"#).unwrap();
+        assert!(
+            parse(&object).is_err(),
+            "unknown fields are refused as poki-native refuses them"
+        );
+    }
+
+    #[test]
+    fn answers_carry_poki_native_output_verbatim() {
+        let output = json!({"sent": true, "screen_change_verified": false, "x": 1.0});
+        let answer = success(json!(1), &output, Timings::default());
+        assert_eq!(answer["stdout"], json!(output.to_string()));
+        assert_eq!(
+            answer["stdout"].as_str().unwrap(),
+            r#"{"screen_change_verified":false,"sent":true,"x":1.0}"#
+        );
+        let error: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        let answer = failure(json!("q"), &*error, Timings::default());
+        assert_eq!(answer["ok"], json!(false));
+        assert_eq!(
+            answer["stderr"].as_str().unwrap(),
+            r#"{"error":"boom","screen_change_verified":false}"#
+        );
+    }
+
+    #[test]
+    fn only_reads_are_retried() {
+        let read = |text: &str| reads_only(&parse(&split(text).unwrap().2).unwrap());
+        assert!(read(r#"{"op":"ax_tree"}"#));
+        assert!(read(r#"{"op":"app_for_pid","pid":42}"#));
+        assert!(read(r#"{"op":"pasteboard","action":"get"}"#));
+        assert!(read(r#"{"op":"configuration","method":"get_appearance"}"#));
+        assert!(!read(r#"{"op":"pasteboard","action":"set","text":"x"}"#));
+        assert!(!read(
+            r#"{"op":"configuration","method":"set_appearance","value":"dark"}"#
+        ));
+        assert!(!read(r#"{"op":"tap","x":1,"y":1}"#));
+        assert!(!read(r#"{"op":"rotate"}"#));
+    }
+
+    fn temp_socket(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pb-{name}-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ))
+    }
+
+    async fn ask(stream: &mut BufReader<UnixStream>, line: &str) -> Value {
+        stream
+            .get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_line(&mut answer).await.unwrap();
+        serde_json::from_str(&answer).unwrap()
+    }
+
+    /// The daemon over a real socket, against a target it cannot reach: the answers match what
+    /// poki-native prints for the same failure, and the socket protocol works end to end.
+    #[tokio::test]
+    async fn serves_requests_over_the_socket() {
+        tokio::task::LocalSet::new()
+            .run_until(serves_requests())
+            .await;
+    }
+
+    async fn serves_requests() {
+        let socket = temp_socket("serve");
+        let missing = std::env::temp_dir().join("poki-bridged-test-missing.plist");
+        let target = Target::RemotePairing {
+            host: "127.0.0.1".parse().unwrap(),
+            rp_pairing_file: missing.clone(),
+            host_name: Some("test".into()),
+        };
+        let listener = bind(&socket).await.unwrap();
+        assert_eq!(
+            bind(&socket).await.err().map(|e| e.to_string()).as_deref(),
+            Some(ALREADY_RUNNING)
+        );
+        let state = Rc::new(State::new(target));
+        let server = tokio::task::spawn_local(serve(listener, state.clone()));
+        let mut client = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+
+        let pong = ask(&mut client, r#"{"id":1,"op":"ping"}"#).await;
+        assert_eq!(pong["id"], json!(1));
+        assert_eq!(pong["pong"]["tunnel"], json!(false));
+
+        let started = Instant::now();
+        let answer = ask(&mut client, r#"{"id":2,"op":"ax_tree"}"#).await;
+        println!(
+            "unreachable ax_tree answered in {} ms: {answer}",
+            ms(started)
+        );
+        assert_eq!(answer["ok"], json!(false));
+        let expected = remote::read_pairing_file(&missing, Some("test"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            answer["stderr"].as_str().unwrap(),
+            json!({"error": expected, "screen_change_verified": false}).to_string()
+        );
+
+        let answer = ask(&mut client, r#"{"id":3,"op":"tap","x":1}"#).await;
+        assert_eq!(
+            answer["ok"],
+            json!(false),
+            "invalid requests are refused before connecting"
+        );
+        let answer = ask(
+            &mut client,
+            r#"{"id":4,"op":"location","action":"set","latitude":1,"longitude":2}"#,
+        )
+        .await;
+        assert!(answer["stderr"].as_str().unwrap().contains("held location"));
+        let answer = ask(&mut client, "not json").await;
+        assert_eq!(answer["ok"], json!(false));
+
+        let answer = ask(&mut client, r#"{"id":5,"op":"shutdown"}"#).await;
+        assert_eq!(answer["ok"], json!(true));
+        server.await.unwrap().unwrap();
+        assert_eq!(state.session.lock().await.ops, 3);
+        let _ = std::fs::remove_file(&socket);
+    }
+}
