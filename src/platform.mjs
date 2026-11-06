@@ -8,6 +8,8 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import { idevice, stateDir, root } from './config.mjs';
+import { jsonToXmlPlist, plistToJson, plistValue, setPlistBooleans } from './plist.mjs';
+import { unzipArchive, zipDirectory } from './zip.mjs';
 import { startRecording, stopRecording, closeRecordings } from './recording.mjs';
 import { openInput, selectKeyboard } from './simulator-input.mjs';
 import { holdLocation, isNetworkId, nativeArgs, runIdeviceTool } from './network-device.mjs';
@@ -79,9 +81,10 @@ async function prepareSimulatorAccessibility(target) {
   const temporary = await mkdtemp(join(directory, '.poki-mcp-accessibility-'));
   const staged = join(temporary, 'preferences.plist');
   try {
+    let create = false;
     try { await copyFile(path, staged, constants.COPYFILE_EXCL); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; await platformRun('plutil', ['-create', 'binary1', staged]); }
-    for (const key of ['ApplicationAccessibilityEnabled', 'AutomationEnabled']) await platformRun('plutil', ['-replace', key, '-bool', 'true', staged]);
+    catch (error) { if (error.code !== 'ENOENT') throw error; create = true; }
+    await setPlistBooleans(staged, ['ApplicationAccessibilityEnabled', 'AutomationEnabled'], { create });
     await chmod(staged, 0o600);
     await rename(staged, path);
   } finally { await rm(temporary, { recursive: true, force: true }); }
@@ -146,8 +149,7 @@ async function startSimulator(ctx, args) {
 async function apps(target, includeSystem = false) {
   if (target.kind === 'simulator') {
     const plist = await simctl(['listapps', target.id]);
-    const { stdout } = await platformRun('plutil', ['-convert', 'json', '-o', '-', '-'], { input: plist });
-    return Object.entries(JSON.parse(stdout)).map(([id, app]) => ({
+    return Object.entries(await plistToJson(plist)).map(([id, app]) => ({
       bundle_id: id, name: app.CFBundleDisplayName ?? app.CFBundleName ?? id,
       system: app.ApplicationType === 'System', version: app.CFBundleShortVersionString,
       path: app.Path, executable: app.CFBundleExecutable,
@@ -335,14 +337,13 @@ async function install(target, value) {
     if (extname(path).toLowerCase() === '.ipa') {
       if (target.kind === 'simulator') throw new Error('A simulator requires a simulator-built .app, not an .ipa.');
       temporary = await newDirectory(join(stateDir, 'install'), 'ipa-');
-      await platformRun('ditto', ['-x', '-k', path, temporary]);
+      await unzipArchive(path, temporary);
       const bundles = (await readdir(join(temporary, 'Payload'))).filter(f => f.endsWith('.app'));
       if (bundles.length !== 1) throw new Error('The .ipa must contain exactly one Payload/*.app.');
       source = join(temporary, 'Payload', bundles[0]);
     }
     if (extname(source).toLowerCase() !== '.app' || !(await stat(source)).isDirectory()) throw new Error('Install expects an .app directory or .ipa archive.');
-    const { stdout } = await platformRun('plutil', ['-extract', 'CFBundleIdentifier', 'raw', '-o', '-', join(source, 'Info.plist')]);
-    const bundle = stdout.trim();
+    const bundle = await plistValue(join(source, 'Info.plist'), 'CFBundleIdentifier');
     if (target.kind === 'simulator') await simctl(['install', target.id, source]);
     else {
       let archive = path;
@@ -352,7 +353,7 @@ async function install(target, value) {
         await mkdir(payload);
         await cp(source, join(payload, basename(source)), { recursive: true, verbatimSymlinks: true });
         archive = join(temporary, 'package.ipa');
-        await platformRun('ditto', ['-c', '-k', '--keepParent', payload, archive]);
+        await zipDirectory(payload, archive);
       }
       return await applicationMutation(target, { op: 'install_app', ipa_path: archive, bundle_id: bundle }, async () => {
         const app = (await apps(target, true)).find(app => app.bundle_id === bundle);
@@ -622,8 +623,7 @@ async function downloadContainer(target, args) {
     await cp(source, data, { recursive: true, errorOnExist: true, force: false, dereference: false });
   } else await devicectl(target.id, ['device', 'copy', 'from', '--domain-type', 'appDataContainer', '--domain-identifier', app.bundle_id, '--source', '.', '--destination', data], 180000);
   const plist = { ApplicationBundleIdentifier: app.bundle_id, ApplicationName: app.name, ContainerType: 'AppData' };
-  const converted = await platformRun('plutil', ['-convert', 'xml1', '-o', '-', '-'], { input: JSON.stringify(plist) });
-  await writeFile(join(packagePath, 'AppDataInfo.plist'), converted.stdout, { mode: 0o600, flag: 'wx' });
+  await writeFile(join(packagePath, 'AppDataInfo.plist'), await jsonToXmlPlist(plist), { mode: 0o600, flag: 'wx' });
   return { bundle_id: app.bundle_id, path: packagePath };
 }
 
@@ -753,7 +753,13 @@ export async function platformTool(ctx, name, args = {}) {
       const result = await physical(target.id, ['pasteboard', 'paste']);
       const listing = await physical(target.id, ['pasteboard', 'items']);
       const types = [...listing.stdout.matchAll(/^\[\d+\] ([^:]+):/gm)].map(match => match[1]);
-      const imageInfo = JSON.parse((await platformRun(join(root, 'build/simulator'), [], { input: JSON.stringify({ op: 'image_types', types }) })).stdout);
+      // The image-type probe is the macOS helper build/simulator. Without it the text and the raw
+      // type list are still returned, and the reply says the image check did not run.
+      const probe = join(root, 'build/simulator');
+      if (process.platform !== 'darwin' || !(await access(probe, constants.X_OK).then(() => true, () => false))) {
+        return { text: result.stdout, types, image_check: 'unavailable', note: 'contains_image was not determined: the image-type check needs the macOS helper build/simulator. Use types to judge whether an image is on the clipboard.' };
+      }
+      const imageInfo = JSON.parse((await platformRun(probe, [], { input: JSON.stringify({ op: 'image_types', types }) })).stdout);
       return { text: result.stdout, ...imageInfo, types };
     }
     case 'set_clipboard': {

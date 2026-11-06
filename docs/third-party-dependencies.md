@@ -41,6 +41,7 @@ Includes every entry in `package-lock.json`. Optional and platform-specific entr
 | `@modelcontextprotocol/core` | 2.4.0 | Apache-2.0 | [github.com/modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | regular dependency |
 | `@modelcontextprotocol/node` | 2.1.2 | Apache-2.0 | [github.com/modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | regular dependency |
 | `@modelcontextprotocol/server` | 2.4.0 | Apache-2.0 | [github.com/modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | regular dependency |
+| `@xmldom/xmldom` | 0.9.12 | MIT | [github.com/xmldom/xmldom](https://github.com/xmldom/xmldom) | regular dependency |
 | `cross-spawn` | 7.0.6 | MIT | [github.com/moxystudio/node-cross-spawn](https://github.com/moxystudio/node-cross-spawn) | regular dependency |
 | `detect-libc` | 2.1.2 | Apache-2.0 | [github.com/lovell/detect-libc](https://github.com/lovell/detect-libc) | regular dependency |
 | `eventsource` | 3.0.7 | MIT | [github.com/EventSource/eventsource](https://github.com/EventSource/eventsource) | regular dependency |
@@ -50,12 +51,14 @@ Includes every entry in `package-lock.json`. Optional and platform-specific entr
 | `jose` | 6.2.15 | MIT | [github.com/panva/jose](https://github.com/panva/jose) | regular dependency |
 | `path-key` | 3.1.1 | MIT | [github.com/sindresorhus/path-key](https://github.com/sindresorhus/path-key) | regular dependency |
 | `pkce-challenge` | 5.0.1 | MIT | [github.com/crouchcd/pkce-challenge](https://github.com/crouchcd/pkce-challenge) | regular dependency |
+| `plist` | 5.0.0 | MIT | [github.com/TooTallNate/plist.js](https://github.com/TooTallNate/plist.js) | regular dependency |
 | `semver` | 7.8.6 | ISC | [github.com/npm/node-semver](https://github.com/npm/node-semver) | regular dependency |
 | `sharp` | 0.34.5 | Apache-2.0 | [github.com/lovell/sharp](https://github.com/lovell/sharp) | regular dependency |
 | `shebang-command` | 2.0.0 | MIT | [github.com/kevva/shebang-command](https://github.com/kevva/shebang-command) | regular dependency |
 | `shebang-regex` | 3.0.0 | MIT | [github.com/sindresorhus/shebang-regex](https://github.com/sindresorhus/shebang-regex) | regular dependency |
 | `tslib` | 2.9.1 | 0BSD | [github.com/Microsoft/tslib](https://github.com/Microsoft/tslib) | optional |
 | `which` | 2.0.2 | ISC | [github.com/isaacs/node-which](https://github.com/isaacs/node-which) | regular dependency |
+| `xmlbuilder` | 15.1.1 | MIT | [github.com/oozcitak/xmlbuilder-js](https://github.com/oozcitak/xmlbuilder-js) | regular dependency |
 | `zod` | 4.6.7 | MIT | [github.com/colinhacks/zod](https://github.com/colinhacks/zod) | regular dependency |
 
 ## Rust packages

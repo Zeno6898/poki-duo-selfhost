@@ -28,13 +28,14 @@ The optional `bin/setup-channels` command downloads the unmodified [BlueBubbles 
 
 ## JavaScript packages
 
-The exact installed versions come from `package-lock.json`. These packages provide the MCP server/client transports, image processing and input validation:
+The exact installed versions come from `package-lock.json`. These packages provide the MCP server/client transports, image processing, input validation and property lists:
 
 | Repository | Packages and locked versions | License |
 | --- | --- | --- |
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | `@modelcontextprotocol/client`, `core`, `server` 2.4.0; `@modelcontextprotocol/node` 2.1.2 | Package metadata declares Apache-2.0. The upstream license also retains MIT for contributions without relicensing consent; its complete text is preserved in [third_party/LICENSE.typescript-sdk](third_party/LICENSE.typescript-sdk). |
 | [sharp](https://github.com/lovell/sharp/tree/e0624568686516209c434de2d3c0ef6688f0811d) | `sharp` and applicable `@img/sharp-*` packages 0.34.5 | Apache-2.0; full text in [third_party/LICENSE.sharp](third_party/LICENSE.sharp). |
 | [Zod](https://github.com/colinhacks/zod/tree/b500a2ee95134f81d74da7911d7378dd2853d042) | `zod` 4.6.7 | MIT; full text in [third_party/LICENSE.zod](third_party/LICENSE.zod). |
+| [plist.js](https://github.com/TooTallNate/plist.js) | `plist` 5.0.0, with `@xmldom/xmldom` 0.9.12 and `xmlbuilder` 15.1.1 | MIT; full text in [third_party/LICENSE.plist](third_party/LICENSE.plist). Used off macOS in place of `plutil`. |
 
 The [dependency inventory](docs/third-party-dependencies.md#npm-packages) names every locked npm package, its source repository, declared license and platform conditions. It includes transitive packages such as Hono, EventSource, jose and cross-spawn.
 

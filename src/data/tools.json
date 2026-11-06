@@ -1123,7 +1123,7 @@
     },
     {
       "name": "request_human_action",
-      "description": "Optional. Show a macOS dialog asking the user to complete reason on the device; no other tool requires it. Wait for an actual Done/Cancel response, up to timeout_seconds (default 300). Done is an acknowledgment; inspect the device before continuing. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Optional. Ask the user to complete reason on the device, with a dialog on macOS or an MCP elicitation elsewhere; no other tool requires it. Wait for an actual Done/Cancel response, up to timeout_seconds (default 300). Done is an acknowledgment; inspect the device before continuing. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
