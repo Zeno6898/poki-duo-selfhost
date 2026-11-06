@@ -409,7 +409,7 @@ export async function interaction(ctx, name, args) {
       if (!await keyboardVisible()) return { hidden: true, already_hidden: true };
       await ctx.input({ op: 'button', button: 'keyboard' });
       if (await keyboardVisible()) throw new Error("The keyboard is still visible after the toggle. Use its hide control, or tap outside the field if the app supports dismissing it that way.");
-      return { hidden: true, screen_change_verified: true };
+      return { hidden: true, screen_change: 'changed', screen_change_verified: true };
     }
     case 'system_gesture': {
       if (args.gesture === 'go_home') return ctx.input({ op: 'button', button: 'home' });

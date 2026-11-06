@@ -34,6 +34,14 @@ const onScreen = ({ width, height }) => element => {
   return box.x < width && box.y < height && box.x + box.width > 0 && box.y + box.height > 0;
 };
 
+// "unknown" means the screen could not be compared, never that nothing happened. screen_change_verified and
+// screen_changed are the earlier two-field form, kept for clients that read them.
+export function screenChange(before, after) {
+  if (before === undefined || after === undefined) return { screen_change: 'unknown', screen_change_verified: false };
+  const changed = after !== before;
+  return { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
+}
+
 export function hidPoint(x, y, width, height) {
   if (![x,y,width,height].every(Number.isFinite) || width < 2 || height < 2 || x < 0 || y < 0 || x >= width || y >= height) throw new Error(`Coordinates must be inside the screen (${width} × ${height} points).`);
   return [Math.round(x / (width - 1) * 65535), Math.round(y / (height - 1) * 65535)];
@@ -264,14 +272,14 @@ export class Devices {
     try {
       const target = await this.target();
       const { signature, screen } = await deadline(this.observationBudget(target), () => readScreen(this));
-      const compared = before !== undefined && signature !== undefined;
-      return { screen, screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
+      return { screen, ...screenChange(before, signature) };
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
       // Input clears the last read, so one left now was taken after the action: report it rather than nothing.
       const seen = this.seen?.device === this.resolved?.id && this.seen.elements.length ? this.seen : undefined;
-      if (!seen) return { screen_change_verified: false, screen: { unavailable: error.message } };
-      return { screen_change_verified: false, screen: { ...describeScreen(seen), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
+      if (!seen) return { ...screenChange(), screen: { unavailable: error.message } };
+      // One read that differs settles a change; a matching one needed a second read to confirm it.
+      return { ...screenChange(before, before !== undefined && seen.signature !== before ? seen.signature : undefined), screen: { ...describeScreen(seen), partial: true, reason: `${error.message}: the screen may still have been changing; this is the last complete read.` } };
     }
   }
   // The action does not depend on this read, so a slow read only costs the comparison.
@@ -281,11 +289,11 @@ export class Devices {
   // A batch step reports only whether its touch changed the screen; the batch ends with the screen itself.
   async changedSince(before) {
     try {
-      const changed = await deadline(readbackMs, () => screenChanged(this, before));
-      return changed === undefined ? {} : { screen_change_verified: true, screen_changed: changed };
+      const changed = await deadline(this.observationBudget(await this.target()), () => screenChanged(this, before));
+      return changed === undefined ? screenChange() : { screen_change: changed ? 'changed' : 'unchanged', screen_change_verified: true, screen_changed: changed };
     } catch {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
-      return {};
+      return screenChange();
     }
   }
   // Lets the app react to the last input, so a read shows the new page rather than the old one.
@@ -438,7 +446,9 @@ export class Devices {
           const sentTo = this.beforeInput ?? before, signature = sentTo?.elements.length ? sentTo.signature : undefined;
           if (looks && delivered) result = { ...result, ...await this.readback(signature) };
           else if (touches && delivered && signature !== undefined) result = { ...result, ...await this.changedSince(signature) };
-          const unchanged = touches && result.screen_changed === false && !result.stopped;
+          // The input layers answer screen_change_verified false before anything is read, which means not looked at, not unchanged.
+          if (result.screen_change === undefined && result.screen_change_verified === false && !this.inBatch) result = { ...result, screen_change: 'unknown' };
+          const unchanged = touches && result.screen_change === 'unchanged' && !result.stopped;
           if (unchanged) result = { ...result, instruction: unchangedAdvice };
           // The input layers always answer false here. Only a touch is compared inside a batch; the batch ends with the screen.
           if (this.inBatch && result.screen_change_verified === false) { const { screen_change_verified, ...rest } = result; result = rest; }

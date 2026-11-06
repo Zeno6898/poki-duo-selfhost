@@ -427,7 +427,7 @@ async function observeAction(ctx, action) {
     if (changed) break;
     await pause(200);
   } while (Date.now() < deadline);
-  return { ...result, screen_changed: changed, screen_change_verified: true, foreground_before: before.foreground, foreground_after: after.foreground,
+  return { ...result, screen_change: changed ? 'changed' : 'unchanged', screen_changed: changed, screen_change_verified: true, foreground_before: before.foreground, foreground_after: after.foreground,
     ...(!changed ? { notice: 'The URL was accepted, but the screen did not visibly change afterwards.' } : {}) };
 }
 

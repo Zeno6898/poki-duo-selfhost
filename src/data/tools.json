@@ -176,7 +176,7 @@
     },
     {
       "name": "tap",
-      "description": "Tap at x/y in screen points or at the center of a current element ref. Refresh refs with list_elements after input; ambiguous or stale targets are rejected. sent=true only means the touch was written to the device. screen_changed compares what accessibility reports before and after the tap: the elements, their text, values, selected/enabled/focused state and positions. false means no change was observed, which is not proof the tap failed (an effect on a canvas or image, or one that arrives late, is not seen); the reply says so in instruction. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Tap at x/y in screen points or at the center of a current element ref. Refresh refs with list_elements after input; ambiguous or stale targets are rejected. sent=true only means the touch was written to the device. screen_change compares what accessibility reports before and after the tap: the elements, their text, values, selected/enabled/focused state and positions. It is changed, unchanged, or unknown when the screen could not be compared in time (unknown is not a failure). unchanged is not proof the tap failed (an effect on a canvas or image, or one that arrives late, is not seen); the reply says so in instruction. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -202,7 +202,7 @@
     },
     {
       "name": "tap_text",
-      "description": "Find one visible element matching text, waiting up to five seconds for it to appear and hold still, trying OCR when needed, and tap it. Returns the visible text afterwards and screen_changed. sent=true only means the touch was written to the device, which does not acknowledge it. screen_changed compares what accessibility reports before and after the tap: the elements, their text, values, selected/enabled/focused state and positions. false means no change was observed, which is not proof the tap failed (an effect on a canvas or image, or one that arrives late, is not seen); the reply says so in instruction. Multiple matches produce an error without tapping; a missing target reports the closest text on screen. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Find one visible element matching text, waiting up to five seconds for it to appear and hold still, trying OCR when needed, and tap it. Returns the visible text afterwards and screen_change. sent=true only means the touch was written to the device, which does not acknowledge it. screen_change compares what accessibility reports before and after the tap: the elements, their text, values, selected/enabled/focused state and positions. It is changed, unchanged, or unknown when the screen could not be compared in time (unknown is not a failure). unchanged is not proof the tap failed (an effect on a canvas or image, or one that arrives late, is not seen); the reply says so in instruction. Multiple matches produce an error without tapping; a missing target reports the closest text on screen. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -320,7 +320,7 @@
     },
     {
       "name": "scroll",
-      "description": "Scroll up, down, left, or right around x/y, or the screen center when omitted. Coordinates use logical points. Waits for the list to stop, then returns screen_changed (false means it did not move, as at the end of a list) and the visible text, so there is no need to look again. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
+      "description": "Scroll up, down, left, or right around x/y, or the screen center when omitted. Coordinates use logical points. Waits for the list to stop, then returns screen_change (unchanged means it did not move, as at the end of a list; unknown means it could not be compared) and the visible text, so there is no need to look again. Optional device selects an id or name; otherwise the session selection or sole available device is used.",
       "inputSchema": {
         "type": "object",
         "properties": {
