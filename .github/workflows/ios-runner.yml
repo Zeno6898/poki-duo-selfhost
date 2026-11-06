@@ -27,7 +27,7 @@ jobs:
         run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
 
       - name: Apply Poki's runner patch (opened by hand it sends people to Poki; its screen while in use)
-        run: cd native/ios-runner/WebDriverAgent && git apply "$GITHUB_WORKSPACE/native/ios-runner/patches/wda-poki-runner.patch" && git diff --stat
+        run: cd native/ios-runner/WebDriverAgent && git apply < "$GITHUB_WORKSPACE/native/ios-runner/patches/wda-poki-runner.patch" && git diff --stat
 
       - name: Build for testing (iOS device SDK, unsigned)
         run: |
