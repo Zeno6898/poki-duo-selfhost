@@ -22,6 +22,7 @@ final class LookDoTests: XCTestCase {
         _ = await core.call("look", [:])
         let settings = wda.bodies("POST /appium/settings").first?["settings"]
         XCTAssertEqual(settings?["animationCoolOffTimeout"]?.double, 0)
+        XCTAssertEqual(settings?["accessibilityDeadline"]?.double, 2, "a read of an app that never idles fails fast instead of blocking WDA")
         XCTAssertEqual(settings?["waitForIdleTimeout"]?.double, 0.5)
     }
 

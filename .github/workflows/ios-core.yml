@@ -112,11 +112,10 @@ jobs:
           pro = [x for x in phones if 'Pro' in x['name'] and 'Max' not in x['name']]
           print((pro or phones)[0]['udid'])" "$(xcrun --sdk iphonesimulator --show-sdk-version)")
           echo "UDID=$UDID" >> "$GITHUB_ENV"
+          # The keyboard's slide-to-type introduction is left on: it loops an animation over the keyboard
+          # the first time a field is typed in, the case accessibilityDeadline is set for (Runner.swift).
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-          # A phone in use has long dismissed the keyboard's slide-to-type introduction; a fresh simulator
-          # shows it over the keyboard on the first field (as Appium does, set it as already shown).
-          xcrun simctl spawn "$UDID" defaults write com.apple.Preferences DidShowContinuousPathIntroduction -bool true
           xcrun simctl list devices | grep "$UDID"
       - name: Build WebDriverAgent for the simulator
         run: xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd build-for-testing -quiet
