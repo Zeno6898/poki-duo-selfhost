@@ -15,6 +15,7 @@ import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
 import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
 import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
+import { routes as routesToBridgeDaemon, runThroughDaemon } from './bridge-daemon.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -41,6 +42,7 @@ export class Devices {
   scales = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
+    if (routesToBridgeDaemon(file, input)) return runThroughDaemon(args, { timeout, input });
     const result = await execute(file, args, { timeout, input });
     return { stdout: result.stdout.trimEnd(), stderr: result.stderr.trimEnd() };
   }
