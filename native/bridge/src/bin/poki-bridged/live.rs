@@ -457,6 +457,15 @@ pub fn foreground_json(state: &State) -> Value {
         "seen_ms_ago": at.elapsed().as_millis() as u64,
         "via": "tree",
     });
+    // Read before the last input: the foreground may have changed since (a fresh tree, e.g.
+    // the AX prefetch at each settle, brings it up to date).
+    let last_input = state
+        .session
+        .try_lock()
+        .ok()
+        .and_then(|session| session.input.as_ref().map(|input| input.frames.live()))
+        .and_then(|live| live.state(Duration::ZERO).last_input);
+    answer["stale"] = last_input.map(|input| at < input).into();
     if let Some(pid) = pid {
         if let Some(known) = f.known.get(&pid) {
             if answer["bundle_id"].is_null() {
@@ -503,7 +512,11 @@ pub async fn resolve_foreground(state: Rc<State>) {
             Ok(app) if app["running"] == true => {
                 f.known.insert(pid, app);
             }
-            Ok(_) | Err(_) => f.failed = Some((pid, Instant::now())),
+            Ok(_) => f.failed = Some((pid, Instant::now())),
+            Err(error) => {
+                log(&format!("foreground: app_for_pid {pid} failed: {error}"));
+                f.failed = Some((pid, Instant::now()));
+            }
         }
     }
 }
