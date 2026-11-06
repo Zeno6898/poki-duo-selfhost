@@ -112,11 +112,21 @@ jobs:
           pro = [x for x in phones if 'Pro' in x['name'] and 'Max' not in x['name']]
           print((pro or phones)[0]['udid'])" "$(xcrun --sdk iphonesimulator --show-sdk-version)")
           echo "UDID=$UDID" >> "$GITHUB_ENV"
+          # A phone in use has long dismissed the keyboard's slide-to-type introduction. On a fresh
+          # simulator it loops an animation over the keyboard and WDA stops answering (30 s+) while it
+          # shows, so it is set as shown, and slide-to-type off, before the first boot.
+          prefs="$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Library/Preferences"
+          mkdir -p "$prefs"
+          for domain in com.apple.Preferences com.apple.keyboard.preferences; do
+            defaults write "$prefs/$domain" DidShowContinuousPathIntroduction -bool true
+            defaults write "$prefs/$domain" KeyboardContinuousPathEnabled -bool false
+          done
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-          # A phone in use has long dismissed the keyboard's slide-to-type introduction; a fresh simulator
-          # shows it over the keyboard on the first field (as Appium does, set it as already shown).
-          xcrun simctl spawn "$UDID" defaults write com.apple.Preferences DidShowContinuousPathIntroduction -bool true
+          for domain in com.apple.Preferences com.apple.keyboard.preferences; do
+            xcrun simctl spawn "$UDID" defaults write "$domain" DidShowContinuousPathIntroduction -bool true
+            xcrun simctl spawn "$UDID" defaults write "$domain" KeyboardContinuousPathEnabled -bool false
+          done
           xcrun simctl list devices | grep "$UDID"
       - name: Build WebDriverAgent for the simulator
         run: xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd build-for-testing -quiet
