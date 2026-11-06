@@ -39,7 +39,7 @@ jobs:
           test -d "$PRODUCTS/$RUNNER"
 
       - name: Brand as Poki
-        run: native/ios-runner/branding/brand.sh "$PRODUCTS/$RUNNER" docs/images/poki-icon.png
+        run: native/ios-runner/branding/brand.sh "$PRODUCTS/$RUNNER" docs/images/poki-icon.png docs/images/runner/AppIcon-1024.png
 
       - name: Package the IPA
         run: |
