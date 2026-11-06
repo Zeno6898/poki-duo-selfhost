@@ -121,3 +121,11 @@ test('a screen says when its read began and how old it is', { timeout: 30000 }, 
  assert.ok(!Number.isNaN(Date.parse(receipt.screen.observed_at)),JSON.stringify(receipt.screen));
  assert.ok(receipt.screen.tree_age_ms>=0);
 });
+
+test('launch_app gives the app a moment to come to the front and says how long it took', { timeout: 30000 }, async t => {
+ const f=await fixture(t);await f.set({foregroundLagReads:6});
+ const result=await f.call('launch_app',{bundle_id:'local.fixture'});
+ assert.notEqual(result.isError,true,result.content[0].text);
+ const launched=value(result);
+ assert.equal(launched.foreground_verified,true);assert.ok(launched.foreground_after_ms>0);
+});
