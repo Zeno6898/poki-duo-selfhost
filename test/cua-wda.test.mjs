@@ -25,13 +25,16 @@ async function fakeWda(t) {
     if (req.method === 'POST' && req.url === '/session') { const id = `s${state.sessions.size + 1}`; state.sessions.add(id); return send({ sessionId: id, capabilities: {} }); }
     if (req.session && (!state.sessions.has(req.session) || state.forget)) { state.forget = false; state.sessions.delete(req.session); return send({ error: 'invalid session id', message: 'Session does not exist' }, 404); }
     if (path === '/window/size') return send({ width: 200, height: 400 });
+    if (path === '/wda/screen') return send({ screenSize: { width: 200, height: 400 }, scale: 2 });
     if (path === '/screenshot') return send(png);
     if (path.startsWith('/source')) { assert.match(req.url, /excluded_attributes=visible/); return send(tree()); }
-    if (path === '/wda/activeAppInfo') return send(state.page === 'home' ? { bundleId: 'com.apple.springboard', name: 'SpringBoard', pid: 30 } : { bundleId: 'local.jot', name: 'Jot', pid: 700 });
+    if (path === '/wda/activeAppInfo') return send(state.page === 'home' ? { bundleId: 'com.apple.springboard', name: 'SpringBoard', pid: 30 } : { bundleId: 'local.jot', name: '', pid: 700 });
     if (path === '/wda/tap') { if (state.page === 'home' && args.x >= 20 && args.x <= 70 && args.y >= 80 && args.y <= 130) state.page = 'note'; else if (state.page === 'note' && args.y >= 50 && args.y <= 80) state.focused = true; return send(null); }
-    if (path === '/wda/keys') { if (state.focused) state.title += args.value.join(''); return send(null); }
+    if (path === '/wda/keys') { if (state.focused) for (const key of args.value) state.title = key === '\b' ? state.title.slice(0, -1) : state.title + key; return send(null); }
     if (path === '/element/active') return send({ ELEMENT: 'field-1' });
-    if (path === '/element/field-1/clear') { state.title = ''; return send(null); }
+    if (path === '/element/field-1/attribute/value') return send(state.title);
+    if (path === '/element/field-1/clear') { state.calls.push('slow clear'); return send(null); }
+    if (path === '/wda/apps/terminate') { state.terminated = args.bundleId; state.page = 'home'; return send(true); }
     if (path === '/wda/homescreen') { state.page = 'home'; return send(null); }
     if (path === '/wda/apps/launch') { state.page = args.bundleId === 'local.jot' ? 'note' : state.page; return send(null); }
     if (path === '/wda/dragfromtoforduration' || path === '/wda/touchAndHold' || path === '/actions') return send(null);
@@ -80,6 +83,9 @@ test('look and do answer the same way on WebDriverAgent: numbered elements, scre
   assert.equal(wda.state.title, 'Milk');
   const cleared = await phone.call('do', { actions: [{ type: 'Tea', ref: numberOf(typed, 'Title = Milk'), clear: true }] });
   assert.match(text(cleared), /TextField "Title = Tea"/);
+  assert.ok(!wda.state.calls.includes('slow clear'), 'clearing deletes with keys, not with WDA element clear');
+  // Every read has a tree of its own: the one after a tap shows the screen after it.
+  assert.equal(wda.state.calls.filter(c => c.startsWith('GET /source')).length, wda.state.calls.filter(c => c === 'GET /screenshot').length);
   // WDA forgot the session: the next request opens a new one and goes through once.
   wda.state.forget = true;
   const home2 = await phone.call('do', { actions: [{ button: 'home' }] });
@@ -87,8 +93,10 @@ test('look and do answer the same way on WebDriverAgent: numbered elements, scre
   assert.equal(wda.state.page, 'home');
   assert.equal(wda.state.sessions.size, 1);
   assert.equal(wda.state.calls.filter(c => c === 'POST /session').length, 2);
-  const swiped = await phone.call('do', { actions: [{ swipe: 'up' }, { long_press: [50, 50] }, { launch: 'local.jot' }] });
-  assert.match(text(swiped), /swipe up \(sent[\s\S]*long_press[\s\S]*launch local.jot \(sent/);
+  const swiped = await phone.call('do', { actions: [{ swipe: 'up' }, { long_press: [50, 50] }, { launch: { bundle: 'local.jot', fresh: true } }] });
+  assert.match(text(swiped), /swipe up \(sent[\s\S]*long_press[\s\S]*launch local.jot \(fresh\) \(sent/);
+  assert.equal(wda.state.terminated, 'local.jot');
+  assert.match(text(swiped), /^app: Jot/m, 'an app WDA does not name is named by its application root');
 });
 
 test('an input WDA refuses is not_sent, and one it never answered is unknown', { timeout: 20000 }, async t => {

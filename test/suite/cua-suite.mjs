@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The fixed device suite for the computer-use profile (POKI_TOOL_PROFILE=cua): three generic tasks on
-// built-in apps, driven the way a model drives the tools, one decision per tool call, each decision
+// built-in apps, each started fresh, driven the way a model drives the tools, one decision per tool call, each decision
 // made only from the previous answer. Run it on the server after every build:
 //
 //   node test/suite/cua-suite.mjs                      the local daemon (its endpoint file)
@@ -51,19 +51,19 @@ async function task(name, body) {
 const tasks = {
   // Read the iOS version from Settings > General > About.
   async settings_version(call) {
-    let a = await call('do', { actions: [{ launch: 'com.apple.Preferences' }] });
-    if (!find(a, /^General$/)) a = await call('do', { actions: [{ scroll_to: 'General' }] });
-    const general = find(a, /^General$/);
+    let a = await call('do', { actions: [{ launch: { bundle: 'com.apple.Preferences', fresh: true } }] });
+    if (!find(a, /^General\b/)) a = await call('do', { actions: [{ scroll_to: 'General' }] });
+    const general = find(a, /^General\b/);
     if (!general) return false;
     a = await call('do', { actions: [{ tap: general }] });
-    const about = find(a, /^About$/);
+    const about = find(a, /^About\b/);
     if (!about) return false;
     a = await call('do', { actions: [{ tap: about }] });
     return has(a, /iOS Version|Software Version/);
   },
   // Open a web page in Safari by typing its address.
   async safari_page(call) {
-    let a = await call('do', { actions: [{ launch: 'com.apple.mobilesafari' }] });
+    let a = await call('do', { actions: [{ launch: { bundle: 'com.apple.mobilesafari', fresh: true } }] });
     let field = find(a, /Address|Search or enter website name|URL/i);
     if (!field) { a = await call('look', {}); field = find(a, /Address|Search or enter website name|URL/i); }
     if (!field) return false;
@@ -74,17 +74,17 @@ const tasks = {
   },
   // Start the stopwatch, stop it after a moment, read it, and reset it.
   async stopwatch(call) {
-    let a = await call('do', { actions: [{ launch: 'com.apple.mobiletimer' }] });
-    const tab = find(a, /^Stopwatch$/);
+    let a = await call('do', { actions: [{ launch: { bundle: 'com.apple.mobiletimer', fresh: true } }] });
+    const tab = find(a, /^Stopwatch\b/);
     if (tab) a = await call('do', { actions: [{ tap: tab }] });
-    const start = find(a, /^Start$/);
+    const start = find(a, /^Start\b/);
     if (!start) return false;
     a = await call('do', { actions: [{ tap: start }, { wait: 1500 }] });
-    const stop = find(a, /^Stop$/);
+    const stop = find(a, /^Stop\b/);
     if (!stop) return false;
     a = await call('do', { actions: [{ tap: stop }] });
     const read = has(a, /\d\d:\d\d[,.]\d\d/);
-    const reset = find(a, /^Reset$/);
+    const reset = find(a, /^Reset\b/);
     if (reset) await call('do', { actions: [{ tap: reset }] });
     return read;
   },

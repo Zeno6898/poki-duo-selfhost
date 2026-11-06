@@ -75,7 +75,9 @@ export function flatten(root) {
 async function readSource(wda) {
   const [source, app] = await Promise.all([wda.call('GET', '/source?format=json&excluded_attributes=visible,accessible,enabled,index'), wda.call('GET', '/wda/activeAppInfo').catch(() => undefined)]);
   const tree = typeof source === 'string' ? JSON.parse(source) : source;
-  return { elements: flatten(tree), foreground: app ? { bundle_id: app.bundleId, name: app.name ?? tree?.label, pid: app.pid } : { name: tree?.label } };
+  // The app's name: WDA's, else the label of the application root (its display name), else the id.
+  const name = app?.name || tree?.label || tree?.name || app?.bundleId || undefined;
+  return { elements: flatten(tree), foreground: { ...(app?.bundleId ? { bundle_id: app.bundleId } : {}), ...(name ? { name } : {}), ...(app?.pid ? { pid: app.pid } : {}) } };
 }
 
 const buttons = { home: 'home', volume_up: 'volumeUp', 'volume-up': 'volumeUp', volume_down: 'volumeDown', 'volume-down': 'volumeDown' };
@@ -89,7 +91,7 @@ export function wdaContext(ctx, url = process.env.POKI_WDA_URL) {
   const wda = new Wda(url);
   const view = Object.create(ctx);
   Object.assign(view, {
-    wda, size: undefined, cua: undefined,
+    wda, size: undefined, cua: undefined, typesEverything: true,
     async target() { return { id: 'wda', kind: 'physical', name: 'WebDriverAgent' }; },
     liveScreen() { return undefined; },
     async screenSize() {
@@ -98,19 +100,20 @@ export function wdaContext(ctx, url = process.env.POKI_WDA_URL) {
       return view.size;
     },
     async capture() {
-      // The tree read that follows every screenshot starts with it: WDA answers both at once.
-      view.pendingSource = { at: performance.now(), promise: readSource(wda) };
-      view.pendingSource.promise.catch(() => {});
       const [png, size] = await Promise.all([wda.call('GET', '/screenshot'), view.screenSize()]);
       return { id: String(Date.now()), device: 'wda', width: size.width, height: size.height, data: Buffer.from(png, 'base64'), at: Date.now() };
     },
     async bridge(request) {
       if (request.op === 'ax') {
-        const pending = view.pendingSource && performance.now() - view.pendingSource.at < 5000 ? view.pendingSource.promise : undefined;
-        view.pendingSource = undefined;
-        return pending ?? readSource(wda);
+        // cua's read asks for this and the screenshot together, so each read gets a tree of its own.
+        return readSource(wda);
       }
-      if (request.op === 'launch_app') { await wda.call('POST', '/wda/apps/launch', { bundleId: request.bundle_id }); return { bundle_id: request.bundle_id }; }
+      if (request.op === 'launch_app') {
+        // A fresh launch ends the app first, so a page it was left on cannot answer for it.
+        if (request.terminate_existing) await wda.call('POST', '/wda/apps/terminate', { bundleId: request.bundle_id }).catch(error => { if (error.delivered !== 'not_sent') throw error; });
+        await wda.call('POST', '/wda/apps/launch', { bundleId: request.bundle_id });
+        return { bundle_id: request.bundle_id };
+      }
       throw new Error(`${request.op} is not available on the WebDriverAgent backend`);
     },
     // Inputs answer like the bridge's: sent, or isError with outcome not_sent or unknown.
@@ -140,16 +143,20 @@ async function send(wda, request, size) {
         { type: 'pointerMove', duration: ms, x: Math.round(x + sign * b), y: Math.round(y) }, { type: 'pointerUp', button: 0 }] });
       return wda.call('POST', '/actions', { actions: [finger('f1', -1), finger('f2', 1)] });
     }
-    case 'type_keys': {
+    case 'type_keys': case 'type_text': {
+      // Clearing deletes what the field being edited holds with Delete keys in the same request:
+      // WDA's element clear retries until the value is empty, which a field like Safari's address bar
+      // (its value is the page, its text selected) never reports, and that took 25 s.
+      let deletes = 0;
       if (request.clear) {
-        // The field being edited, emptied before the new text goes in.
-        const active = await wda.call('GET', '/element/active').catch(() => undefined);
+        const active = await wda.call('GET', '/element/active', undefined, 3000).catch(() => undefined);
         const id = active?.ELEMENT ?? active?.['element-6066-11e4-a52e-4f735466cecf'];
-        if (id) await wda.call('POST', `/element/${id}/clear`, {});
+        const value = id ? await wda.call('GET', `/element/${id}/attribute/value`, undefined, 3000).catch(() => undefined) : undefined;
+        deletes = typeof value === 'string' ? Math.min(400, [...value].length) : 0;
       }
-      return wda.call('POST', '/wda/keys', { value: [...request.text] });
+      const keys = [...'\b'.repeat(deletes), ...request.text];
+      return wda.call('POST', '/wda/keys', { value: keys }, 5000 + 80 * keys.length);
     }
-    case 'type_text': return wda.call('POST', '/wda/keys', { value: [...request.text] });
     case 'key': {
       const text = keyText[String(request.key).toLowerCase()] ?? (String(request.key).length === 1 ? request.key : undefined);
       if (text === undefined) throw new WdaError(`key ${request.key} has no WebDriverAgent equivalent`, { delivered: 'not_sent' });

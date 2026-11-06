@@ -185,6 +185,8 @@ async function typeText(ctx, text, clear = false) {
   // Only a request the bridge refused before sending (a character with no key, an older bridge) may
   // be pasted instead: after a failure part way, a paste would enter the text twice.
   const refused = /cannot type|unknown variant|at most 2000/i.test(String(typed?.error ?? ''));
+  // A backend that types every character (WebDriverAgent) has no paste to fall back on.
+  if (ctx.typesEverything) { const e = new Error(`typing failed: ${typed?.error ?? 'no answer'}`); e.delivery = typed?.outcome === 'not_sent' ? 'not_sent' : 'unknown'; throw e; }
   if (!refused && !clear) { const e = new Error(`typing failed part way (${typed?.error ?? 'no answer'}); not pasted, so the text is not entered twice`); e.delivery = 'unknown'; throw e; }
   const saved = await savedClipboard(ctx);
   if (!saved) { const e = new Error('the keyboard cannot type this text, and the clipboard cannot be saved and put back, so it was not pasted over'); e.delivery = refused ? 'not_sent' : 'unknown'; throw e; }
@@ -265,7 +267,13 @@ async function perform(ctx, action, size, until) {
     await send(ctx, { op: 'pinch', x: p.x, y: p.y, start_distance: start, end_distance: start * scale, duration_ms: 500 }); return ['pinch', `pinch ${JSON.stringify(spec)} x${scale}`];
   }
   if ('button' in action) { await send(ctx, { op: 'button', button: String(action.button) }); return ['button', `button ${action.button}`]; }
-  if ('launch' in action) { await ctx.bridge({ op: 'launch_app', bundle_id: String(action.launch) }); return ['launch', `launch ${action.launch}`]; }
+  if ('launch' in action) {
+    // {launch: "id"} brings the app to the front as it was; {launch: {bundle, fresh: true}} starts it anew.
+    const spec = typeof action.launch === 'string' ? { bundle: action.launch } : action.launch ?? {};
+    if (!spec.bundle) throw new NotSent('launch takes a bundle id');
+    await ctx.bridge({ op: 'launch_app', bundle_id: String(spec.bundle), ...(spec.fresh ? { terminate_existing: true } : {}) });
+    return ['launch', `launch ${spec.bundle}${spec.fresh ? ' (fresh)' : ''}`];
+  }
   if ('wait' in action) { await pause(Math.min(Number(action.wait) || 0, 3000)); return ['wait', `wait ${action.wait} ms`]; }
   throw new NotSent(`Unknown action ${JSON.stringify(action)}`);
 }
@@ -350,7 +358,7 @@ export async function act(ctx, args = {}) {
 
 export const definitions = [
   ['look', 'Read the screen now: the app in front, the numbered elements (role, label = value, [x,y,w,h] in screen points; + marks elements new since the last read), and a screenshot. full=true lists every element. Numbers refer to this read only.', { type: 'object', properties: { full: { type: 'boolean' } }, additionalProperties: false }, true],
-  ['do', 'Run actions in order, then read the screen once and return the same facts as look, with a screenshot. Actions: {tap: n} or {tap: [x, y]}; {type: "text", ref?: n, clear?} (taps n first, then types the text as key presses; text the keyboard cannot type is pasted with your clipboard saved and put back); {key: "return"|"delete"|...}; {swipe: "up"|"down"|"left"|"right"} or {swipe: {direction, in?: n, distance?: "short"|"long"}} (direction is where the finger moves); {scroll_to: "text"} or {scroll_to: {text or ref, in?: n, direction?: "down", max_swipes?: 6}} (swipes until it is fully on screen); {long_press: n or [x, y] or {ref, ms?}}; {drag: {from: n or [x, y], to: n or [x, y], ms?}}; {pinch: {ref or x, y, scale}}; {button: "home"|"lock"}; {launch: "bundle id"}; {wait: ms}. Points are in the same screen points as the element frames. Each action is reported as sent, not_sent or unknown; it stops at the first action that fails and never re-sends one that may have been delivered. Several known steps can go in one call; you judge the result from the elements and the screenshot.', { type: 'object', properties: { actions: { type: 'array', items: { type: 'object' }, minItems: 0, maxItems: 20 }, full: { type: 'boolean' } }, required: ['actions'], additionalProperties: false }, false],
+  ['do', 'Run actions in order, then read the screen once and return the same facts as look, with a screenshot. Actions: {tap: n} or {tap: [x, y]}; {type: "text", ref?: n, clear?} (taps n first, then types the text as key presses; text the keyboard cannot type is pasted with your clipboard saved and put back); {key: "return"|"delete"|...}; {swipe: "up"|"down"|"left"|"right"} or {swipe: {direction, in?: n, distance?: "short"|"long"}} (direction is where the finger moves); {scroll_to: "text"} or {scroll_to: {text or ref, in?: n, direction?: "down", max_swipes?: 6}} (swipes until it is fully on screen); {long_press: n or [x, y] or {ref, ms?}}; {drag: {from: n or [x, y], to: n or [x, y], ms?}}; {pinch: {ref or x, y, scale}}; {button: "home"|"lock"}; {launch: "bundle id"} or {launch: {bundle, fresh: true}} (fresh ends the app first); {wait: ms}. Points are in the same screen points as the element frames. Each action is reported as sent, not_sent or unknown; it stops at the first action that fails and never re-sends one that may have been delivered. Several known steps can go in one call; you judge the result from the elements and the screenshot.', { type: 'object', properties: { actions: { type: 'array', items: { type: 'object' }, minItems: 0, maxItems: 20 }, full: { type: 'boolean' } }, required: ['actions'], additionalProperties: false }, false],
 ];
 export const tools = new Set(['look', 'do', 'list_apps', 'list_devices', 'select_device', 'poki_mcp_status']);
 export const instructions = 'look reads the screen; do runs actions and then reads it. Both return the numbered elements and a screenshot. Use the numbers from the latest answer. Decide what happened from the elements and the picture.';
