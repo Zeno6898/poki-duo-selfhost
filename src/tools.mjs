@@ -1,8 +1,8 @@
+import * as actAndObserve from './act-and-observe.mjs';
 import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { version } from './build-info.mjs';
-import * as actAndObserve from './act-and-observe.mjs';
 
 const catalog = JSON.parse(readFileSync(new URL('./data/tools.json', import.meta.url), 'utf8'));
 const defaultTools = new Set([
