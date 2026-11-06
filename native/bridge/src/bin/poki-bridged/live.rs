@@ -1075,11 +1075,17 @@ pub async fn prefetch_loop(state: Rc<State>) {
             tokio::time::sleep(Duration::from_millis(300)).await;
             continue;
         };
+        let gate = state.ax_gate.clone();
         let reader: TreeReader = Rc::new(move || {
-            let (mut adapter, rsd) = (adapter.clone(), rsd.clone());
+            let (mut adapter, rsd, gate) = (adapter.clone(), rsd.clone(), gate.clone());
             Box::pin(async move {
-                crate::ax::read_tree_with_timeout(&mut adapter, &rsd, false, Duration::from_secs(4))
-                    .await
+                let read = crate::ax::read_tree_with_timeout(
+                    &mut adapter,
+                    &rsd,
+                    false,
+                    Duration::from_secs(4),
+                );
+                super::ax_gate::through(&gate, read, || ()).await
             })
         });
         prefetch_while_open(&live, &state.prefetch, &state.prefetch_events, &reader).await;
