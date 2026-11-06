@@ -273,7 +273,7 @@ final class AppModel {
             activity.update { $0.phase = .approval; $0.approval = approval; $0.headline = "Allow this step?" }
             // The Live Activity pops up for it by itself; the notification is for when it is not running.
             if !activity.isRunning { ApprovalNotice.post(approval) }
-        case .approvalEnded(let id, _):
+        case .approvalEnded(let id, let approved):
             approvals.removeAll { $0.id == id }
             log.add("approval", "ended \(id): \(approved.map { $0 ? "approved" : "denied" } ?? "expired or replaced")")
             if approved == nil { problem = "An approval ran out before you answered, so that step was not done. The agent can ask again." }
