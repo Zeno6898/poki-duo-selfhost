@@ -188,13 +188,18 @@ impl Drop for Picture {
 #[derive(Clone, Debug)]
 pub struct Tuning {
     pub threads: u32,
+    /// "slice" (default) or "frame": frame threads raise throughput when one picture takes
+    /// longer than a unit interval, at one unit of delay per extra thread. The phone sends units
+    /// even on a still screen, so a held picture comes out with the next one.
+    pub thread_type: &'static str,
     pub skip_loop_filter: bool,
     pub fast: bool,
 }
 
 impl Tuning {
     /// POKI_LIVE_DECODE_THREADS (default 3), POKI_LIVE_LOOP_FILTER=1 keeps the loop filter,
-    /// POKI_LIVE_DECODE_FAST=0 turns flags2 +fast off.
+    /// POKI_LIVE_DECODE_FAST=0 turns flags2 +fast off, POKI_LIVE_THREAD_TYPE=frame uses frame
+    /// threads (try with POKI_LIVE_DECODE_THREADS=2).
     pub fn from_env() -> Self {
         Self {
             threads: std::env::var("POKI_LIVE_DECODE_THREADS")
@@ -202,6 +207,10 @@ impl Tuning {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3)
                 .clamp(1, 16),
+            thread_type: match std::env::var("POKI_LIVE_THREAD_TYPE").as_deref() {
+                Ok("frame") => "frame",
+                _ => "slice",
+            },
             skip_loop_filter: std::env::var("POKI_LIVE_LOOP_FILTER").as_deref() != Ok("1"),
             fast: std::env::var("POKI_LIVE_DECODE_FAST").as_deref() != Ok("0"),
         }
@@ -228,12 +237,19 @@ impl Decoder {
             return Err("libavcodec has no HEVC decoder".into());
         }
         let mut context = unsafe { (api.alloc_context3)(codec) };
-        // Slice threads only: frame threading adds a frame of delay per thread, and holds the
-        // last pictures of an animation until more units come.
+        // Slice threads by default: frame threading adds a unit of delay per thread, and holds
+        // the last pictures until more units come.
         let threads = tuning.threads.to_string();
         let configured = set(context, "threads", &threads)
-            .and_then(|()| set(context, "thread_type", "slice"))
-            .and_then(|()| set(context, "flags", "+low_delay"))
+            .and_then(|()| set(context, "thread_type", tuning.thread_type))
+            // libavcodec turns frame threading off under low_delay.
+            .and_then(|()| {
+                if tuning.thread_type == "frame" {
+                    Ok(())
+                } else {
+                    set(context, "flags", "+low_delay")
+                }
+            })
             .and_then(|()| {
                 if tuning.fast {
                     set(context, "flags2", "+fast")

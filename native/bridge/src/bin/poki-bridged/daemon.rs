@@ -572,6 +572,9 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     "continuous"
                 }
                 .into();
+                let tuning = crate::libav::Tuning::from_env();
+                pong["decode_threads"] =
+                    json!({"threads": tuning.threads, "type": tuning.thread_type});
                 pong["ax_gate"] = state.ax_gate.borrow().json();
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
