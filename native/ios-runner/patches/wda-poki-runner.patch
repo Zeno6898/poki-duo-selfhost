@@ -1,91 +1,85 @@
-diff --git a/native/ios-runner/patches/wda-poki-runner.patch b/native/ios-runner/patches/wda-poki-runner.patch
-index c631dcc..e69de29 100644
---- a/native/ios-runner/patches/wda-poki-runner.patch
-+++ b/native/ios-runner/patches/wda-poki-runner.patch
-@@ -1,86 +0,0 @@
--diff --git a/WebDriverAgentRunner/UITestingUITests.m b/WebDriverAgentRunner/UITestingUITests.m
--index 5ffafa86..af2d162b 100644
----- a/WebDriverAgentRunner/UITestingUITests.m
--+++ b/WebDriverAgentRunner/UITestingUITests.m
--@@ -7,6 +7,7 @@
--  */
-- 
-- #import <XCTest/XCTest.h>
--+#import <UIKit/UIKit.h>
-- 
-- #import <WebDriverAgentLib/FBDebugLogDelegateDecorator.h>
-- #import <WebDriverAgentLib/FBConfiguration.h>
--@@ -43,11 +44,73 @@
--  */
-- - (void)testRunner
-- {
--+  // Poki: the Poki app starts the runner and says so in POKI_LAUNCHER. Opened any other way (by hand
--+  // from the home screen), the runner does nothing and sends the person to Poki.
--+  if (!NSProcessInfo.processInfo.environment[@"POKI_LAUNCHER"]) {
--+    [[[XCUIApplication alloc] initWithBundleIdentifier:@"nz.zheha.poki"] activate];
--+    return;
--+  }
--+  [self pokiShowRunningScreen];
--+  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(pokiShowRunningScreen) name:UISceneDidActivateNotification object:nil];
--   FBWebServer *webServer = [[FBWebServer alloc] init];
--   webServer.delegate = self;
--   [webServer startServing];
-- }
-- 
--+#pragma mark - Poki
--+
--+static UIWindow *pokiWindow;
--+
--+/// The runner's own screen while Poki uses it: without this it is black. It covers the test host's
--+/// window and says what is going on and how to stop.
--+- (void)pokiShowRunningScreen
--+{
--+  if (pokiWindow.windowScene) { return; }
--+  UIWindowScene *scene = nil;
--+  for (UIScene *candidate in UIApplication.sharedApplication.connectedScenes) {
--+    if ([candidate isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)candidate; break; }
--+  }
--+  if (!scene) { return; }
--+  UIViewController *controller = [UIViewController new];
--+  UIView *view = controller.view;
--+  view.backgroundColor = [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1];
--+  UIImageView *bear = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"LaunchBear"]];
--+  bear.contentMode = UIViewContentModeScaleAspectFit;
--+  UILabel *title = [UILabel new];
--+  title.text = @"Poki is using this iPhone";
--+  title.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
--+  UILabel *body = [UILabel new];
--+  body.text = @"Leave Poki Runner open in the background while the agent works. Closing it stops the agent.\n\nTo stop, tap Stop runner in Poki or on the Live Activity. Poki also stops it by itself when the agent is idle.";
--+  body.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
--+  for (UILabel *label in @[title, body]) {
--+    label.textColor = UIColor.whiteColor;
--+    label.numberOfLines = 0;
--+    label.textAlignment = NSTextAlignmentCenter;
--+  }
--+  UIButtonConfiguration *style = UIButtonConfiguration.filledButtonConfiguration;
--+  style.baseBackgroundColor = UIColor.whiteColor;
--+  style.baseForegroundColor = [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1];
--+  UIButton *open = [UIButton buttonWithConfiguration:style primaryAction:[UIAction actionWithTitle:@"Open Poki" image:nil identifier:nil handler:^(__kindof UIAction *action) {
--+    [UIApplication.sharedApplication openURL:[NSURL URLWithString:@"poki://"] options:@{} completionHandler:nil];
--+  }]];
--+  UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[bear, title, body, open]];
--+  stack.axis = UILayoutConstraintAxisVertical;
--+  stack.spacing = 18;
--+  stack.alignment = UIStackViewAlignmentCenter;
--+  stack.translatesAutoresizingMaskIntoConstraints = NO;
--+  [view addSubview:stack];
--+  [NSLayoutConstraint activateConstraints:@[
--+    [bear.heightAnchor constraintEqualToConstant:160],
--+    [stack.centerYAnchor constraintEqualToAnchor:view.centerYAnchor],
--+    [stack.leadingAnchor constraintEqualToAnchor:view.layoutMarginsGuide.leadingAnchor constant:12],
--+    [stack.trailingAnchor constraintEqualToAnchor:view.layoutMarginsGuide.trailingAnchor constant:-12],
--+  ]];
--+  pokiWindow = [[UIWindow alloc] initWithWindowScene:scene];
--+  pokiWindow.windowLevel = UIWindowLevelAlert + 1;
--+  pokiWindow.rootViewController = controller;
--+  pokiWindow.hidden = NO;
--+}
--+
-- #pragma mark - FBWebServerDelegate
-- 
-- - (void)webServerDidRequestShutdown:(FBWebServer *)webServer
+diff --git a/WebDriverAgentRunner/UITestingUITests.m b/WebDriverAgentRunner/UITestingUITests.m
+index 5ffafa86..99f5c8ce 100644
+--- a/WebDriverAgentRunner/UITestingUITests.m
++++ b/WebDriverAgentRunner/UITestingUITests.m
+@@ -7,6 +7,7 @@
+  */
+ 
+ #import <XCTest/XCTest.h>
++#import <UIKit/UIKit.h>
+ 
+ #import <WebDriverAgentLib/FBDebugLogDelegateDecorator.h>
+ #import <WebDriverAgentLib/FBConfiguration.h>
+@@ -43,11 +44,72 @@
+  */
+ - (void)testRunner
+ {
++  // Poki: only the Poki app starts the runner, and says so in POKI_LAUNCHER. Started any other way, the
++  // test ends at once without touching the screen.
++  if (!NSProcessInfo.processInfo.environment[@"POKI_LAUNCHER"]) {
++    return;
++  }
++  [self pokiShowRunningScreen];
++  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(pokiShowRunningScreen) name:UISceneDidActivateNotification object:nil];
+   FBWebServer *webServer = [[FBWebServer alloc] init];
+   webServer.delegate = self;
+   [webServer startServing];
+ }
+ 
++#pragma mark - Poki
++
++static UIWindow *pokiWindow;
++
++/// The runner's own screen while Poki uses it: without this it is black. It covers the test host's
++/// window and says what is going on and how to stop.
++- (void)pokiShowRunningScreen
++{
++  if (pokiWindow.windowScene) { return; }
++  UIWindowScene *scene = nil;
++  for (UIScene *candidate in UIApplication.sharedApplication.connectedScenes) {
++    if ([candidate isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)candidate; break; }
++  }
++  if (!scene) { return; }
++  UIViewController *controller = [UIViewController new];
++  UIView *view = controller.view;
++  view.backgroundColor = [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1];
++  UIImageView *bear = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"LaunchBear"]];
++  bear.contentMode = UIViewContentModeScaleAspectFit;
++  UILabel *title = [UILabel new];
++  title.text = @"Poki is using this iPhone";
++  title.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
++  UILabel *body = [UILabel new];
++  body.text = @"Leave Poki Runner open in the background while the agent works. Closing it stops the agent.\n\nTo stop, tap Stop runner in Poki or on the Live Activity. Poki also stops it by itself when the agent is idle.";
++  body.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
++  for (UILabel *label in @[title, body]) {
++    label.textColor = UIColor.whiteColor;
++    label.numberOfLines = 0;
++    label.textAlignment = NSTextAlignmentCenter;
++  }
++  UIButtonConfiguration *style = UIButtonConfiguration.filledButtonConfiguration;
++  style.baseBackgroundColor = UIColor.whiteColor;
++  style.baseForegroundColor = [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1];
++  UIButton *open = [UIButton buttonWithConfiguration:style primaryAction:[UIAction actionWithTitle:@"Open Poki" image:nil identifier:nil handler:^(__kindof UIAction *action) {
++    [UIApplication.sharedApplication openURL:[NSURL URLWithString:@"poki://"] options:@{} completionHandler:nil];
++  }]];
++  UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[bear, title, body, open]];
++  stack.axis = UILayoutConstraintAxisVertical;
++  stack.spacing = 18;
++  stack.alignment = UIStackViewAlignmentCenter;
++  stack.translatesAutoresizingMaskIntoConstraints = NO;
++  [view addSubview:stack];
++  [NSLayoutConstraint activateConstraints:@[
++    [bear.heightAnchor constraintEqualToConstant:160],
++    [stack.centerYAnchor constraintEqualToAnchor:view.centerYAnchor],
++    [stack.leadingAnchor constraintEqualToAnchor:view.layoutMarginsGuide.leadingAnchor constant:12],
++    [stack.trailingAnchor constraintEqualToAnchor:view.layoutMarginsGuide.trailingAnchor constant:-12],
++  ]];
++  pokiWindow = [[UIWindow alloc] initWithWindowScene:scene];
++  pokiWindow.windowLevel = UIWindowLevelAlert + 1;
++  pokiWindow.rootViewController = controller;
++  pokiWindow.hidden = NO;
++}
++
+ #pragma mark - FBWebServerDelegate
+ 
+ - (void)webServerDidRequestShutdown:(FBWebServer *)webServer
