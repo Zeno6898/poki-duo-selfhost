@@ -10,6 +10,7 @@ import sharp from 'sharp';
 import { idevice, stateDir, root } from './config.mjs';
 import { startRecording, stopRecording, closeRecordings } from './recording.mjs';
 import { openInput, selectKeyboard } from './simulator-input.mjs';
+import { holdLocation, isNetworkId, nativeArgs, runIdeviceTool } from './network-device.mjs';
 
 const launchReadyMs = 10000;
 
@@ -23,12 +24,12 @@ export function platformRun(file, args, options) { return execute(file, args, op
 
 const simctl = async args => (await platformRun('xcrun', ['simctl', ...args])).stdout.trim();
 const physical = async (id, args, expect) => {
-  const result = await platformRun(idevice, ['--udid', id, ...args]);
+  const result = isNetworkId(id) ? await runIdeviceTool(platformRun, id, args) : await platformRun(idevice, ['--udid', id, ...args]);
   if (expect && !expect.test(result.stdout + '\n' + result.stderr)) throw new Error(`Device service did not confirm the action: ${(result.stderr || result.stdout).slice(-2000)}`);
   return result;
 };
 async function configuration(target, method, value) {
-  const { stdout } = await platformRun(join(root, 'build/poki-native'), ['--udid', target.id], { input: JSON.stringify({ op: 'configuration', method, ...(value === undefined ? {} : { value }) }) });
+  const { stdout } = await platformRun(join(root, 'build/poki-native'), nativeArgs(target), { input: JSON.stringify({ op: 'configuration', method, ...(value === undefined ? {} : { value }) }) });
   return JSON.parse(stdout);
 }
 
@@ -152,7 +153,7 @@ async function apps(target, includeSystem = false) {
       path: app.Path, executable: app.CFBundleExecutable,
     })).filter(app => includeSystem || !app.system);
   }
-  const { stdout } = await platformRun(join(root, 'build/poki-native'), ['--udid', target.id], { input: JSON.stringify({ op: 'list_apps' }), timeout: 95000 });
+  const { stdout } = await platformRun(join(root, 'build/poki-native'), nativeArgs(target), { input: JSON.stringify({ op: 'list_apps' }), timeout: 95000 });
   return JSON.parse(stdout).apps.filter(app => includeSystem || !app.system);
 }
 
@@ -294,7 +295,7 @@ async function applicationMutation(target, request, verify) {
   }
   let receipt = {}, result;
   try {
-    const { stdout } = await platformRun(join(root, 'build/poki-native'), ['--udid', target.id], {
+    const { stdout } = await platformRun(join(root, 'build/poki-native'), nativeArgs(target), {
       input: JSON.stringify(request), timeout: request.op === 'install_app' ? 185000 : 95000,
     });
     receipt = JSON.parse(stdout);
@@ -513,7 +514,9 @@ async function startLocation(ctx, target, args) {
     state(ctx).locations.set(target.id, { target, child: { kill() {} }, closed: Promise.resolve() });
   } else {
     checkWork();
-    const child = spawn(idevice, ['--udid', target.id, 'location_simulation', 'set', String(args.latitude), String(args.longitude)], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const hold = isNetworkId(target.id) ? holdLocation(target.id, args.latitude, args.longitude) : undefined;
+    const child = hold ? spawn(hold.file, hold.args, { stdio: ['pipe', 'pipe', 'pipe'] }) : spawn(idevice, ['--udid', target.id, 'location_simulation', 'set', String(args.latitude), String(args.longitude)], { stdio: ['ignore', 'pipe', 'pipe'] });
+    if (hold) child.stdin.end(hold.input);
     const closed = new Promise(resolveClose => child.once('close', resolveClose));
     const requestSignal = signal();
     let escalation;
@@ -524,7 +527,7 @@ async function startLocation(ctx, target, args) {
     let output = '';
     await new Promise((resolveReady, reject) => {
       const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('Location service did not confirm the simulated location.')); }, 45000);
-      const receive = chunk => { output = (output + chunk).slice(-3000); if (output.includes('Location set!')) { clearTimeout(timer); resolveReady(); } };
+      const receive = chunk => { output = (output + chunk).slice(-3000); if (output.includes(hold?.ready ?? 'Location set!')) { clearTimeout(timer); resolveReady(); } };
       child.stdout.on('data', receive); child.stderr.on('data', receive);
       child.once('error', error => { clearTimeout(timer); reject(error); });
       child.once('exit', code => { clearTimeout(timer); reject(new Error(`Location service exited (${code}): ${output}`)); });
@@ -755,6 +758,7 @@ export async function platformTool(ctx, name, args = {}) {
     }
     case 'set_clipboard': {
       if (target.kind === 'simulator') await platformRun('xcrun', ['simctl', 'pbcopy', target.id], { input: args.text });
+      else if (isNetworkId(target.id)) await runIdeviceTool(platformRun, target.id, ['pasteboard', 'copy'], { input: args.text });
       else await platformRun(idevice, ['--udid', target.id, 'pasteboard', 'copy'], { input: args.text });
       const readback = await platformTool(ctx, 'get_clipboard', {});
       if (readback.text !== args.text) throw new Error('Clipboard readback differs from requested text.');

@@ -14,6 +14,7 @@ import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
 import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
+import { isNetworkId, nativeArgs, networkDevice, runIdeviceTool } from './network-device.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -67,8 +68,14 @@ export class Devices {
   unownBackground(id, type) { const owned = this.backgroundDevices.get(id); owned?.delete(type); if (!owned?.size) this.backgroundDevices.delete(id); }
   access(target) { this.coordinator.access(this, target); }
   changed(target) { this.coordinator.changed(target.id); this.elements = []; this.elementsAt = 0; this.frame = undefined; this.seen = undefined; }
+  // A device configured with POKI_DEVICE_HOST answers the idevice-tools calls through the bridge.
+  networkTool(id, args, timeout, input) {
+    return runIdeviceTool((file, argv, options) => this.run(file, argv, options.timeout, options.input), id, args, { timeout, input });
+  }
   async inventory(all = false) {
-    const { stdout } = await this.run('python3', [join(root, 'native/devices.py')], 8000);
+    // A configured network device replaces usbmuxd discovery.
+    const configured = networkDevice();
+    const { stdout } = configured ? { stdout: JSON.stringify([configured]) } : await this.run('python3', [join(root, 'native/devices.py')], 8000);
     const physical = new Map();
     for (const device of JSON.parse(stdout)) {
       if (!device.id || (physical.has(device.id) && device.connection !== 'USB')) continue;
@@ -85,7 +92,7 @@ export class Devices {
       try {
         this.access(device);
         const values = await Promise.all(['DeviceName','ProductType','ProductVersion'].map(async key => {
-          const response = await this.run(idevice, ['--udid',device.id,'lockdown','get',key],8000);
+          const response = isNetworkId(device.id) ? await this.networkTool(device.id, ['lockdown','get',key], 8000) : await this.run(idevice, ['--udid',device.id,'lockdown','get',key],8000);
           if (!response.stdout) throw new Error(response.stderr || `No ${key} response`);
           return JSON.parse(response.stdout);
         }));
@@ -107,7 +114,7 @@ export class Devices {
         const occupancy = this.coordinator.status(d.id, this);
         if (occupancy.occupied && !occupancy.owned_by_session) continue;
         this.access(d);
-        const value = await this.run(idevice, ['--udid', d.id, 'lockdown', 'get', 'DeviceName']);
+        const value = isNetworkId(d.id) ? await this.networkTool(d.id, ['lockdown', 'get', 'DeviceName']) : await this.run(idevice, ['--udid', d.id, 'lockdown', 'get', 'DeviceName']);
         try { d.name = JSON.parse(value.stdout); this.physicalNames.set(d.id, d.name); } catch { continue; }
       }
       matches = list.filter(d => d.name.toLocaleLowerCase() === query.toLocaleLowerCase());
@@ -132,7 +139,7 @@ export class Devices {
   async native(args, expected, timeout = 45000) {
     const target = await this.target();
     if (target.kind !== 'physical') throw new Error('This native command requires a physical device.');
-    const result = await this.run(idevice, ['--udid', target.id, ...args], timeout);
+    const result = isNetworkId(target.id) ? await this.networkTool(target.id, args, timeout) : await this.run(idevice, ['--udid', target.id, ...args], timeout);
     if (expected && !expected.test(result.stdout + '\n' + result.stderr)) throw new Error(`Device service did not confirm the action: ${(result.stderr || result.stdout).slice(-3000)}`);
     return result;
   }
@@ -140,7 +147,7 @@ export class Devices {
     const target = await this.target();
     if (target.kind === 'simulator') return simulatorRequest(target.id, request);
     const nativeRequest = request.op === 'ax' ? { op: 'ax_tree', include_offscreen: request.include_offscreen ?? false } : request;
-    const { stdout } = await this.run(join(root, 'build/poki-native'), ['--udid', target.id], 95000, JSON.stringify(nativeRequest));
+    const { stdout } = await this.run(join(root, 'build/poki-native'), nativeArgs(target), 95000, JSON.stringify(nativeRequest));
     const result = JSON.parse(stdout);
     if (request.op === 'ax') return { ...result, foreground: result.foreground_app, elements: result.elements?.map(e => ({ ...e, type: e.type ?? e.role })) };
     return result;

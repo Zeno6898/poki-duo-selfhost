@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { idevice } from './config.mjs';
+import { isNetworkId } from './network-device.mjs';
 import { checkWork, execute, signal, work } from './work.mjs';
 
 const sessions = new WeakMap();
@@ -75,6 +76,8 @@ export async function startRecording(ctx, target) {
   checkWork();
   const active = recordings(ctx);
   if (active.has(target.id)) throw new Error('This device is already recording. Call stop_recording first.');
+  // Recording streams from idevice-tools screencapture, which cannot reach a network device yet.
+  if (isNetworkId(target.id)) throw new Error('Recording is not available yet for a network device configured with POKI_DEVICE_HOST; it needs USB or usbmuxd.');
   const directory = join(homedir(), 'Movies', 'Poki MCP');
   await mkdir(directory, { recursive: true, mode: 0o700 }); checkWork();
   const path = join(directory, `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}.mov`);
