@@ -228,6 +228,40 @@ final class LookDoTests: XCTestCase {
         XCTAssertEqual(wda.bodies("POST /wda/pressAndDragWithVelocity").first?["holdDuration"]?.double, 0.1)
     }
 
+    func testAControlInsideABarOrAnInputBarListedApartFromItIsHittable() async {
+        let (core, wda, _) = makeCore()
+        // WeChat-like: the Send button is listed before the input bar and the keyboard that enclose it.
+        wda.tree([
+            Node("Table", nil, [0, 0, 390, 690], [Node("Cell", "Hello", [0, 100, 390, 60])]),
+            Node("Button", "Send", [320, 705, 60, 40]),
+            Node("Other", nil, [0, 700, 390, 50], [Node("TextView", "message", [16, 705, 290, 40])]),
+            Node("Keyboard", nil, [0, 750, 390, 94], [Node("Key", "a", [10, 760, 30, 40])]),
+            Node("Button", "Return", [300, 790, 80, 44]),
+        ])
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["tap": 2], ["tap": 5]]])
+        XCTAssertFalse(result.isError, result.text)
+        let taps = wda.bodies("POST /wda/tap")
+        XCTAssertEqual(taps.first?["x"]?.double, 350)
+        XCTAssertEqual(taps.first?["y"]?.double, 725)
+        XCTAssertEqual(taps.last?["y"]?.double, 812)
+    }
+
+    func testTheActionsGetTheirFullTimeAfterTheOwnerApproves() async {
+        let (core, wda, _) = makeCore { $0.approvalWait = 4; $0.toolDeadline = 3; $0.actionCap = 1.5; $0.readTimeout = 1 }
+        wda.source([("Button", "Delete Photo")])
+        _ = await core.call("look", [:])
+        Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if let p = core.pendingApproval { core.resolveApproval(id: p.id, approved: true) }
+        }
+        let result = await core.call("do", ["actions": [["tap": 1]]])
+        XCTAssertFalse(result.isError, result.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 1, result.text)
+        XCTAssertTrue(result.text.contains("approval: approved on the phone after"), result.text)
+        XCTAssertTrue(result.text.contains("app: Settings"), "the read after it still answers: \(result.text)")
+    }
+
     func testTheToolDescriptionsPointToScrollTo() {
         let text = PokiCore.tools.map { $0.serialized() }.joined() + PokiCore.instructions
         XCTAssertTrue(PokiCore.instructions.contains("scroll_to"))

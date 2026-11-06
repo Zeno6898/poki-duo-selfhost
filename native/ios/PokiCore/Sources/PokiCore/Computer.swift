@@ -236,8 +236,8 @@ final class Computer: @unchecked Sendable {
     // MARK: do
 
     func act(actions: [JSON], full: Bool) async -> ToolResult {
-        let started = now()
-        let until = started + config.toolDeadline
+        var started = now()
+        var until = started + config.toolDeadline
         if let blocked = await waitForRunner(until: until) { return blocked }
 
         // A number that is not in the latest read is refused before anything is sent.
@@ -258,11 +258,15 @@ final class Computer: @unchecked Sendable {
             } else {
                 let approval = approvals.pending.flatMap { $0.fingerprint == fingerprint ? $0 : nil }
                     ?? approvals.request(app: lastForeground?.describe ?? "unknown", summary: labels(actions), reason: reason, fingerprint: fingerprint)
-                let wait = max(0, min(config.approvalWait, until - now() - config.readTimeout - 1))
-                switch await approvals.wait(id: approval.id, seconds: wait) {
+                // The time the owner takes is not the actions' time: the clock starts again after it.
+                let asked = now()
+                switch await approvals.wait(id: approval.id, seconds: config.approvalWait) {
                 case .approved?:
                     _ = approvals.consumeGrant(fingerprint: fingerprint)
-                    approvedNote = "approval: approved on the phone (\(reason))"
+                    let waited = now() - asked
+                    approvedNote = "approval: approved on the phone after \(Int(waited.rounded())) s (\(reason))"
+                    until += waited
+                    started += waited
                 case .declined?:
                     return ToolResult(text: "not_sent: the owner declined on the phone (\(reason)). Nothing was sent.", jpeg: nil, isError: true)
                 case .expired?:

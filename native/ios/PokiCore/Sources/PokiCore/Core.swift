@@ -266,7 +266,8 @@ public final class PokiCore: @unchecked Sendable {
         }
         gate.current = "\(name): \(activity.summary)"
         emit(.toolStarted(activity))
-        let deadline = config.toolDeadline + 1
+        // The owner's time on an approval comes on top of the tool's own time.
+        let deadline = config.toolDeadline + (name == "do" ? config.approvalWait : 0) + 1
         let output: ToolResult
         do {
             output = try await withDeadline(deadline, name) { [computer] in
