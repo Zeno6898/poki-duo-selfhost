@@ -354,7 +354,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
     let mut timings = Timings::default();
     let limit = Duration::from_secs(if op == "install_app" { 180 } else { 90 });
     let outcome = tokio::select! {
-        outcome = tokio::time::timeout(limit, session.handle(object, &mut timings)) => Some(outcome),
+        outcome = tokio::time::timeout(limit, Box::pin(session.handle(object, &mut timings))) => Some(outcome),
         _ = closed.wait_for(|closed| *closed) => None,
     };
     session.ops += 1;
@@ -432,12 +432,31 @@ fn reads_only(request: &Request) -> bool {
         Request::DisplayInfo
         | Request::ListApps
         | Request::AxTree { .. }
+        | Request::AppForPid { .. }
         | Request::LockdownGet { .. }
         | Request::Screenshot { .. } => true,
         Request::Pasteboard { action, .. } => action != "set",
         Request::Configuration { method, .. } => method.starts_with("get_"),
         _ => false,
     }
+}
+
+/// The ops `tunnel_op` runs on the held tunnel.
+fn on_tunnel(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::LaunchApp(_)
+            | Request::ListApps
+            | Request::Configuration { .. }
+            | Request::AxTree { .. }
+            | Request::AppForPid { .. }
+            | Request::LockdownGet { .. }
+            | Request::Screenshot { .. }
+            | Request::Rotate { .. }
+            | Request::Pasteboard { .. }
+            | Request::Location { .. }
+            | Request::DisplayInfo
+    )
 }
 
 fn uses_touch(request: &Request) -> bool {
@@ -497,10 +516,14 @@ impl Session {
             request,
             Request::InstallApp { .. } | Request::UninstallApp { .. }
         ) {
-            return execute(&self.target, request).await;
+            return Box::pin(execute(&self.target, request)).await;
         }
         if is_held_location(&request) {
             return Err("A held location set runs in its own poki-native process.".into());
+        }
+        if !on_tunnel(&request) && !is_input(&request) {
+            // An op this daemon does not know yet runs as poki-native runs it, on its own connection.
+            return Box::pin(execute(&self.target, request)).await;
         }
         if is_input(&request) {
             return self.input_op(request, &object, timings).await;
@@ -552,6 +575,7 @@ impl Session {
             Request::AxTree { include_offscreen } => {
                 ax::read_tree(adapter, rsd, include_offscreen).await
             }
+            Request::AppForPid { pid } => apps::app_for_pid(adapter, rsd, pid).await,
             Request::LockdownGet { domain, key } => {
                 device_ops::lockdown_get(adapter, rsd, domain.as_deref(), &key).await
             }
@@ -570,7 +594,7 @@ impl Session {
                 let info = display.get_media_support_info().await?;
                 Ok(serde_json::to_value(info)?)
             }
-            _ => unreachable!("handled before"),
+            _ => unreachable!("on_tunnel"),
         }
     }
 
@@ -896,6 +920,7 @@ mod daemon_tests {
     fn only_reads_are_retried() {
         let read = |text: &str| reads_only(&parse(&split(text).unwrap().2).unwrap());
         assert!(read(r#"{"op":"ax_tree"}"#));
+        assert!(read(r#"{"op":"app_for_pid","pid":42}"#));
         assert!(read(r#"{"op":"pasteboard","action":"get"}"#));
         assert!(read(r#"{"op":"configuration","method":"get_appearance"}"#));
         assert!(!read(r#"{"op":"pasteboard","action":"set","text":"x"}"#));

@@ -19,12 +19,12 @@ const nativeFile = () => join(root, 'build/poki-native');
 export const daemonFile = (env = process.env) => env.POKI_BRIDGED ?? join(root, 'build/poki-bridged');
 
 // The ops poki-bridged runs. Installs keep their own process, and so does a held location.
-const served = new Set(['display_info', 'list_apps', 'launch_app', 'configuration', 'ax_tree', 'lockdown_get', 'screenshot', 'rotate', 'pasteboard', 'tap', 'double_tap', 'long_press', 'drag', 'pinch', 'key', 'button', 'type_text']);
+const served = new Set(['display_info', 'list_apps', 'launch_app', 'configuration', 'ax_tree', 'app_for_pid', 'lockdown_get', 'screenshot', 'rotate', 'pasteboard', 'tap', 'double_tap', 'long_press', 'drag', 'pinch', 'key', 'button', 'type_text']);
 
 // Ops that change nothing on the phone, which the client may send again when the daemon died
 // while running one.
 export function repeatable(request) {
-  if (['display_info', 'list_apps', 'ax_tree', 'lockdown_get', 'screenshot'].includes(request.op)) return true;
+  if (['display_info', 'list_apps', 'ax_tree', 'app_for_pid', 'lockdown_get', 'screenshot'].includes(request.op)) return true;
   if (request.op === 'pasteboard') return request.action !== 'set';
   if (request.op === 'configuration') return String(request.method).startsWith('get_');
   return false;

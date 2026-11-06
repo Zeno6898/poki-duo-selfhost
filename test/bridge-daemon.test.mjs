@@ -41,7 +41,7 @@ test('the daemon path is off unless POKI_BRIDGE_DAEMON=1, and covers only poki-n
 });
 
 test('only reads are sent twice', () => {
-  for (const request of [{ op: 'ax_tree' }, { op: 'screenshot', path: '/tmp/x.png' }, { op: 'pasteboard', action: 'get' }, { op: 'configuration', method: 'get_appearance' }]) assert.equal(repeatable(request), true, JSON.stringify(request));
+  for (const request of [{ op: 'ax_tree' }, { op: 'app_for_pid', pid: 42 }, { op: 'screenshot', path: '/tmp/x.png' }, { op: 'pasteboard', action: 'get' }, { op: 'configuration', method: 'get_appearance' }]) assert.equal(repeatable(request), true, JSON.stringify(request));
   for (const request of [{ op: 'tap' }, { op: 'type_text' }, { op: 'pasteboard', action: 'set' }, { op: 'configuration', method: 'set_appearance' }, { op: 'launch_app' }, { op: 'rotate' }]) assert.equal(repeatable(request), false, JSON.stringify(request));
 });
 
@@ -155,7 +155,7 @@ test('poki-bridged and poki-native print the same failure for the same request',
   const daemon = new BridgeDaemon(args, { ...process.env, POKI_BRIDGED: bridged, POKI_BRIDGED_SOCKET_DIR: dir });
   const { execFileSync } = await import('node:child_process');
   try {
-    for (const request of [{ op: 'ax_tree' }, { op: 'tap', x: 1, y: 2 }, { op: 'tap', x: 1 }]) {
+    for (const request of [{ op: 'ax_tree' }, { op: 'app_for_pid', pid: 42 }, { op: 'tap', x: 1, y: 2 }, { op: 'tap', x: 1 }]) {
       let spawned;
       try { execFileSync(nativeBinary, args, { input: JSON.stringify(request), stdio: 'pipe' }); } catch (error) { spawned = error.stderr.toString().trimEnd(); }
       await assert.rejects(daemon.run(request), error => {
