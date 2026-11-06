@@ -235,7 +235,7 @@ test('a lost device connection blocks inputs and says why', { timeout: 30000 }, 
   const live = phone => ({ latestFrame: () => picture(phone), waitSettled: () => picture(phone), op: async () => { throw new Error('no OCR'); }, status: async () => ({ ok: !reasons.length, reasons }) });
   const phone = new LedgerPhone({ live });
   await phone.call('observe', {});
-  reasons = ['needs_wifi'];
+  reasons = ['wifi_required'];
   const held = await phone.call('act', { action: { tool: 'tap', arguments: { x: 45, y: 105 } } });
   assert.equal(held.isError, true);
   const answer = body(held);

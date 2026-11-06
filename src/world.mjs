@@ -98,10 +98,14 @@ const lineOf = e => {
 const treeKey = (elements, foreground) => JSON.stringify([foreground?.pid ?? null, elements.map(e => { const f = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, Boolean(e.selected), f.x, f.y, f.width, f.height]; })]);
 const treeLagMs = 2500;
 const lostText = {
-  needs_wifi: 'The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB. Put the phone on Wi-Fi or USB; inputs are held until it is back.',
+  wifi_required: 'The device tunnel is lost, and iOS accepts new developer connections only on Wi-Fi or USB. Put the phone on Wi-Fi or USB; inputs are held until it is back.',
+  tunnel_down: 'The device tunnel is down and being reopened. Inputs are held until it is back.',
   media_closed: 'The screen video is closed, so the result of an input cannot be seen. Inputs are held until it reopens.',
   unreachable: 'The device bridge is not answering. Inputs are held until it does.',
 };
+lostText.needs_wifi = lostText.wifi_required;
+// Reasons the picture may be old while inputs still work: reported as unverified, not blocked.
+const degraded = new Set(['video_stalled', 'decode_backlog']);
 const visible = e => e.visible !== false && e.visible !== 0 && (e.type ?? e.role) !== 'Application';
 const inside = (box, [x, y, w, h], size) => {
   const f = box.frame ?? box, cx = (f.x + f.width / 2) / size.width, cy = (f.y + f.height / 2) / size.height;
@@ -161,8 +165,8 @@ export class World {
     let health;
     try { health = await screen.status(); } catch (error) { if (stopped(error)) throw error; health = { ok: false, reasons: ['unreachable'] }; }
     const reasons = health?.reasons ?? [];
-    const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.includes('video_stalled');
-    const lost = reasons.find(reason => reason !== 'video_stalled');
+    const stalled = frame?.videoStalled || screen.liveFeed?.stalled || reasons.some(reason => degraded.has(reason));
+    const lost = reasons.find(reason => !degraded.has(reason));
     if (!stalled && !lost) return undefined;
     return {
       ...(stalled ? { stalled: { ms: frame?.stalledMs ?? null, lastPictureAt: frame ? new Date(frame.capturedMs).toISOString() : null } } : {}),
