@@ -171,13 +171,96 @@ pub struct Activity {
     pub epoch: u64,
 }
 
-/// Units smaller than this do not count as movement (POKI_LIVE_ACTIVE_BYTES, default 0: every
-/// unit counts, so "unchanged" is never claimed for a screen that moved).
-fn active_bytes() -> usize {
-    std::env::var("POKI_LIVE_ACTIVE_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
+/// How big a unit must be to mean movement. The phone may stream units on a still screen (an
+/// iPhone 17 Pro sent 50 to 58 a second on an idle home screen), so their arrival alone means
+/// nothing; their size does: a repeated picture codes to a few bytes, a change to more. The
+/// idle baseline is a low percentile of the sizes seen over the last 30 s (a still screen's
+/// repeats dominate it whenever there was a still moment), and a unit counts as movement when it
+/// is over `factor` times that plus a margin. POKI_LIVE_ACTIVE_BYTES fixes the threshold instead;
+/// POKI_LIVE_ACTIVE_FACTOR sets the factor (default 2). Until a baseline exists (the first
+/// second), every unit counts: "unchanged" is never claimed without one.
+#[derive(Debug)]
+struct UnitSizes {
+    recent: VecDeque<(Instant, usize)>,
+    baseline: Option<usize>,
+    computed_at: Option<Instant>,
+    fixed: Option<usize>,
+    factor: f64,
+}
+
+/// What the idle baseline is computed over, how often, and from which percentile.
+const SIZE_WINDOW: Duration = Duration::from_secs(30);
+const SIZE_PERCENTILE: f64 = 0.10;
+const SIZE_MARGIN: usize = 32;
+
+impl UnitSizes {
+    fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::new(
+            var("POKI_LIVE_ACTIVE_BYTES").and_then(|v| v.trim().parse().ok()),
+            var("POKI_LIVE_ACTIVE_FACTOR").and_then(|v| v.trim().parse().ok()),
+        )
+    }
+
+    fn new(fixed: Option<usize>, factor: Option<f64>) -> Self {
+        Self {
+            recent: VecDeque::new(),
+            baseline: None,
+            computed_at: None,
+            fixed,
+            factor: factor.unwrap_or(2.0),
+        }
+    }
+
+    /// Records one unit; whether it means movement.
+    fn push(&mut self, now: Instant, bytes: usize) -> bool {
+        self.recent.push_back((now, bytes));
+        while self
+            .recent
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > SIZE_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        let started = self.recent.front().map_or(now, |(at, _)| *at);
+        if now.duration_since(started) >= Duration::from_secs(1)
+            && self
+                .computed_at
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+        {
+            let mut sizes: Vec<usize> = self.recent.iter().map(|(_, b)| *b).collect();
+            sizes.sort_unstable();
+            self.baseline = Some(sizes[((sizes.len() - 1) as f64 * SIZE_PERCENTILE) as usize]);
+            self.computed_at = Some(now);
+        }
+        bytes >= self.threshold()
+    }
+
+    fn threshold(&self) -> usize {
+        self.fixed
+            .or(self
+                .baseline
+                .map(|b| (b as f64 * self.factor) as usize + SIZE_MARGIN))
+            .unwrap_or(0)
+    }
+
+    /// The average unit size over the last second.
+    fn average(&self, now: Instant) -> Option<usize> {
+        let last: Vec<usize> = self
+            .recent
+            .iter()
+            .rev()
+            .take_while(|(at, _)| now.duration_since(*at) <= Duration::from_secs(1))
+            .map(|(_, b)| *b)
+            .collect();
+        (!last.is_empty()).then(|| last.iter().sum::<usize>() / last.len())
+    }
+}
+
+impl Default for UnitSizes {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
 }
 
 /// What the daemon reads; written by the receive task and the decoder thread.
@@ -218,8 +301,9 @@ struct Screen {
     /// arrival says when the screen last moved, decoded or not (see Activity).
     activity: Option<Activity>,
     units_since_input: u64,
-    /// Sizes of the newest units, for tuning POKI_LIVE_ACTIVE_BYTES.
+    /// Sizes of the newest units, for tuning, and the idle baseline (see UnitSizes).
     recent_unit_bytes: VecDeque<usize>,
+    sizes: UnitSizes,
 }
 
 enum Job {
@@ -279,6 +363,7 @@ impl Frames {
     fn over<S: Datagrams>(socket: S, our_ssrc: u32, decode: bool) -> Self {
         let screen = Arc::new(Mutex::new(Screen {
             session: SESSIONS.fetch_add(1, Ordering::SeqCst) + 1,
+            sizes: UnitSizes::from_env(),
             ..Screen::default()
         }));
         let (jobs, queue) = mpsc::channel();
@@ -364,6 +449,9 @@ pub struct State {
     /// Always true when nothing is decoded.
     pub picture_current: bool,
     pub decoding: bool,
+    /// Whether the screen moved after the last input (None before any input), by the authority
+    /// in use: pixels when decoding, unit sizes otherwise.
+    pub changed_since_input: Option<bool>,
 }
 
 impl Live {
@@ -397,23 +485,32 @@ impl Live {
 
     pub fn state(&self, settle: Duration) -> State {
         let screen = self.screen.lock().unwrap();
-        let quiet_since = [
-            screen.activity.map(|a| a.at),
-            screen.last_change.map(|(at, _)| at),
-            screen.last_input,
-        ]
-        .into_iter()
-        .flatten()
-        .max()
-        .or(screen.decoding_since);
-        let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
         let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
-        let c = &screen.counters;
-        let picture_current = !decoding || c.units_done >= c.units_to_decoder;
+        // When decoding, the pixel difference is the authority on movement; otherwise the size
+        // of the units (see UnitSizes).
+        let moved = if decoding {
+            screen.last_change.map(|(at, _)| at)
+        } else {
+            screen.activity.map(|a| a.at)
+        };
+        let quiet_since = [moved, screen.last_input]
+            .into_iter()
+            .flatten()
+            .max()
+            .or(screen.decoding_since);
+        let quiet = quiet_since.is_none_or(|at| at.elapsed() >= settle);
+        // The newest picture is not older than the newest unit that meant movement: whatever
+        // waits in the decoder's queue repeats it.
+        let picture_current = !decoding
+            || screen
+                .latest
+                .is_some_and(|l| screen.activity.is_none_or(|a| l.0 >= a.at));
         State {
-            // Settled by the packet clock; when decoding, also once the picture shows it.
             settled: quiet && (!decoding || (screen.latest.is_some() && picture_current)),
-            moving: screen.activity.is_some_and(|a| a.at.elapsed() < settle),
+            moving: moved.is_some_and(|at| at.elapsed() < settle),
+            changed_since_input: screen
+                .last_input
+                .map(|input| moved.is_some_and(|at| at > input)),
             activity: screen.activity,
             units_since_input: screen.units_since_input,
             picture_current,
@@ -526,8 +623,13 @@ impl Live {
     /// Whether the screen is as it was at `at`: no pixel change and no input since.
     pub fn unchanged_since(&self, at: Instant) -> bool {
         let screen = self.screen.lock().unwrap();
-        screen.last_change.is_none_or(|(changed, _)| changed <= at)
-            && screen.activity.is_none_or(|a| a.at <= at)
+        let decoding = screen.decoding_since.is_some() && screen.decoder_error.is_none();
+        let moved = if decoding {
+            screen.last_change.map(|(at, _)| at)
+        } else {
+            screen.activity.map(|a| a.at)
+        };
+        moved.is_none_or(|moved| moved <= at)
             && screen.last_input.is_none_or(|input| input <= at)
             && !screen.closed
     }
@@ -677,6 +779,10 @@ impl Live {
             "ms_since_unit": since(state.activity.map(|a| a.at)),
             "units_since_input": state.units_since_input,
             "recent_unit_bytes": screen.recent_unit_bytes,
+            "unit_bytes_avg": screen.sizes.average(Instant::now()),
+            "idle_baseline_bytes": screen.sizes.baseline,
+            "active_threshold_bytes": screen.sizes.threshold(),
+            "movement_from": if state.decoding { "pixels" } else { "unit_bytes" },
         });
         if let (Value::Object(report), Value::Object(clock)) = (&mut report, clock) {
             report.extend(clock);
@@ -747,7 +853,6 @@ async fn receive<S: Datagrams>(
     our_ssrc: u32,
     notify: Arc<tokio::sync::watch::Sender<u64>>,
 ) {
-    let active_bytes = active_bytes();
     // Bytes of the unit being received, for the packet clock.
     let mut unit_bytes = 0usize;
     let mut depacketizer = HevcDepacketizer::new();
@@ -809,7 +914,7 @@ async fn receive<S: Datagrams>(
                     screen.recent_unit_bytes.pop_front();
                 }
                 screen.recent_unit_bytes.push_back(bytes);
-                if bytes >= active_bytes {
+                if screen.sizes.push(now, bytes) {
                     screen.activity = Some(Activity {
                         at: now,
                         wall: SystemTime::now(),
@@ -1526,10 +1631,11 @@ mod tests {
             });
     }
 
-    /// The packet clock with nothing decoded: units say the screen moves, quiet after them says it
-    /// settled, and an input followed by no unit proves the input changed nothing.
+    /// The packet clock with nothing decoded, on a phone that streams small units on a still
+    /// screen: those do not count as movement once the idle baseline is known; bigger units do;
+    /// quiet after them is settled; an input followed by idle units only changed nothing.
     #[test]
-    fn units_are_the_clock_without_decoding() {
+    fn unit_sizes_are_the_clock_without_decoding() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1543,37 +1649,97 @@ mod tests {
                 let frames = Frames::over(socket.clone(), 1, false);
                 let live = frames.live();
                 let settle = Duration::from_millis(80);
-                let mut seq = 1u16;
-                // Any bytes do: nothing is decoded.
-                let mut unit = |tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>| {
-                    for packet in packetize(&[0, 0, 0, 1, 0x02, 0x01, 0xaa, 0xbb], &mut seq, 0) {
+                let seq = Arc::new(Mutex::new(1u16));
+                // Nothing is decoded, so any bytes do; only the size matters.
+                let unit = |size: usize| {
+                    let mut nal = vec![0, 0, 0, 1, 0x02, 0x01];
+                    nal.resize(size, 0xab);
+                    let mut seq = seq.lock().unwrap();
+                    for packet in packetize(&nal, &mut seq, 0) {
                         tx.send(packet).unwrap();
                     }
                 };
-                let started = Instant::now();
-                live.note_input();
-                unit(&tx);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Idle: 60 small units a second, all along.
+                let idle = {
+                    let (tx, seq) = (tx.clone(), seq.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let mut nal = vec![0, 0, 0, 1, 0x02, 0x01];
+                            nal.resize(40, 0);
+                            for packet in packetize(&nal, &mut seq.lock().unwrap(), 0) {
+                                let _ = tx.send(packet);
+                            }
+                            tokio::time::sleep(Duration::from_millis(16)).await;
+                        }
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    live.state(settle).moving,
+                    "no baseline yet: every unit counts"
+                );
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                assert!(live.wait_settled(settle, Duration::from_millis(500)).await);
                 let state = live.state(settle);
-                assert!(state.moving && !state.settled && !state.decoding);
-                assert_eq!(state.units_since_input, 1);
-                assert!(!live.unchanged_since(started));
-                assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
-                let state = live.state(settle);
-                assert!(state.settled && !state.moving && state.picture_current);
+                assert!(!state.moving && !state.decoding && state.picture_current);
                 assert!(
                     state.latest.is_none(),
                     "settled with no picture: nothing is decoded"
                 );
-                // An input, and no unit after it: unchanged, as soon as the settle time passes.
+                let threshold = live.screen.lock().unwrap().sizes.threshold();
+                assert!((40..400).contains(&threshold), "threshold {threshold}");
+
+                // An input that moves the screen: bigger units.
+                let started = Instant::now();
+                live.note_input();
+                for _ in 0..4 {
+                    unit(3000);
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                let state = live.state(settle);
+                assert!(state.moving && !state.settled);
+                assert_eq!(state.changed_since_input, Some(true));
+                assert!(state.units_since_input >= 4);
+                assert!(!live.unchanged_since(started));
+                assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
+
+                // An input followed by idle units only: unchanged, once the settle time passes.
                 let input = Instant::now();
                 live.note_input();
+                tokio::time::sleep(Duration::from_millis(5)).await;
                 assert!(live.wait_settled(settle, Duration::from_secs(1)).await);
                 assert!(input.elapsed() < Duration::from_millis(200));
-                assert_eq!(live.state(settle).units_since_input, 0);
+                let state = live.state(settle);
+                assert_eq!(state.changed_since_input, Some(false));
+                assert_eq!(state.units_since_input, 0);
                 assert!(live.unchanged_since(input + Duration::from_millis(1)));
+                idle.abort();
                 drop(tx);
             });
+    }
+
+    #[test]
+    fn the_idle_baseline_is_a_low_percentile_of_recent_sizes() {
+        let mut sizes = UnitSizes::new(None, None);
+        let start = Instant::now();
+        assert!(sizes.push(start, 10), "before a baseline every unit counts");
+        // 1.5 s of small units with a few big ones among them.
+        for i in 1..90u64 {
+            let bytes = if i % 10 == 0 {
+                5000
+            } else {
+                50 + (i % 3) as usize
+            };
+            sizes.push(start + Duration::from_millis(i * 16), bytes);
+        }
+        assert_eq!(sizes.baseline, Some(50));
+        assert_eq!(sizes.threshold(), 132);
+        let now = start + Duration::from_millis(1500);
+        assert!(!sizes.push(now, 60));
+        assert!(sizes.push(now, 500));
+        assert!(sizes.average(now).is_some_and(|avg| avg > 50));
+        let fixed = UnitSizes::new(Some(700), None);
+        assert_eq!(fixed.threshold(), 700);
     }
 
     /// An x265 stream like the phone's (no B-frames, delimiters), split into access units.

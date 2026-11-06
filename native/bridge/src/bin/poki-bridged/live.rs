@@ -251,8 +251,8 @@ pub async fn subscribe(
                 let mut event = json!({
                     "event": "settled",
                     "quiet_ms": now.quiet_since.map(|at| at.elapsed().as_millis() as u64),
-                    // No unit since the input: the input changed nothing on screen.
-                    "changed_since_input": now.last_input.map(|_| now.units_since_input > 0),
+                    // Nothing moved since the input: the input changed nothing on screen.
+                    "changed_since_input": now.changed_since_input,
                     "captured_at": now.latest.map(|l| stamp_at(l.1)),
                     "size": now.latest.map(|l| [l.2, l.3]),
                     "epoch": now.epoch,
@@ -417,9 +417,10 @@ async fn picture(live: &Live, object: &Map<String, Value>, wait_ms: u64) -> Resu
             change
         }),
         "last_input_ms_ago": state.last_input.map(ago),
-        // By the packet clock: the phone sends units only when pixels change.
-        "changed_since_input": state.last_input.map(|_| state.units_since_input > 0),
+        // Pixels when decoding, unit sizes otherwise (see frames::UnitSizes).
+        "changed_since_input": state.changed_since_input,
         "units_since_input": state.last_input.map(|_| state.units_since_input),
+        "source": "video",
         "moving": state.moving,
         "ms_since_unit": state.activity.map(|a| ago(a.at)),
         "picture_current": state.picture_current,
