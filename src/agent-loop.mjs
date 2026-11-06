@@ -62,16 +62,40 @@ class StaleRef extends Error {}
 function resolveRef(agent, world, ref) {
   const element = agent.refs?.byRef.get(String(ref).toLowerCase());
   const stale = () => new StaleRef(`Ref ${ref} is from an earlier screen. Use the refs in this result, or the visible text with tap_text.`);
-  if (!element) throw stale();
-  if (agent.refs.epoch === world.epoch) return element;
+  if (!element || !heldSince(world, agent.refs, element)) throw stale();
+  return element;
+}
+// Whether an element read for an earlier picture ({epoch, thumb}) is still where it was: nothing has
+// changed since, or the newest picture, seen after the last input, differs only away from it.
+function heldSince(world, seen, element) {
+  if (seen.epoch === world.epoch) return true;
   const latest = world.lastFrame, size = world.devices.size;
-  if (!latest || !size || !agent.refs.thumb || latest.epoch < (world.lastInput?.epoch ?? 0)) throw stale();
-  const change = compare(agent.refs.thumb, latest.thumb);
-  if (!change?.changed) return element;
+  if (!latest || !size || !seen.thumb || latest.epoch < (world.lastInput?.epoch ?? 0)) return false;
+  const change = compare(seen.thumb, latest.thumb);
+  if (!change?.changed) return true;
   const f = box(element), [x, y, w, h] = change.region;
   const fx = f.x / size.width, fy = f.y / size.height, fw = f.width / size.width, fh = f.height / size.height;
-  if (fx < x + w && x < fx + fw && fy < y + h && y < fy + fh) throw stale();
-  return element;
+  return !(fx < x + w && x < fx + fw && fy < y + h && y < fy + fh);
+}
+const isTextInput = element => /^(?:AX|XCUIElementType)?(?:Secure)?(?:TextField|TextArea|TextView|SearchField)$/i.test(roleOf(element));
+// A target named by its text, looked up in what the World last read of the screen (the tree, or OCR
+// lines without one) while it still holds there: what an agent was shown is what it can tap.
+// Undefined when the World does not see it, and the single-step tool looks for it as before.
+function seenTarget(world, text, { exact, inputsOnly } = {}) {
+  const view = world.lastView;
+  if (!view || typeof text !== 'string' || !text.trim()) return undefined;
+  let found = matching(view.elements, text, exact).filter(e => heldSince(world, view.frame, e));
+  if (inputsOnly) found = found.filter(isTextInput);
+  if (found.length > 1) {
+    // Words that are also inside a control (a label within its button) are the control.
+    const controls = found.filter(e => /button|link|cell|tab|switch|menuitem|textfield|searchfield/i.test(roleOf(e)));
+    if (controls.length === 1) found = controls;
+  }
+  if (found.length > 1) {
+    const brief = found.slice(0, 8).map(e => ({ role: roleOf(e) || 'Text', label: labelOf(e), ...Object.fromEntries(Object.entries(centerOf(e)).map(([k, v]) => [k, Math.round(v)])) }));
+    return { many: `Expected one match for ${JSON.stringify(text)}; found ${found.length} on screen. Nothing was tapped. Tap one with tap and its x and y, or with a ref from now: ${JSON.stringify(brief)}` };
+  }
+  return found.length ? { element: found[0] } : undefined;
 }
 
 // What a step will touch, as a label, so the destructive check sees the same thing the tap will.
@@ -125,19 +149,28 @@ async function judge(world, base, { expect, timeoutMs, sentMs }) {
   // A hard deadline: every settle, picture, tree and OCR read races it, and the answer at the end is
   // whatever the World has then.
   const until = performance.now() + timeoutMs, left = () => until - performance.now();
-  let previous, frame, view, shot = false;
+  let previous, frame, view, shot = false, viaShots = false;
   for (;;) {
     checkWork();
-    // Until a picture newer than the input arrives, the wait leaves room for one screenshot at the end.
-    const reserve = sentMs && !newerThan(frame, sentMs) ? shotMs : 0;
-    const settled = await within(left() - reserve, () => world.settle(Math.max(150, Math.min(left() - reserve, sliceMs))), undefined);
-    frame = settled ?? frame;
-    // Never a picture older than the newest: a screen that does not settle is shown as it is now.
-    if (!settled?.settled) frame = await within(Math.max(300, left() - reserve), () => world.current(), frame) ?? frame ?? world.lastFrame ?? base.frame;
-    // No newer picture by now (a still screen sends none, a broken video none at all): take one.
-    if (sentMs && !newerThan(frame, sentMs) && left() <= shotMs && !shot) {
-      shot = true;
+    if (viaShots) {
+      // The video is not trusted for the rest of this wait: every look is a screenshot.
       frame = await within(Math.max(left(), shotMs), () => world.screenshot(), undefined) ?? frame;
+    } else {
+      // Until a picture newer than the input arrives, the wait leaves room for one screenshot at the end.
+      const reserve = sentMs && !newerThan(frame, sentMs) ? shotMs : 0;
+      const settled = await within(left() - reserve, () => world.settle(Math.max(150, Math.min(left() - reserve, sliceMs))), undefined);
+      frame = settled ?? frame;
+      // Never a picture older than the newest: a screen that does not settle is shown as it is now.
+      if (!settled?.settled) frame = await within(Math.max(300, left() - reserve), () => world.current(), frame) ?? frame ?? world.lastFrame ?? base.frame;
+      // A picture the source does not vouch for (a stalled or silent video, a decode backlog) is never
+      // judged: a screenshot replaces it, and the rest of the wait looks by screenshot.
+      const trusted = await world.trusted(frame, Math.max(left(), shotMs));
+      if (trusted !== frame) { viaShots = true; frame = trusted; }
+      // No newer picture by now (a still screen sends none, a broken video none at all): take one.
+      else if (sentMs && !newerThan(frame, sentMs) && left() <= shotMs && !shot) {
+        shot = true;
+        frame = await within(Math.max(left(), shotMs), () => world.screenshot(), undefined) ?? frame;
+      }
     }
     view = await within(Math.max(300, left()), () => world.read(frame, { waitMs: world.live ? treeWaitMs : left(), budgetMs: Math.max(300, left()) }), undefined)
       ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
@@ -156,7 +189,7 @@ async function judge(world, base, { expect, timeoutMs, sentMs }) {
     const moved = compare(base.frame.thumb, frame.thumb)?.changed;
     // Only a tree read for this frame can say what is missing: a lagging one is waited out.
     if (expect && fresh && view.tree === 'current' && (frame.settled && (!moved || previous?.frame.settled && world.same(previous.frame, frame)) || textStill)) return { expectation: 'missed', frame, view };
-    if (left() <= 0 || shot) return { expectation: expect ? (met ? 'met' : 'timeout') : undefined, frame, view };
+    if (left() <= 0 || shot || viaShots && left() < shotMs) return { expectation: expect ? (met ? 'met' : 'timeout') : undefined, frame, view };
     previous = { frame, view };
   }
 }
@@ -185,23 +218,27 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
   // held an input back is reported as it was then, even if it has cleared since.
   let condition = await world.condition(frame);
   if (held) condition = { ...condition, lost: held };
-  if (condition?.stalled) verdict = { ...verdict, outcome: 'unverified', reason: 'the screen video is stalled, so no picture after the input exists' };
+  // A picture that may be behind the screen (no screenshot could replace it) decides nothing.
+  const stale = world.staleness(frame, condition);
+  if (stale) verdict = { ...verdict, outcome: 'unverified', reason: 'the screen video is behind and no screenshot could be taken, so no picture after the input exists' };
   const since = world.sinceLastLook(agent, view);
   const lines = view.lines.slice(0, lineLimit);
   const app = view.foreground?.bundle_id ?? 'unknown app';
   const fresh = since?.appeared?.slice(0, 3).map(line => line.replace(/^[^:]+: /, '')).join(', ');
   const word = verdict ? { as_expected: 'as expected', changed: 'changed', unchanged: 'unchanged', unknown: 'still animating', unverified: 'unverified' }[verdict.outcome] : frame.settled === false ? 'current screen, still animating' : 'current screen';
-  const stall = condition?.stalled ? `Screen feed stalled${condition.stalled.ms ? ` ${Math.round(condition.stalled.ms / 1000)} s` : ''}; last picture is from ${condition.stalled.lastPictureAt}. ` : '';
+  const at = new Date(frame.capturedMs).toISOString(), during = condition?.stalled?.ms ? ` ${Math.round(condition.stalled.ms / 1000)} s` : frame.stalledMs ? ` ${Math.round(frame.stalledMs / 1000)} s` : '';
+  const stall = stale ? `${condition?.stalled?.text ?? 'Screen video is behind'}${during} and no screenshot could be taken; this picture is from ${at} and may be behind the screen. `
+    : condition?.stalled && frame.screenshot ? `${condition.stalled.text}; this picture is a screenshot taken at ${at}. ` : '';
   const summary = `${condition?.lost ? `${condition.lost.text} ` : ''}${stall}${app}: ${stop ? `stopped before step ${stop.step} (${stop.reason}), last step ` : ''}${word}${verdict?.expectation && verdict.expectation !== 'met' ? ` (expected ${verdict.expected}: ${verdict.expectation})` : ''}${fresh ? `. New: ${fresh}` : ''}${view.prompt ? `. System prompt: ${view.prompt.kind}` : ''}${view.ax === 'unavailable' ? '. Accessibility unavailable: text is read from the picture, and refs are OCR boxes' : ''}.`;
   const elements = giveRefs(agent, view);
   return {
     summary,
     ...(verdict ? { outcome: verdict.outcome, ...(verdict.reason ? { reason: verdict.reason } : {}) } : {}),
-    frame: { captured_at: new Date(frame.capturedMs).toISOString(), ...(sentMs ? { action_sent_at: new Date(sentMs).toISOString() } : {}), age_ms: Math.max(0, Date.now() - frame.capturedMs), settled: Boolean(frame.settled), ...(condition?.stalled ? { stalled: true } : {}) },
+    frame: { captured_at: new Date(frame.capturedMs).toISOString(), ...(sentMs ? { action_sent_at: new Date(sentMs).toISOString() } : {}), age_ms: Math.max(0, Date.now() - frame.capturedMs), settled: Boolean(frame.settled), source: frame.screenshot ? 'screenshot' : world.live ? 'video' : 'capture', ...(stale ? { stalled: true, stale_reason: stale } : {}) },
     ...(since && Object.keys(since).length ? { since_last_look: since } : {}),
     foreground: view.foreground,
     // With the video stalled the text comes from a read of the screen made now, not from the old picture.
-    text: { of: condition?.stalled ? new Date().toISOString() : new Date(frame.capturedMs).toISOString(), source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
+    text: { of: at, source: view.source, lines, ...(view.lines.length > lines.length ? { more: view.lines.length - lines.length } : {}) },
     ...(view.tree === 'pending' ? { tree: 'pending' } : {}),
     ...(full || refsInvalid ? { elements } : {}),
     ...(condition?.lost ? { blocked: { kind: condition.lost.kind ?? 'connection', reason: condition.lost.reason, text: [condition.lost.text] } } : view.prompt ? { blocked: { kind: view.prompt.kind, reason: 'system_prompt', text: lines.length ? lines.slice(0, 6) : [`A system prompt (${view.prompt.kind}) is on screen.`] } } : {}),
@@ -209,10 +246,12 @@ async function nowBlock(ctx, world, judged, { base, sentMs, verdict, full = fals
   };
 }
 
-// The picture goes with the text, except an old one from a stalled video, which would pass for the screen.
+// The picture always goes with the text. One that may be behind the screen is marked so in now.frame
+// and the summary, never left out: the agent is not left without a picture.
 async function reply(ctx, world, body, frame, full) {
   const content = [{ type: 'text', text: JSON.stringify(body) }];
-  if (!body.now?.frame?.stalled) content.push({ type: 'image', data: (await world.picture(frame, full)).toString('base64'), mimeType: 'image/jpeg' });
+  const image = await within(2000, () => world.picture(frame, full), undefined);
+  if (image) content.push({ type: 'image', data: image.toString('base64'), mimeType: 'image/jpeg' });
   return { content, _meta: { verdict: body.now?.outcome ?? null } };
 }
 
@@ -244,10 +283,21 @@ async function send(ctx, world, agent, step) {
     const { ref, ...rest } = args;
     args = { ...rest, ...centerOf(resolveRef(agent, world, ref)) };
   }
+  // A text target the World sees is touched where it is: no second read of the screen, and no "not on
+  // screen" for something the agent was just shown.
+  let tool = step.tool;
+  if (tool === 'tap_text') {
+    const seen = seenTarget(world, args.text, { exact: args.exact });
+    if (seen?.many) return { isError: true, sent: false, message: seen.many };
+    if (seen) { const { text, exact, ...rest } = args; tool = 'tap'; args = { ...rest, ...centerOf(seen.element) }; }
+  } else if (tool === 'fill' && args.field !== undefined && args.x === undefined) {
+    const seen = seenTarget(world, args.field, { inputsOnly: true });
+    if (seen?.element) { const { field, ...rest } = args; args = { ...rest, ...centerOf(seen.element) }; }
+  }
   const saved = { inBatch: ctx.inBatch, batchStep: ctx.batchStep };
   // As in a batch: one device lookup and one screen size for all steps, and no per-step readback.
   ctx.inBatch = true; ctx.batchStep = { stopOnError: false };
-  try { return answerOf(await ctx.dispatch(step.tool, args)); }
+  try { return answerOf(await ctx.dispatch(tool, args)); }
   finally { ctx.inBatch = saved.inBatch; ctx.batchStep = saved.batchStep; }
 }
 
@@ -299,10 +349,21 @@ async function step(ctx, world, agent, item, { timeoutMs }) {
   return { base, judged, sent, answer, expect: item.expect, sentMs };
 }
 
+// The screen now, read: the newest picture, or a screenshot when the source does not vouch for it,
+// and its text from the tree or, failing that, OCR of that picture. Text comes with every look.
+async function look(world, waitMs) {
+  const started = performance.now(), left = () => lookMs + shotMs - (performance.now() - started);
+  let frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current();
+  frame = await world.trusted(frame, shotMs);
+  const view = await within(Math.max(500, left()), () => world.read(frame, { waitMs: Math.min(waitMs, left()), budgetMs: Math.max(500, left()) }), undefined)
+    ?? await within(Math.max(500, left()), async () => { const lines = await world.ocr(frame, null, world.devices.size ?? { width: frame.width, height: frame.height }); return world.view(frame, { source: 'ocr', elements: lines, foreground: frame.foreground, tree: 'unavailable', ocrOnly: lines }); }, undefined)
+    ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
+  return { frame, view };
+}
+
 export async function observe(ctx, args = {}) {
   const world = await ctx.world();
-  const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current();
-  const view = await within(lookMs, () => world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs }), undefined) ?? world.view(frame, { source: 'none', elements: [], foreground: null, tree: 'unavailable' });
+  const { frame, view } = await look(world, lookMs - 500);
   const now = await nowBlock(ctx, world, { frame, view }, { full: args.full });
   return reply(ctx, world, { now, next: 'Act with act {action, expect}, or chain known steps with run {steps}; each reply ends with the screen as now.' }, frame, args.full);
 }
@@ -312,7 +373,7 @@ export async function act(ctx, args) {
   const timeoutMs = Math.min(args.timeout_ms ?? stepTimeoutMs, maxTimeoutMs);
   const lost = await heldBack(world);
   if (lost) {
-    const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(), view = await world.read(frame, { waitMs: treeWaitMs, budgetMs: lookMs });
+    const { frame, view } = await look(world, treeWaitMs);
     return { isError: true, ...await reply(ctx, world, { sent: false, expectation: args.expect ? 'blocked' : undefined, blocked: lost, now: await nowBlock(ctx, world, { frame, view }, { held: lost }) }, frame) };
   }
   let done;
@@ -320,7 +381,7 @@ export async function act(ctx, args) {
   catch (error) {
     if (cancelled()) return { isError: true, content: [{ type: 'text', text: JSON.stringify({ stopped: true, stop_reason: stoppingReason(error) }) }], _meta: { stop_reason: stoppingReason(error) } };
     if (!(error instanceof StaleRef)) throw error;
-    const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(), view = await world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs });
+    const { frame, view } = await look(world, lookMs - 500);
     const now = await nowBlock(ctx, world, { frame, view }, { refsInvalid: true });
     return { isError: true, ...await reply(ctx, world, { sent: false, error: error.message, now }, frame) };
   }
@@ -390,7 +451,7 @@ export async function run(ctx, args) {
   const finished = saved.next >= saved.steps.length && !stoppedAt;
   if (finished) agent.runs.delete(saved.id);
   // The last step's frame, or the screen now when the run stopped before sending anything.
-  const judged = last?.judged ?? await (async () => { const frame = await within(lookMs, () => world.current(), world.lastFrame) ?? await world.current(); return { frame, view: await world.read(frame, { waitMs: lookMs - 500, budgetMs: lookMs }) }; })();
+  const judged = last?.judged ?? await look(world, lookMs - 500);
   const verdict = last ? { ...outcomeOf(judged, last.base, last.sent, last.sentMs), expectation: judged.expectation, expected: last.expect ? describeExpect(last.expect) : undefined } : undefined;
   const now = await nowBlock(ctx, world, judged, { base: last?.base, sentMs: last?.sentMs, verdict, full: args.full, typed, held, stop: stoppedAt?.reason === 'checkpoint' ? stoppedAt : undefined });
   const body = { run_id: saved.id, completed_steps: stoppedAt ? stoppedAt.step - 1 : saved.steps.length, stopped: stoppedAt, now };

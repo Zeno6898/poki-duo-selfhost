@@ -39,6 +39,10 @@ export async function frameFromAnswer(answer, { rgb = false } = {}) {
     ...(answer.source ? { source: answer.source } : {}), ...(answer.fallback_reason ? { fallbackReason: answer.fallback_reason } : {}),
     ...(answer.moving !== undefined ? { moving: Boolean(answer.moving) } : {}), ...(answer.animating_region ? { animatingRegion: answer.animating_region } : {}),
     ...(answer.foreground?.pid ? { foreground: answer.foreground } : {}),
+    // The bridge's own word on whether this picture shows the screen now (no unit waiting to be
+    // decoded, the stream not stalled), and how long since the last video unit arrived.
+    ...(typeof answer.picture_current === 'boolean' ? { pictureCurrent: answer.picture_current } : {}),
+    ...(Number.isFinite(answer.ms_since_unit) ? { msSinceUnit: answer.ms_since_unit } : {}),
   };
   if (rgb && jpeg) frame.rgb = await sharp(jpeg).removeAlpha().raw().toBuffer();
   return frame;
@@ -114,7 +118,10 @@ export class LiveScreen {
   // The daemon's own verdict on the connection: { ok, reasons: [video_stalled | media_closed | ...] }.
   async status() {
     const { pong } = await this.daemon.ping(1000);
-    return pong?.health ?? { ok: true, reasons: [] };
+    const health = pong?.health ?? { ok: true, reasons: [] };
+    // How long since the phone last sent anything: the stream can fall silent with health still ok.
+    const silent = pong?.health?.ms_since_last_packet ?? pong?.frames?.ms_since_last_packet;
+    return Number.isFinite(silent) ? { ...health, msSinceLastPacket: silent } : health;
   }
   // source 'screenshot' asks for a picture from the screenshot service on the held tunnel instead of
   // the decoded video: slower (about 1 s), but taken now, whatever state the video is in.
