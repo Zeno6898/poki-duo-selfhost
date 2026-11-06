@@ -16,6 +16,8 @@ public struct RunnerError: Error, CustomStringConvertible, Sendable {
     public var message: String
     public var delivery: Delivery
     public var status: Int? = nil
+    /// WebDriver's error code when the runner answered with one ("unknown command", "invalid session id").
+    public var code: String? = nil
     /// No answer at all (refused or timed out), as opposed to an answer that says no.
     public var silent = false
     public var description: String { message }
@@ -79,8 +81,15 @@ public final class Runner: @unchecked Sendable {
 
     public var consecutiveMisses: Int { state.value.misses }
 
-    /// One request outside the session.
-    public func raw(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4) async throws -> JSON {
+    /// Settings for every session. WDA waits after each gesture until the app has been still for up
+    /// to `animationCoolOffTimeout` (2 s) and before each event until it is idle for up to
+    /// `waitForIdleTimeout` (10 s); an app that never stops animating (a feed with videos) used all of
+    /// both on every drag. Poki pauses briefly itself and the model reads the screen after.
+    static let sessionSettings: JSON = ["animationCoolOffTimeout": 0, "waitForIdleTimeout": 0.5]
+
+    /// One request outside the session. `countsAsMiss: false` for a request that may rightly take long
+    /// (a gesture): its timeout is not taken as a sign that the runner is gone.
+    public func raw(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4, countsAsMiss: Bool = true) async throws -> JSON {
         let target = URL(string: url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!
         let result: (status: Int, body: Data)
         do {
@@ -91,10 +100,10 @@ public final class Runner: @unchecked Sendable {
             miss()
             throw RunnerError(message: "the runner is not running (connection refused at \(url.absoluteString)); it is being restarted", delivery: .notSent, silent: true)
         } catch let error as DeadlineExceeded {
-            miss()
+            if countsAsMiss { miss() }
             throw RunnerError(message: error.description, delivery: .unknown, silent: true)
         } catch TransportError.timedOut {
-            miss()
+            if countsAsMiss { miss() }
             throw RunnerError(message: "the runner did not answer \(method) \(Self.short(path)) within \(DeadlineExceeded.format(timeout))", delivery: .unknown, silent: true)
         } catch is CancellationError {
             throw CancellationError()
@@ -107,7 +116,7 @@ public final class Runner: @unchecked Sendable {
         let value = parsed["value"] ?? parsed
         if let code = value["error"]?.string {
             let message = (value["message"]?.string ?? code).split(separator: "\n").first.map(String.init) ?? code
-            throw RunnerError(message: "the runner refused \(method) \(Self.short(path)): \(message)", delivery: .notSent, status: result.status)
+            throw RunnerError(message: "the runner refused \(method) \(Self.short(path)): \(message)", delivery: .notSent, status: result.status, code: code)
         }
         if !(200..<300).contains(result.status) {
             throw RunnerError(message: "the runner answered HTTP \(result.status) to \(method) \(Self.short(path))", delivery: .notSent, status: result.status)
@@ -129,17 +138,19 @@ public final class Runner: @unchecked Sendable {
             throw RunnerError(message: "the runner opened no session", delivery: .notSent)
         }
         state.update { $0.session = id }
+        // Best effort: a runner that refuses the settings still works, only slower.
+        _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": Self.sessionSettings], timeout: 2, countsAsMiss: false)
         return id
     }
 
     /// A request inside the session, made again once on a new session when WDA no longer knows it.
-    public func call(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4) async throws -> JSON {
+    public func call(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4, countsAsMiss: Bool = true) async throws -> JSON {
         let id = try await session()
         do {
-            return try await raw(method, "/session/\(id)\(path)", body, timeout: timeout)
-        } catch let error as RunnerError where error.status == 404 || error.message.lowercased().contains("invalid session id") {
+            return try await raw(method, "/session/\(id)\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
+        } catch let error as RunnerError where error.code == "invalid session id" || error.message.lowercased().contains("invalid session id") || (error.status == 404 && error.code != "unknown command" && error.code != "unknown method") {
             state.update { if $0.session == id { $0.session = nil } }
-            return try await raw(method, "/session/\(try await session())\(path)", body, timeout: timeout)
+            return try await raw(method, "/session/\(try await session())\(path)", body, timeout: timeout, countsAsMiss: countsAsMiss)
         }
     }
 

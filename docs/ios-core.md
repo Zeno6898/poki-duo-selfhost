@@ -122,6 +122,9 @@ public protocol CoreHost: AnyObject, Sendable {
     /// The runner launcher's state; PokiCore asks for a restart when the runner stops answering.
     func runnerState() -> RunnerState
     func restartRunner()
+    /// Text read from the screenshot, for elements an app collapsed. Optional: PokiCore's default
+    /// answers it with Vision (VNRecognizeTextRequest), so the app need not implement it.
+    func recognizeText(inPNG png: Data) async -> [RecognizedText]?
 }
 
 public final class PokiCore: Sendable {
@@ -160,8 +163,41 @@ The computer-use profile, ported from `src/cua.mjs` and `src/cua-wda.mjs`:
 - `do {actions: [...], full?}`: run actions in order, then read the screen.
 - `status`: the relay, the runner and pending approvals, without touching the device.
 
-Each answer is facts only: the app in front, numbered elements, `+` for new, what each action did
-(`sent`, `not_sent`, `unknown`), timings and a JPEG screenshot. No verdicts.
+Each answer is facts only: the app in front, numbered elements, what each action did (`sent`,
+`not_sent`, `unknown`), timings and a JPEG screenshot. No verdicts.
+
+- **Numbers stay.** An element still on screen in the next read keeps its number (same text and frame
+  first, then same text); a new screen (another app, or under 30% of the elements kept) numbers from
+  1 again. `do` lists only the new (`+`) and moved (`~`) elements and says how many others kept their
+  numbers; `look` and `full=true` list everything.
+- **`screen_changed`** in every `do`: whether the elements, or only the picture, differ from the read
+  before, so a no-op action is visible at once.
+- **The screenshot is one pixel per screen point** (402 px wide on a 402-point iPhone 17 Pro), and the
+  answer says so: a point on the picture is a point to tap.
+- **Lean lists.** Text an element around it already says (a post's text and then each of its lines),
+  scroll bars, and holders that say what the button inside them says are left out; labels over 160
+  characters are cut. `full=true` lists the tree as it is.
+- **Collapsed elements.** An element with a long label and nothing listed inside it (X shows a reply,
+  its buttons included, as one cell) is marked `[collapsed]`. `full=true` adds the text Vision reads
+  inside it as numbered `Text` elements (`(read from the picture)`), which can be tapped.
+- **Taps are hit-tested.** A numbered element is touched at its centre, or, when the centre is off
+  screen or under a bar or a later element in the tree (a reply bar), at the nearest point of it that
+  is free; the answer says where. No free point: `not_hittable`, nothing is sent. Points off the screen
+  are `not_hittable` too.
+- **Gestures.** `swipe` is a quick flick inside the biggest list on screen (or `in: n`), clear of bars
+  and anything drawn across it, away from the screen's system edges. `drag` moves at its own speed
+  (`ms`, default 400) and rests 150 ms before lifting, so the list stops where the finger stops
+  (`hold_ms` first to pick something up). `scroll_to` uses resting drags and counts a target under a
+  bar as not there yet. All three use WDA's `pressAndDragWithVelocity` (a runner without it gets
+  `dragfromtoforduration`), with a gesture's own time limit that is not counted as a runner miss.
+- **WDA's waits are off.** Each new session sets `animationCoolOffTimeout` 0 and `waitForIdleTimeout`
+  0.5 s. WDA otherwise waited up to 2 s after every gesture for the app to hold still, and up to 10 s
+  before events for it to be idle, which an app that never stops animating used in full (2.3 to 4.3 s
+  drags in X). Poki's own short pause before the read stays.
+- **`wait_until`**: `{wait_until: "text"}`, `{wait_until: {text, gone: true, ms}}` or
+  `{wait_until: {settled: true, ms}}` reads the tree every 250 ms until the text appears or goes, or
+  two reads match (default 3 s, at most 10 s, within the action time). Not seeing it is reported, not
+  an error. There is no "paused" line after a wait.
 
 ### Deadlines (no hangs)
 

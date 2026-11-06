@@ -24,16 +24,25 @@ final class Computer: @unchecked Sendable {
     let approvals: Approvals
 
     // Kept between calls; one tool call runs at a time (the gate in PokiCore), so no lock is needed.
+    /// The numbers of the latest read. An element that is still there in the next read keeps its
+    /// number, so a `do` can list only what changed.
     var refs: [Int: Element] = [:]
-    var previous: Set<String> = []
-    var lastElements: [Element] = []
+    var listed: [(ref: Int, element: Element)] = []
+    var nextRef = 1
+    /// Every element of the latest tree with a frame, listed or not (for what covers what).
+    var lastAll: [Element] = []
     var lastForeground: Foreground?
     var size: ScreenSize?
     var lastPNG: Data?
+    var lastTree: String?
+    var lastPicture: UInt64?
 
-    static let settle: [String: Double] = ["tap": 0.45, "type": 0.25, "key": 0.3, "swipe": 0.6, "drag": 0.6, "long_press": 0.4, "pinch": 0.6, "button": 0.7, "launch": 0.9, "scroll_to": 0.2, "wait": 0]
-    static let imageWidth = 300
+    var lastElements: [Element] { listed.map(\.element) }
+    var layout: Layout { Layout(all: lastAll, screen: size ?? ScreenSize(width: 10_000, height: 10_000)) }
+
+    static let settle: [String: Double] = ["tap": 0.45, "type": 0.25, "key": 0.3, "swipe": 0.6, "drag": 0.35, "long_press": 0.4, "pinch": 0.6, "button": 0.7, "launch": 0.9, "scroll_to": 0.2, "wait": 0, "wait_until": 0]
     static let lineLimit = 120
+    static let textLimit = 160
 
     init(runner: Runner, host: CoreHost, config: CoreConfig, approvals: Approvals) {
         self.runner = runner
@@ -51,56 +60,154 @@ final class Computer: @unchecked Sendable {
         return s
     }
 
-    /// Reads the screen and answers with the facts, whatever part of the read failed.
-    func readAndReply(until: Double, full: Bool, did: [String] = [], error: String? = nil, extra: [String] = []) async -> ToolResult {
+    /// The screenshot's width: one pixel per screen point, so a point read off the picture is a point
+    /// to tap.
+    static func pictureWidth(_ screen: ScreenSize?) -> Int {
+        guard let w = screen?.width, w >= 200, w <= 1400 else { return 300 }
+        return Int(w.rounded())
+    }
+
+    /// Reads the screen and answers with the facts, whatever part of the read failed. `changes` lists
+    /// only what changed since the read before (a `do`); `full` lists every element, as the tree has it.
+    func readAndReply(until: Double, full: Bool, changes: Bool = false, did: [String] = [], error: String? = nil, extra: [String] = []) async -> ToolResult {
         let budget = max(0.8, min(config.readTimeout, until - now() - 0.2))
         let reading = await runner.read(timeout: budget)
-        var screen = ScreenSize(width: 10_000, height: 10_000)
-        if let known = size { screen = known } else if let asked = try? await screenSize(until: now() + 1.5) { screen = asked }
+        if size == nil { _ = try? await screenSize(until: now() + 1.5) }
+        let screen = size ?? ScreenSize(width: 10_000, height: 10_000)
         var notes = reading.notes
-        let elements = listable(reading.elements, screen)
         if reading.png == nil && reading.elements.isEmpty {
             // Nothing came back: say what was sent and what the runner is doing, and nothing else.
             let state = host.runnerState()
             let did = did.map { $0.replacingOccurrences(of: "(sent,", with: "(sent, not confirmed: no read after it,") }
             let lines = ["read: failed (\(notes.joined(separator: "; ")))", "runner: \(state.describe)"] + did.map { "did: \($0)" } + (error.map { ["error: \($0)"] } ?? []) + extra
+            refs = [:]
+            listed = []
             return ToolResult(text: lines.joined(separator: "\n"), jpeg: nil, isError: true)
         }
+        let treeRead = !reading.elements.isEmpty || reading.notes.isEmpty
+        let sameApp = reading.foreground?.bundleID == nil || reading.foreground?.bundleID == lastForeground?.bundleID
         lastForeground = reading.foreground ?? lastForeground
         lastPNG = reading.png ?? lastPNG
-        // Numbers refer to this read only.
-        refs = [:]
-        var keysNow = Set<String>()
-        let fresh = previous.isEmpty
-        var lines: [(isNew: Bool, text: String)] = []
-        for (index, e) in elements.enumerated() {
-            let ref = index + 1
-            refs[ref] = e
-            keysNow.insert(e.key)
-            let isNew = !fresh && !previous.contains(e.key)
-            let f = e.frame
-            lines.append((isNew, "\(isNew ? "+" : " ")\(ref) \(e.type) \"\(e.text)\" [\([f.x, f.y, f.width, f.height].map { String(Int($0.rounded())) }.joined(separator: ","))]"))
+
+        // Whether the screen changed since the read before (the one the model saw last).
+        let visible = listable(reading.elements, screen)
+        let tree = visible.map { "\($0.key)@\($0.frame.described)" }.joined(separator: "\n")
+        let picture = reading.png.map(fingerprint)
+        var changedLine: String?
+        if changes, treeRead, let before = lastTree {
+            let pictureChanged: Bool? = picture.flatMap { now in lastPicture.map { $0 != now } }
+            if tree != before { changedLine = "screen_changed: true (the elements changed)" }
+            else if pictureChanged == true { changedLine = "screen_changed: true (only the picture changed; the elements are the same)" }
+            else { changedLine = "screen_changed: false (the elements\(pictureChanged == false ? " and the picture" : "") are the same as in the read before)" }
         }
-        let gone = previous.subtracting(keysNow).sorted().prefix(20).map { key -> String in
-            let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
-            return "\(parts[0]) \"\(parts.count > 1 ? parts[1] : "")\""
+        if treeRead { lastTree = tree }
+        if let picture { lastPicture = picture }
+
+        // What to list: the elements without repeats, and in a full read the text inside collapsed ones.
+        var shown = treeRead ? lean(visible, full: full) : []
+        let collapsed = Set(shown.filter { isCollapsed($0, in: reading.elements) }.map(\.node))
+        if full, !collapsed.isEmpty, let png = reading.png, size != nil {
+            let host = self.host
+            let left = max(0.3, min(2, until - now() - 0.5))
+            if let texts = (try? await withDeadline(left, "reading text from the picture", { await host.recognizeText(inPNG: png) })) ?? nil {
+                // Each text goes right after the collapsed element it lies in, top to bottom.
+                var inside: [Int: [Element]] = [:]
+                let holders = shown.filter { collapsed.contains($0.node) }
+                for t in texts {
+                    let frame = Rect(x: t.box.x * screen.width, y: t.box.y * screen.height, width: t.box.width * screen.width, height: t.box.height * screen.height)
+                    guard let holder = holders.last(where: { $0.frame.contains(frame.centre) }) else { continue }
+                    inside[holder.node, default: []].append(Element(type: "Text", label: t.text, value: nil, identifier: nil, frame: frame, depth: holder.depth + 1, fromPicture: true))
+                }
+                shown = shown.flatMap { e in [e] + (inside[e.node] ?? []).sorted { ($0.frame.y, $0.frame.x) < ($1.frame.y, $1.frame.x) } }
+            } else {
+                notes.append("no text read from the picture")
+            }
         }
-        if !reading.elements.isEmpty || reading.notes.isEmpty { previous = keysNow; lastElements = elements }
-        let shown = full || fresh ? lines : lines.enumerated().filter { $0.element.isNew || $0.offset < Self.lineLimit }.map(\.element)
+
+        // Numbers: an element still there keeps its number (same text and frame first, then same text).
+        let prior = treeRead ? listed : []
+        var exact: [String: [Int]] = [:], loose: [String: [Int]] = [:]
+        for (r, e) in prior where !e.fromPicture {
+            exact["\(e.key)@\(e.frame.described)", default: []].append(r)
+            loose[e.key, default: []].append(r)
+        }
+        var used = Set<Int>()
+        var assigned = [Int?](repeating: nil, count: shown.count)
+        var moved = Set<Int>()
+        for (i, e) in shown.enumerated() where !e.fromPicture {
+            if let r = exact["\(e.key)@\(e.frame.described)"]?.first(where: { !used.contains($0) }) { assigned[i] = r; used.insert(r) }
+        }
+        for (i, e) in shown.enumerated() where !e.fromPicture && assigned[i] == nil {
+            if let r = loose[e.key]?.first(where: { !used.contains($0) }) { assigned[i] = r; used.insert(r); moved.insert(r) }
+        }
+        // Another screen: numbering starts again.
+        let fresh = prior.isEmpty || !sameApp || Double(used.count) < 0.3 * Double(max(1, shown.count))
+        if fresh {
+            assigned = [Int?](repeating: nil, count: shown.count)
+            moved = []
+            used = []
+            nextRef = 1
+        }
+        for i in assigned.indices where assigned[i] == nil {
+            assigned[i] = nextRef
+            nextRef += 1
+        }
+        let gone = fresh ? [] : prior.filter { !used.contains($0.ref) && !$0.element.fromPicture }
+        if treeRead {
+            refs = [:]
+            listed = []
+            for (i, e) in shown.enumerated() {
+                refs[assigned[i]!] = e
+                listed.append((assigned[i]!, e))
+            }
+            lastAll = reading.elements
+        } else {
+            refs = [:]
+            listed = []
+        }
+
+        func line(_ ref: Int, _ e: Element, _ mark: String) -> String {
+            var text = e.text
+            if !full, text.count > Self.textLimit { text = "\(text.prefix(Self.textLimit - 10))… (+\(text.count - Self.textLimit + 10) characters)" }
+            let tag = e.fromPicture ? " (read from the picture)" : collapsed.contains(e.node) ? " [collapsed]" : ""
+            return "\(mark)\(ref) \(e.type) \"\(text)\" \(e.frame.described)\(tag)"
+        }
+        var body: [String] = []
+        var heading: String
+        let marks: [String] = shown.indices.map { i in
+            let r = assigned[i]!
+            if fresh { return " " }
+            return used.contains(r) ? (moved.contains(r) ? "~" : " ") : "+"
+        }
+        if changes, !full, !fresh {
+            let changed = shown.indices.filter { marks[$0] != " " }
+            let same = shown.count - changed.count
+            heading = changed.isEmpty
+                ? "elements: none changed (\(shown.count) on screen keep their numbers)"
+                : "elements (\(shown.count) on screen; only the changed are listed: + new, ~ moved; the \(same) others keep their numbers, full=true lists all):"
+            body = changed.prefix(Self.lineLimit).map { line(assigned[$0]!, shown[$0], marks[$0]) }
+        } else {
+            heading = fresh || prior.isEmpty ? "elements (\(shown.count)):" : "elements (\(shown.count); + new since the last read, ~ moved):"
+            body = shown.indices.prefix(full ? 1000 : Self.lineLimit).map { line(assigned[$0]!, shown[$0], marks[$0]) }
+            if !full, shown.count > Self.lineLimit { body.append("… \(shown.count - Self.lineLimit) more; full=true lists all") }
+        }
+        if !collapsed.isEmpty, !full { heading += "  ([collapsed] = one element whose parts are not in the tree; full=true adds the text read from the picture inside it, or tap a point on the screenshot)" }
 
         var jpeg: Data?
+        let width = Self.pictureWidth(size)
         if let png = reading.png {
-            do { jpeg = try host.jpeg(fromPNG: png, width: Self.imageWidth, quality: 0.6) }
+            do { jpeg = try host.jpeg(fromPNG: png, width: width, quality: 0.6) }
             catch { notes.append("screenshot not encoded: \(error)") }
         }
         let app = reading.foreground?.describe ?? "unknown"
         var header = ["app: \(app)   read: \(ISO8601DateFormatter().string(from: Date())) (\(reading.ms) ms)" + (notes.isEmpty ? "" : "   note: \(notes.joined(separator: "; "))")]
+        if jpeg != nil { header.append(size != nil ? "screenshot: \(width) px wide, 1 px = 1 screen point (the same points as the frames and taps)" : "screenshot: \(width) px wide; screen size unknown") }
         header += did.map { "did: \($0)" }
         if let error { header.append("error: \(error)") }
+        if let changedLine { header.append(changedLine) }
         header += extra
-        header.append(fresh ? "elements (\(lines.count)):" : "elements (\(lines.count); + = new since the last read):")
-        let footer = gone.isEmpty ? [] : ["gone since the last read: \(gone.joined(separator: ", "))"]
-        let body = shown.prefix(full ? 1000 : Self.lineLimit).map(\.text)
+        header.append(heading)
+        let footer = gone.isEmpty ? [] : ["gone since the last read: " + gone.prefix(20).map { "\($0.ref) \($0.element.type) \"\($0.element.text.prefix(40))\"" }.joined(separator: ", ")]
         return ToolResult(text: (header + body + footer).joined(separator: "\n"), jpeg: jpeg, isError: error != nil)
     }
 
@@ -198,10 +305,12 @@ final class Computer: @unchecked Sendable {
         }
         if let lastKind {
             let pause = min(Self.settle[lastKind] ?? 0.4, max(0, until - now() - config.readTimeout - 0.3))
-            await sleep(seconds: pause)
-            did.append("waited \(Int((pause * 1000).rounded())) ms")
+            if pause > 0.01 {
+                await sleep(seconds: pause)
+                did.append("paused \(Int((pause * 1000).rounded())) ms before reading")
+            }
         }
-        return await readAndReply(until: until, full: full, did: did, error: error, extra: approvedNote.map { [$0] } ?? [])
+        return await readAndReply(until: until, full: full, changes: true, did: did, error: error, extra: approvedNote.map { [$0] } ?? [])
     }
 
     // MARK: Sensitivity
