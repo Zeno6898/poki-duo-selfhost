@@ -52,6 +52,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "ax_gate.rs"]
+mod ax_gate;
 #[path = "live.rs"]
 mod live;
 #[path = "lock_state.rs"]
@@ -154,6 +156,8 @@ struct State {
     foreground: live::ForegroundCell,
     /// Locked or awake, from SpringBoard's notifications (see device_state).
     device: lock_state::DeviceCell,
+    /// Every accessibility read goes through it (see ax_gate).
+    ax_gate: ax_gate::AxGateCell,
 }
 
 impl State {
@@ -161,14 +165,17 @@ impl State {
         let prefetch = live::Prefetcher::default();
         let prefetch_events = Rc::new(watch::channel(0).0);
         let foreground = live::ForegroundCell::default();
+        let ax_gate = ax_gate::AxGateCell::default();
         let mut session = Session::new(target, prefetch.clone(), prefetch_events.clone());
         session.foreground = foreground.clone();
+        session.ax_gate = ax_gate.clone();
         Self {
             session: Mutex::new(session),
             prefetch,
             prefetch_events,
             foreground,
             device: lock_state::DeviceCell::default(),
+            ax_gate,
             stop: watch::channel(false).0,
             started: Instant::now(),
             version: executable_version(),
@@ -232,7 +239,8 @@ async fn reap(state: Rc<State>) {
     let mut next_attempt = Instant::now();
     let mut backoff = Duration::from_secs(1);
     loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Often enough that a media reopen the stream asks for is done within about 100 ms.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let Ok(mut session) = state.session.try_lock() else {
             continue;
         };
@@ -525,7 +533,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     // A packet was lost: pictures may show errors until the session reopens.
                     reasons.push("picture_damaged");
                 }
-                if live::ax_unavailable(&state.prefetch) {
+                if live::ax_unavailable(&state.prefetch) || state.ax_gate.borrow().unavailable() {
                     // The newest accessibility read failed: no tree shows the screen.
                     reasons.push("ax_unavailable");
                 }
@@ -562,6 +570,7 @@ async fn answer(line: &str, state: &State, mut closed: watch::Receiver<bool>) ->
                     "continuous"
                 }
                 .into();
+                pong["ax_gate"] = state.ax_gate.borrow().json();
                 pong["ax"] = json!({
                     "watch": session.ax.as_ref().map(|w| w.stats()),
                     "opened": session.ax_opened,
@@ -714,6 +723,7 @@ struct Input {
 
 struct Session {
     target: Target,
+    ax_gate: ax_gate::AxGateCell,
     foreground: live::ForegroundCell,
     prefetch: live::Prefetcher,
     prefetch_events: Rc<watch::Sender<u64>>,
@@ -874,6 +884,7 @@ impl Session {
             tunnels_lost: 0,
             ops: 0,
             media_reopens: 0,
+            ax_gate: ax_gate::AxGateCell::default(),
             foreground: live::ForegroundCell::default(),
         }
     }
@@ -1141,10 +1152,20 @@ impl Session {
                     self.ax_last_error = Some(error.to_string());
                     timings.ax = Some(crate::ax::watch::Served::Fallback);
                     if let Some(link) = self.link.as_mut()
-                        && let Ok(tree) =
-                            ax::read_tree(&mut link.device.adapter, &link.device.rsd, false).await
+                        && let Ok(tree) = ax::read_tree_with_timeout(
+                            &mut link.device.adapter,
+                            &link.device.rsd,
+                            false,
+                            Duration::from_secs(4),
+                        )
+                        .await
                     {
                         return Ok(tree);
+                    }
+                    // The accessibility service not answering is not the tunnel failing: input
+                    // and the media session stay. Only a dead tunnel is reopened and retried.
+                    if self.link.is_some() && self.tunnel_alive().await {
+                        return Err(error);
                     }
                     self.recover().await;
                     if !reused || attempt > 0 {
@@ -1375,7 +1396,15 @@ impl Session {
             return Ok(with_provenance(read.tree, &provenance));
         }
         let requested = Instant::now();
-        let tree = Box::pin(self.watched_tree(timings)).await?;
+        let gate = self.ax_gate.clone();
+        let tree = ax_gate::through(&gate, Box::pin(self.watched_tree(timings)), || ()).await;
+        if gate.borrow().closed(Instant::now()).is_some() {
+            // Paused: no subscription is left open on a service that does not answer; the next
+            // read after the pause starts on fresh connections.
+            self.ax = None;
+            self.ax_link = None;
+        }
+        let tree = tree?;
         if let Some(live) = &live {
             live.note_points(&tree);
         }
