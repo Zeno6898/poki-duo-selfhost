@@ -274,6 +274,7 @@ jobs:
       - name: Build for testing (iOS device SDK, unsigned)
         run: |
           set -euo pipefail
+          mkdir -p build
           xcodebuild build-for-testing \
             -project native/ios-runner/WebDriverAgent/WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
