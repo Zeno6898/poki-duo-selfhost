@@ -78,7 +78,7 @@ jobs:
                static var thumbnailURL: URL? { url?.appendingPathComponent("activity-thumbnail.jpg") }
                static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
           diff --git a/native/ios-app/project.yml b/native/ios-app/project.yml
-          index 9c8d321..1ba6c70 100644
+          index 9c8d321..e3ea280 100644
           --- a/native/ios-app/project.yml
           +++ b/native/ios-app/project.yml
           @@ -14,7 +14,7 @@ packages:
@@ -86,7 +86,7 @@ jobs:
              base:
                MARKETING_VERSION: "0.1.0"
           -    CURRENT_PROJECT_VERSION: "1"
-          +    CURRENT_PROJECT_VERSION: "2"
+          +    CURRENT_PROJECT_VERSION: "3"
                SWIFT_VERSION: "5.0"
                TARGETED_DEVICE_FAMILY: "1"
                DEBUG_INFORMATION_FORMAT: dwarf
@@ -103,6 +103,30 @@ jobs:
                    self.relayURL = relayURL
                    self.runnerURL = runnerURL
                    self.sensitive = sensitive
+          diff --git a/native/ios/PokiCore/Sources/PokiCore/Runner.swift b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          index c41f7e9..97f9333 100644
+          --- a/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          +++ b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          @@ -170,8 +170,18 @@ public final class Runner: @unchecked Sendable {
+                           guard let id = value["sessionId"]?.string ?? value["capabilities"]?["sessionId"]?.string else {
+                               throw RunnerError(message: "the runner opened no session", delivery: .notSent)
+                           }
+          +                var settings = Self.sessionSettings.object ?? [:]
+          +                // The default top-left detection point can land on Poki's expanded Live Activity
+          +                // and select Spotlight instead of the app visible underneath it. Use the current
+          +                // screen's centre; do not pin an app, so system dialogs can still be detected.
+          +                if let screen = try? await raw("GET", "/wda/screen", timeout: 1, countsAsMiss: false),
+          +                   let width = screen["screenSize"]?["width"]?.double,
+          +                   let height = screen["screenSize"]?["height"]?.double,
+          +                   width.isFinite, height.isFinite, width > 0, height > 0, width < 10000, height < 10000 {
+          +                    settings["activeAppDetectionPoint"] = .string("\(width / 2),\(height / 2)")
+          +                }
+                           // Best effort: a runner that refuses the settings still works, only slower.
+          -                _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": Self.sessionSettings], timeout: 2, countsAsMiss: false)
+          +                _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": .object(settings)], timeout: 2, countsAsMiss: false)
+                           state.update { $0.session = id }
+                           return id
+                       }
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
           index 8cbbfe5..4d113f6 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
@@ -148,6 +172,37 @@ jobs:
                }
                var sent: [String] { lock.lock(); defer { lock.unlock() }; return outbox }
            }
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          index fb3d0dd..49b874e 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          @@ -26,6 +26,26 @@ final class LookDoTests: XCTestCase {
+                   XCTAssertEqual(settings?["waitForIdleTimeout"]?.double, 0.5)
+               }
+           
+          +    func testExpandedLiveActivityDoesNotSelectSpotlightOverTheVisibleApp() async {
+          +        let (core, wda, _) = makeCore()
+          +        let centred = LockedBox(false)
+          +        wda.set("GET /wda/screen") { _ in (200, ["value": ["screenSize": ["width": 466, "height": 678]]]) }
+          +        wda.set("POST /appium/settings") { body in
+          +            centred.value = body?["settings"]?["activeAppDetectionPoint"]?.string == "233.0,339.0"
+          +            return (200, ["value": .null])
+          +        }
+          +        wda.set("GET /source") { _ in
+          +            (200, ["value": ["type": "XCUIElementTypeApplication", "label": .string(centred.value ? "Calculator" : "Spotlight")]])
+          +        }
+          +        wda.set("GET /wda/activeAppInfo") { _ in
+          +            (200, ["value": ["bundleId": .string(centred.value ? "com.apple.calculator" : "com.apple.Spotlight")]])
+          +        }
+          +        let result = await core.call("look", [:])
+          +        XCTAssertFalse(result.isError, result.text)
+          +        XCTAssertTrue(result.text.contains("Calculator"), result.text)
+          +        XCTAssertFalse(result.text.contains("Spotlight"), result.text)
+          +    }
+          +
+               func testAnElementUnderTheReplyBarIsNotHittableAndNothingIsSent() async {
+                   let (core, wda, _) = makeCore()
+                   thread(wda, quotedY: 750)
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
           index 8a0dc8f..1e4867a 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
@@ -278,7 +333,7 @@ jobs:
                static var thumbnailURL: URL? { url?.appendingPathComponent("activity-thumbnail.jpg") }
                static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
           diff --git a/native/ios-app/project.yml b/native/ios-app/project.yml
-          index 9c8d321..1ba6c70 100644
+          index 9c8d321..e3ea280 100644
           --- a/native/ios-app/project.yml
           +++ b/native/ios-app/project.yml
           @@ -14,7 +14,7 @@ packages:
@@ -286,7 +341,7 @@ jobs:
              base:
                MARKETING_VERSION: "0.1.0"
           -    CURRENT_PROJECT_VERSION: "1"
-          +    CURRENT_PROJECT_VERSION: "2"
+          +    CURRENT_PROJECT_VERSION: "3"
                SWIFT_VERSION: "5.0"
                TARGETED_DEVICE_FAMILY: "1"
                DEBUG_INFORMATION_FORMAT: dwarf
@@ -303,6 +358,30 @@ jobs:
                    self.relayURL = relayURL
                    self.runnerURL = runnerURL
                    self.sensitive = sensitive
+          diff --git a/native/ios/PokiCore/Sources/PokiCore/Runner.swift b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          index c41f7e9..97f9333 100644
+          --- a/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          +++ b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
+          @@ -170,8 +170,18 @@ public final class Runner: @unchecked Sendable {
+                           guard let id = value["sessionId"]?.string ?? value["capabilities"]?["sessionId"]?.string else {
+                               throw RunnerError(message: "the runner opened no session", delivery: .notSent)
+                           }
+          +                var settings = Self.sessionSettings.object ?? [:]
+          +                // The default top-left detection point can land on Poki's expanded Live Activity
+          +                // and select Spotlight instead of the app visible underneath it. Use the current
+          +                // screen's centre; do not pin an app, so system dialogs can still be detected.
+          +                if let screen = try? await raw("GET", "/wda/screen", timeout: 1, countsAsMiss: false),
+          +                   let width = screen["screenSize"]?["width"]?.double,
+          +                   let height = screen["screenSize"]?["height"]?.double,
+          +                   width.isFinite, height.isFinite, width > 0, height > 0, width < 10000, height < 10000 {
+          +                    settings["activeAppDetectionPoint"] = .string("\(width / 2),\(height / 2)")
+          +                }
+                           // Best effort: a runner that refuses the settings still works, only slower.
+          -                _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": Self.sessionSettings], timeout: 2, countsAsMiss: false)
+          +                _ = try? await raw("POST", "/session/\(id)/appium/settings", ["settings": .object(settings)], timeout: 2, countsAsMiss: false)
+                           state.update { $0.session = id }
+                           return id
+                       }
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
           index 8cbbfe5..4d113f6 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
@@ -348,6 +427,37 @@ jobs:
                }
                var sent: [String] { lock.lock(); defer { lock.unlock() }; return outbox }
            }
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          index fb3d0dd..49b874e 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/LookDoTests.swift
+          @@ -26,6 +26,26 @@ final class LookDoTests: XCTestCase {
+                   XCTAssertEqual(settings?["waitForIdleTimeout"]?.double, 0.5)
+               }
+           
+          +    func testExpandedLiveActivityDoesNotSelectSpotlightOverTheVisibleApp() async {
+          +        let (core, wda, _) = makeCore()
+          +        let centred = LockedBox(false)
+          +        wda.set("GET /wda/screen") { _ in (200, ["value": ["screenSize": ["width": 466, "height": 678]]]) }
+          +        wda.set("POST /appium/settings") { body in
+          +            centred.value = body?["settings"]?["activeAppDetectionPoint"]?.string == "233.0,339.0"
+          +            return (200, ["value": .null])
+          +        }
+          +        wda.set("GET /source") { _ in
+          +            (200, ["value": ["type": "XCUIElementTypeApplication", "label": .string(centred.value ? "Calculator" : "Spotlight")]])
+          +        }
+          +        wda.set("GET /wda/activeAppInfo") { _ in
+          +            (200, ["value": ["bundleId": .string(centred.value ? "com.apple.calculator" : "com.apple.Spotlight")]])
+          +        }
+          +        let result = await core.call("look", [:])
+          +        XCTAssertFalse(result.isError, result.text)
+          +        XCTAssertTrue(result.text.contains("Calculator"), result.text)
+          +        XCTAssertFalse(result.text.contains("Spotlight"), result.text)
+          +    }
+          +
+               func testAnElementUnderTheReplyBarIsNotHittableAndNothingIsSent() async {
+                   let (core, wda, _) = makeCore()
+                   thread(wda, quotedY: 750)
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
           index 8a0dc8f..1e4867a 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
