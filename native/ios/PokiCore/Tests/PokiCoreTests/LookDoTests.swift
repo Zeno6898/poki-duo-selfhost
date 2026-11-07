@@ -312,6 +312,38 @@ import CoreText
 import ImageIO
 import UniformTypeIdentifiers
 
+final class PictureSketchTests: XCTestCase {
+    func png(_ draw: (CGContext) -> Void) -> Data {
+        let width = 402, height = 874
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(CGColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1))
+        draw(context)
+        let data = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, context.makeImage()!, nil)
+        CGImageDestinationFinalize(destination)
+        return data as Data
+    }
+
+    /// Seen on the simulator: a scroll indicator fading out after a drag made a no-op wait answer
+    /// screen_changed: true. A picture change is what a person would see.
+    func testAFadingScrollIndicatorIsNotAChangeButASheetIs() {
+        let plain = PictureSketch(png: png { _ in })
+        let indicator = PictureSketch(png: png { $0.fill(CGRect(x: 396, y: 300, width: 3, height: 120)) })
+        let cursor = PictureSketch(png: png { $0.fill(CGRect(x: 40, y: 700, width: 2, height: 22)) })
+        let sheet = PictureSketch(png: png { $0.fill(CGRect(x: 0, y: 0, width: 402, height: 300)) })
+        let photo = PictureSketch(png: png { $0.fill(CGRect(x: 100, y: 400, width: 120, height: 120)) })
+        XCTAssertNil(plain.hash, "decoded, not hashed")
+        XCTAssertFalse(indicator.differs(from: plain))
+        XCTAssertFalse(cursor.differs(from: plain))
+        XCTAssertTrue(sheet.differs(from: plain))
+        XCTAssertTrue(photo.differs(from: plain))
+        XCTAssertFalse(plain.differs(from: PictureSketch(png: png { _ in })))
+    }
+}
+
 final class TextRecognitionTests: XCTestCase {
     /// Vision reads a rendered word back, with its box in parts of the picture from the top left.
     func testVisionReadsTextWithTopLeftBoxes() throws {

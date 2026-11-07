@@ -165,7 +165,7 @@ func eventually(_ seconds: Double = 2, _ condition: () -> Bool) async -> Bool {
 }
 
 func makeCore(_ wda: FakeWDA = FakeWDA(), host: FakeHost = FakeHost(), configure: (inout CoreConfig) -> Void = { _ in }) -> (PokiCore, FakeWDA, FakeHost) {
-    var config = CoreConfig(approvalWait: 0.3, toolDeadline: 6, actionCap: 3, readTimeout: 1, busyWait: 0.2)
+    var config = CoreConfig(approvalWait: 0.3, toolDeadline: 6, actionCap: 3, readTimeout: 1, busyWait: 0.2, treeFormat: "json") // the fake speaks JSON
     configure(&config)
     return (PokiCore(config: config, host: host, transport: wda), wda, host)
 }

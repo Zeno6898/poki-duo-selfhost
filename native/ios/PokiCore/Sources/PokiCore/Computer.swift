@@ -35,7 +35,7 @@ final class Computer: @unchecked Sendable {
     var size: ScreenSize?
     var lastPNG: Data?
     var lastTree: String?
-    var lastPicture: UInt64?
+    var lastPicture: PictureSketch?
 
     var lastElements: [Element] { listed.map(\.element) }
     var layout: Layout { Layout(all: lastAll, screen: size ?? ScreenSize(width: 10_000, height: 10_000)) }
@@ -92,10 +92,10 @@ final class Computer: @unchecked Sendable {
         // Whether the screen changed since the read before (the one the model saw last).
         let visible = listable(reading.elements, screen)
         let tree = visible.map { "\($0.key)@\($0.frame.described)" }.joined(separator: "\n")
-        let picture = reading.png.map(fingerprint)
+        let picture = reading.png.map { PictureSketch(png: $0) }
         var changedLine: String?
         if changes, treeRead, let before = lastTree {
-            let pictureChanged: Bool? = picture.flatMap { now in lastPicture.map { $0 != now } }
+            let pictureChanged: Bool? = picture.flatMap { now in lastPicture.map { now.differs(from: $0) } }
             if tree != before { changedLine = "screen_changed: true (the elements changed)" }
             else if pictureChanged == true { changedLine = "screen_changed: true (only the picture changed; the elements are the same)" }
             else { changedLine = "screen_changed: false (the elements\(pictureChanged == false ? " and the picture" : "") are the same as in the read before)" }

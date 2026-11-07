@@ -132,28 +132,28 @@ jobs:
           nohup xcodebuild -project build/wda/WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination "id=$UDID" -derivedDataPath build/wda-dd test-without-building > build/wda.log 2>&1 &
           for i in $(seq 1 150); do grep -q '\*\* TEST.*FAILED\|Testing failed' build/wda.log && break; curl -sf http://127.0.0.1:8100/status > /dev/null && echo "up after $((i * 2)) s" && exit 0; sleep 2; done
           tail -50 build/wda.log; exit 1
-      - name: look/do in Settings (JSON tree)
+      - name: look/do in Settings (XML tree, the default)
         working-directory: native/ios/PokiCore
         run: |
           set -o pipefail
           swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check.txt
-      - name: look/do in Settings (XML tree)
+      - name: look/do in Settings (JSON tree, for comparison)
         if: always()
         working-directory: native/ios/PokiCore
         run: |
           set -o pipefail
-          POKI_TREE_FORMAT=xml swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check-xml.txt
+          POKI_TREE_FORMAT=json swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check-json.txt
       - name: Summary
         if: always()
         run: |
           tail -40 build/wda.log 2>/dev/null || true
           ls ~/Library/Logs/DiagnosticReports 2>/dev/null | grep -i poki | while read f; do head -60 ~/Library/Logs/DiagnosticReports/"$f"; done || true
-          { echo '## look/do on the simulator (JSON tree)'; echo; sed -n '/^| call/,$p' build/sim-check.txt 2>/dev/null; echo; echo '## look/do on the simulator (XML tree)'; echo; sed -n '/^| call/,$p' build/sim-check-xml.txt 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '## look/do on the simulator (XML tree, the default)'; echo; sed -n '/^| call/,$p' build/sim-check.txt 2>/dev/null; echo; echo '## look/do on the simulator (JSON tree, for comparison)'; echo; sed -n '/^| call/,$p' build/sim-check-json.txt 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: sim-check
           path: |
             build/sim-check.txt
-            build/sim-check-xml.txt
+            build/sim-check-json.txt
             build/wda.log

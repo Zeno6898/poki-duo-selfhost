@@ -16,12 +16,14 @@ public struct CoreConfig: Sendable {
     public var busyWait: Double
     /// How long a call waits for a runner that is starting (the app wakes it when a call comes in).
     public var runnerWait: Double
-    /// The form the element tree is asked for: "json" or "xml". WDA's JSON tree fetches each element's
-    /// custom actions from the accessibility server, one round trip per element, whatever is excluded;
-    /// its XML tree leaves them out unless asked.
+    /// The form the element tree is asked for: "xml" (the default) or "json". WDA's JSON tree fetches
+    /// each element's custom actions from the accessibility server, one round trip per element,
+    /// whatever is excluded; its XML tree leaves them out unless asked. On the CI simulator the XML
+    /// read of Settings took 0.2 to 0.4 s against 0.6 to 0.7 s, and 0.3 s against 2.0 s with the
+    /// keyboard up.
     public var treeFormat: String
 
-    public init(relayURL: URL = URL(string: "wss://pokimcp.zheha.nz/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2, runnerWait: Double = 15, treeFormat: String = "json") {
+    public init(relayURL: URL = URL(string: "wss://pokimcp.zheha.nz/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2, runnerWait: Double = 15, treeFormat: String = "xml") {
         self.relayURL = relayURL
         self.runnerURL = runnerURL
         self.sensitive = sensitive

@@ -171,7 +171,11 @@ Each answer is facts only: the app in front, numbered elements, what each action
   1 again. `do` lists only the new (`+`) and moved (`~`) elements and says how many others kept their
   numbers; `look` and `full=true` list everything.
 - **`screen_changed`** in every `do`: whether the elements, or only the picture, differ from the read
-  before, so a no-op action is visible at once.
+  before, so a no-op action is visible at once. The picture is compared as a 32 by 64 grid of grey
+  levels, and counts as changed when over 1 % of the cells move by more than 12 of 255: a scroll
+  indicator fading out, a cursor blinking or the clock ticking is not a change (seen on the
+  simulator: the indicator fading after a drag made a no-op wait answer `true`); a sheet, a photo or
+  a page coming in is.
 - **The screenshot is one pixel per screen point** (402 px wide on a 402-point iPhone 17 Pro), and the
   answer says so: a point on the picture is a point to tap.
 - **Lean lists.** Text an element around it already says (a post's text and then each of its lines),
@@ -262,13 +266,16 @@ Each answer is facts only: the app in front, numbered elements, what each action
 
 ### The element tree's form
 
-`treeFormat` picks `GET /source?format=json` (the default so far) or `format=xml`, both with
+`treeFormat` picks `GET /source?format=xml` (the default) or `format=json`, both with
 `visible, accessible, enabled, index` excluded. WDA's JSON tree adds every element's custom actions
 (`customActions`), fetched from the accessibility server one round trip per element whatever is
 excluded, so a big tree (a feed, a keyboard) costs hundreds of round trips; its XML tree leaves them
 out unless asked (`includeCustomActionsInPageSource`). The XML is parsed with Foundation's XMLParser
-into the same elements. The CI simulator job runs the checks with both and prints both tables; the
-phone has not been measured with XML yet.
+into the same elements. The CI simulator job runs the checks with both and prints both tables. Run
+42320256495 (Settings, read time of the tree and screenshot together): warm look 0.26 to 0.44 s XML
+against 0.63 to 0.71 s JSON; with the keyboard up 0.28 s against 2.0 s; the first read after a fresh
+launch 1.1 s against 5.9 s; after typing 0.46 s against 3.1 s. The phone has not been measured with
+XML yet.
 
 ### Measured on the CI simulator (run 42258166342)
 
