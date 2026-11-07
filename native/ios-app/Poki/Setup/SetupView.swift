@@ -245,20 +245,22 @@ struct PairingContent: View {
             StatusLine(text: why, symbol: "exclamationmark.triangle.fill", color: .orange)
             Button("Try again", systemImage: "arrow.clockwise") { model.startPairing() }
         default:
-            if model.setup.pairingFile != nil {
-                StatusLine(text: "Paired. The key stays on this iPhone.", symbol: "checkmark.seal.fill", color: .green)
+            if let trouble = model.pairingTrouble {
+                StatusLine(text: "The phone no longer accepts this pairing: \(trouble)", symbol: "exclamationmark.triangle.fill", color: .orange)
+                Text("This happens after a restore, a reset of Location & Privacy, or when the phone forgot Poki. Pair again; the old key is replaced.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Pair again", systemImage: "link") { pairAgain() }.bold()
+            } else if model.pairingPath != nil {
+                StatusLine(text: model.pairingVerifiedAt.map { "Paired. The phone accepted it at \($0.formatted(date: .omitted, time: .shortened))." } ?? "Paired. Checked the next time the runner starts.",
+                           symbol: "checkmark.seal.fill", color: .green)
+                Button("Pair again", systemImage: "arrow.clockwise") { pairAgain() }.font(.subheadline)
             } else {
                 Instructions(lines: [
                     "Connect to Wi-Fi and tap **Start pairing**. Allow local network access when asked.",
                     "Poki opens Settings. Go to **Privacy & Security > Developer Mode** and tap **Pair with Poki**.",
                     "Type the code shown here and on the Lock Screen.",
                 ])
-                Button("Start pairing", systemImage: "link") {
-                    model.startPairing()
-                    model.guide(.pairing)
-                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                }
-                .bold()
+                Button("Start pairing", systemImage: "link") { pairAgain() }.bold()
             }
         }
         diskImage
@@ -269,6 +271,12 @@ struct PairingContent: View {
                 catch { importError = "That is not a pairing file: \(error.localizedDescription)" }
             }
         if let importError { Text(importError).font(.footnote).foregroundStyle(.red) }
+    }
+
+    private func pairAgain() {
+        model.startPairing()
+        model.guide(.pairing)
+        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
     }
 
     @ViewBuilder private var diskImage: some View {

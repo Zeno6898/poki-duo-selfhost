@@ -30,6 +30,8 @@ targets:
       path: Poki/Info.plist
       properties:
         CFBundleDisplayName: Poki
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
           UIColorName: AccentColor
           UIImageName: Bear
@@ -80,6 +82,8 @@ targets:
       path: PokiWidgets/Info.plist
       properties:
         CFBundleDisplayName: Poki
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:

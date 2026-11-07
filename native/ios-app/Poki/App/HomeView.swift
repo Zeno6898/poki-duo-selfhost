@@ -67,14 +67,14 @@ private struct HeroCard: View {
                     .clipShape(.rect(cornerRadius: 16, style: .continuous))
                     .shadow(color: .black.opacity(0.2), radius: 8, y: 4)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(model.sessionOn ? "Poki is on" : "Poki is off").font(.title2.weight(.bold))
+                    Text(model.sessionOn ? "Poki is on" : "Poki is off").font(.system(.title2, design: .rounded).weight(.bold))
                     Text(subtitle).font(.subheadline).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
                         .contentTransition(.opacity)
                 }
                 Spacer(minLength: 0)
             }
             HStack(spacing: 8) {
-                StatusTile(title: "Agents", value: model.sessionOn ? agentsValue : "Off", symbol: "antenna.radiowaves.left.and.right",
+                StatusTile(title: "Agent", value: model.sessionOn ? agentsValue : "Off", symbol: "antenna.radiowaves.left.and.right",
                            health: !model.sessionOn ? .off : model.relayStatus == .ready ? .good : .waiting)
                 StatusTile(title: "Runner", value: model.sessionOn ? model.runner.title : "Off", symbol: "hand.tap.fill",
                            health: !model.sessionOn ? .off : model.runner.isRunning ? .good : model.runner.state == "failed" ? .bad : model.runnerPaused ? .off : .waiting)
@@ -82,12 +82,12 @@ private struct HeroCard: View {
                            health: model.loopback.isWorking ? .good : model.loopback.state == .checking ? .waiting : .bad)
             }
             Button {
-                if !model.sessionOn && model.setup.pairingFile == nil { openSetup() }
+                if !model.sessionOn && model.pairingPath == nil { openSetup() }
                 else { model.sessionOn ? model.stopSession() : model.startSession() }
             } label: {
-                Label(model.sessionOn ? "Turn off" : model.setup.pairingFile == nil ? "Set up Poki" : "Turn on",
-                      systemImage: model.sessionOn || model.setup.pairingFile != nil ? "power" : "checklist")
-                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 6)
+                Label(model.sessionOn ? "Turn off" : model.pairingPath == nil ? "Set up Poki" : "Turn on",
+                      systemImage: model.sessionOn || model.pairingPath != nil ? "power" : "checklist")
+                    .font(.system(.headline, design: .rounded)).frame(maxWidth: .infinity).padding(.vertical, 6)
                     .foregroundStyle(model.sessionOn ? Color.white : Brand.blue)
             }
             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
@@ -95,17 +95,14 @@ private struct HeroCard: View {
         }
         .foregroundStyle(.white)
         .padding(18)
-        .background(
-            LinearGradient(colors: model.sessionOn ? [Brand.blue, Color(red: 0.32, green: 0.36, blue: 0.98)] : [Color(red: 0.22, green: 0.26, blue: 0.38), Color(red: 0.12, green: 0.14, blue: 0.24)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing),
-            in: .rect(cornerRadius: 26, style: .continuous))
+        .background(model.sessionOn ? Brand.blue : Color(red: 0.17, green: 0.20, blue: 0.31), in: .rect(cornerRadius: 26, style: .continuous))
         .shadow(color: (model.sessionOn ? Brand.blue : .black).opacity(0.22), radius: 16, y: 8)
         .padding(.top, 4)
     }
 
     private var agentsValue: String {
         switch model.relayStatus {
-        case .ready: "Online"
+        case .ready: model.activityText != "Idle" ? "Working" : "Idle"
         case .connecting: "Connecting"
         case .offline: "Offline"
         case .off: "Off"
@@ -113,7 +110,7 @@ private struct HeroCard: View {
     }
 
     private var subtitle: String {
-        guard model.sessionOn else { return model.setup.pairingFile == nil ? "Finish setup to turn Poki on." : "Turn on so your agents can use this iPhone." }
+        guard model.sessionOn else { return model.pairingPath == nil ? "Finish setup to turn Poki on." : "Turn on so your agents can use this iPhone." }
         if !model.approvals.isEmpty { return "Waiting for your OK." }
         if model.activityText != "Idle" { return model.activityText }
         return model.runnerPaused ? "Ready. The runner starts when an agent asks." : "Ready for the agent's next step."
@@ -195,7 +192,7 @@ private struct NowCard: View {
                     Text(current).font(.title3.weight(.semibold)).lineLimit(3).contentTransition(.opacity)
                     if let app = model.recentSteps.last?.detail, !working { Text(app).font(.subheadline).foregroundStyle(.secondary).lineLimit(1) }
                     Spacer(minLength: 0)
-                    Button(role: .destructive) { model.pauseRunner() } label: { Label("Stop", systemImage: "stop.fill").padding(.horizontal, 6) }
+                    Button(role: .destructive) { model.pauseRunner() } label: { Label("Stop", systemImage: "stop.fill").font(.system(.subheadline, design: .rounded).weight(.semibold)).padding(.horizontal, 6) }
                         .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.regular)
                         .disabled(!model.approvals.isEmpty)
                 }
@@ -275,7 +272,7 @@ struct Issue: Identifiable {
         var out: [Issue] = []
         if model.sessionOn {
             let runner = model.runner
-            if runner.state == "failed" {
+            if runner.state == "failed", model.pairingTrouble == nil {
                 let fix = runner.fix ?? ""
                 let kind: Fix = fix.contains("Install Poki Runner") || fix.contains("Pair again") || fix.contains("setup") ? .setup : fix.contains("Developer Mode") ? .settings : .retry
                 out.append(Issue(id: "runner", symbol: "hand.tap.fill", title: "The runner stopped",
@@ -285,6 +282,14 @@ struct Issue: Identifiable {
             } else if runner.state == "waiting_network" || !model.loopback.isWorking && model.loopback.state != .checking {
                 out.append(Issue(id: "loopback", symbol: "arrow.triangle.2.circlepath", title: "Loopback is off",
                                  text: model.loopback.detail, fix: .setup))
+            }
+            if let trouble = model.pairingTrouble {
+                out.append(Issue(id: "pairing", symbol: "link.badge.plus", title: "Pair this iPhone again",
+                                 text: "The phone no longer accepts Poki's pairing (\(trouble)). Pair again in Setup; it takes a minute.", fix: .setup))
+            }
+            if model.passcodeHint {
+                out.append(Issue(id: "passcode", symbol: "lock.open.fill", title: "Enter the passcode if the iPhone asks",
+                                 text: "iOS asks for the passcode before UI Automation after Poki Runner was force-closed or the iPhone restarted. Enter it once; Poki carries on by itself.", fix: .none))
             }
             if case .offline = model.relayStatus {
                 out.append(Issue(id: "relay", symbol: "wifi.exclamationmark", title: "Agents can't reach this iPhone",
@@ -404,9 +409,9 @@ private struct RunnerCard: View {
             CardTitle(text: "Runner", symbol: "hand.tap")
             HStack {
                 if model.runnerPaused {
-                    Button("Start now", systemImage: "play.fill") { model.wakeRunner() }
+                    Button { model.wakeRunner() } label: { Label("Start now", systemImage: "play.fill").font(.system(.subheadline, design: .rounded).weight(.semibold)) }
                 } else {
-                    Button("Stop runner", systemImage: "stop.fill", role: .destructive) { model.pauseRunner() }
+                    Button(role: .destructive) { model.pauseRunner() } label: { Label("Stop runner", systemImage: "stop.fill").font(.system(.subheadline, design: .rounded).weight(.semibold)) }
                         .disabled(!model.approvals.isEmpty)
                 }
                 Spacer()

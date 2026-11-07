@@ -10,9 +10,6 @@ struct ProbeView: View {
         NavigationStack {
             List {
                 LogSection()
-                Section {
-                    NavigationLink("Live Activity preview") { ActivityPreview() }
-                }
                 Section("Proxy loopback interface") {
                     if let loop = loopbackInterface(addresses) {
                         Text("\(loop.interface)  \(loop.address)").font(.headline.monospaced())
@@ -79,12 +76,15 @@ private struct LogSection: View {
                     copied = true
                     Task { try? await Task.sleep(for: .seconds(2)); copied = false }
                 } label: {
-                    Label(copied ? "Copied" : "Copy log", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .frame(maxWidth: .infinity)
+                    HStack(spacing: 6) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        Text(copied ? "Copied" : "Copy log")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 ShareLink(item: log.text, subject: Text("Poki log")) {
-                    Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
+                    HStack(spacing: 6) { Image(systemName: "square.and.arrow.up"); Text("Share") }.frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             }
