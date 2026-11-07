@@ -349,7 +349,8 @@ final class PictureSketchTests: XCTestCase {
         XCTAssertTrue(change.share > 0.01 && change.share < 0.05, "\(change)")
         XCTAssertTrue(change.x > 0.9 && change.width <= 2.0 / 32 && change.height > 0.7, "\(change)")
         let page = try XCTUnwrap(sheet.change(from: plain))
-        XCTAssertTrue(page.share > 0.3 && page.y == 0 && page.width == 1, "\(page)")
+        // CoreGraphics draws from the bottom, so the sheet is the lower third of the picture.
+        XCTAssertTrue(page.share > 0.3 && page.width == 1 && page.height < 0.4 && page.y + page.height == 1, "\(page)")
     }
 }
 
