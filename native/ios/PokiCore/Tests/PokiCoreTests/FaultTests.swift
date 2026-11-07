@@ -214,7 +214,8 @@ final class FaultTests: XCTestCase {
         wda.source([("Button", "General")])
         for key in ["GET /screenshot", "GET /wda/activeAppInfo"] { wda.set(key) { _ in (200, ["value": .null]) } }
         _ = await core.call("look", [:])
-        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, sessions, "the session is kept")
+        XCTAssertTrue(wda.sent.contains("DELETE /session"), "the session is ended so nothing queued behind the slow reads runs late")
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, sessions + 1, "one new session once the runner is through")
     }
 
     func testAWedgedRunnerThatAnswersNothingIsRestartedAfterTheProbe() async throws {
@@ -267,6 +268,109 @@ final class FaultTests: XCTestCase {
         host.texts.value = nil
         let again = await core.call("look", [:])
         XCTAssertTrue(again.text.contains("text could not be read from the picture"), again.text)
+    }
+
+    /// Seen on the phone: a feed's tree took longer than a read, and the swipes and taps sent after it
+    /// waited their turn behind it on WDA's main thread, so they landed long after the agent had
+    /// reported them failed. Now a request this side gives up on ends the session: WDA answers what
+    /// is queued behind it with "session does not exist" instead of running it, and an action sent
+    /// while the runner is still finishing is answered not_sent and busy, so nothing runs late.
+    func testGivingUpOnARequestEndsTheSessionAndTheNextActionIsAnsweredBusyNotRunLate() async {
+        let (core, wda, _) = makeCore { $0.readTimeout = 0.5; $0.actionCap = 1 }
+        _ = await core.call("look", [:])
+        // The slow tree holds WDA's queue, so the lock check queued behind it is as slow (the fake does not queue).
+        wda.set("GET /source") { _ in try await Task.sleep(nanoseconds: 3_000_000_000); return (200, ["value": .null]) }
+        wda.set("GET /wda/locked") { _ in try await Task.sleep(nanoseconds: 3_000_000_000); return (200, ["value": false]) }
+        let slow = await core.call("look", [:])
+        XCTAssertTrue(slow.text.contains("no element tree"), slow.text)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(wda.sent.contains("DELETE /session"), "the session is ended so what is queued behind the slow read is not run: \(wda.sent)")
+        // The next session waits its turn behind the slow read; an action sent now is not queued.
+        wda.set("POST /session") { _ in try await Task.sleep(nanoseconds: 2_000_000_000); return (200, ["value": ["sessionId": "s2"]]) }
+        let tap = await core.call("do", ["actions": [["tap": [100, 120]]]])
+        XCTAssertTrue(tap.text.hasPrefix("not_sent: the runner is still finishing an earlier GET /source from"), tap.text)
+        XCTAssertEqual(wda.sent.suffix(2), ["DELETE /session", "POST /session"], "only the new session was asked for, nothing else was queued: \(wda.sent)")
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 0, "nothing was queued to run late")
+        // Once the runner is through, the session that was opened in the meantime serves the next call.
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        wda.source([("Button", "General"), ("Button", "Privacy")])
+        wda.set("GET /wda/locked") { _ in (200, ["value": false]) }
+        let later = await core.call("do", ["actions": [["tap": [100, 120]]]])
+        XCTAssertFalse(later.isError, later.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 1)
+        XCTAssertEqual(wda.sent.filter { $0 == "POST /session" }.count, 2, "the session opened while waiting is the one used")
+    }
+
+    /// WDA's XML tree lists the same elements as its JSON one, without the custom actions it fetches
+    /// for every JSON element.
+    func testTheXMLTreeReadsLikeTheJSONOne() async {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <AppiumAUT>
+          <XCUIElementTypeApplication type="XCUIElementTypeApplication" name="Settings" label="Settings" x="0" y="0" width="390" height="844">
+            <XCUIElementTypeWindow type="XCUIElementTypeWindow" x="0" y="0" width="390" height="844">
+              <XCUIElementTypeButton type="XCUIElementTypeButton" name="General" label="General &amp; more" x="16" y="100" width="358" height="44"/>
+              <XCUIElementTypeSearchField type="XCUIElementTypeSearchField" name="Search" label="Search" value="Wi-Fi" x="16" y="153" width="370" height="37"/>
+              <XCUIElementTypeOther type="XCUIElementTypeOther" x="0" y="0" width="0" height="0"/>
+            </XCUIElementTypeWindow>
+          </XCUIElementTypeApplication>
+        </AppiumAUT>
+        """
+        let parsed = flattenXML(Data(xml.utf8))
+        XCTAssertEqual(parsed?.root.label, "Settings")
+        XCTAssertEqual(parsed?.elements.map(\.type), ["Window", "Button", "SearchField"])
+        XCTAssertEqual(parsed?.elements[1].label, "General & more")
+        XCTAssertEqual(parsed?.elements[2].value, "Wi-Fi")
+        XCTAssertEqual(parsed?.elements[1].frame, Rect(x: 16, y: 100, width: 358, height: 44))
+        XCTAssertEqual(parsed?.elements[0].depth, 1)
+        XCTAssertTrue(parsed!.elements[0].contains(parsed!.elements[1]))
+        XCTAssertNil(flattenXML(Data("not xml".utf8)))
+
+        let (core, wda, _) = makeCore { $0.treeFormat = "xml" }
+        wda.set("GET /source") { _ in (200, ["value": .string(xml)]) }
+        let look = await core.call("look", [:])
+        XCTAssertTrue(look.text.contains("Button \"General & more\" [16,100,358,44]"), look.text)
+        XCTAssertTrue(look.text.contains("SearchField \"Search = Wi-Fi\""), look.text)
+        XCTAssertTrue(wda.log.contains { $0.path.hasSuffix("/source") }, wda.sent.joined(separator: ", "))
+    }
+
+    /// Seen on the phone: launching Photos hit the 6 s action time, since XCTest's launch ends a
+    /// running app and starts it again with a handshake that takes seconds. A plain launch now
+    /// activates the app (to the front as it is, or started), and a launch gets 9 s.
+    func testLaunchActivatesARunningAppAndGetsItsOwnTime() async {
+        let (core, wda, _) = makeCore { $0.actionCap = 1 }
+        _ = await core.call("look", [:])
+        wda.set("POST /wda/apps/activate") { _ in try await Task.sleep(nanoseconds: 1_500_000_000); return (200, ["value": .null]) }
+        let result = await core.call("do", ["actions": [["launch": "com.apple.mobileslideshow"]]])
+        XCTAssertTrue(result.text.contains("launch com.apple.mobileslideshow (sent"), result.text)
+        XCTAssertTrue(wda.sent.contains("POST /wda/apps/activate"), wda.sent.joined(separator: ", "))
+        XCTAssertFalse(wda.sent.contains("POST /wda/apps/launch"))
+        let fresh = await core.call("do", ["actions": [["launch": ["bundle": "com.apple.mobileslideshow", "fresh": true]]]])
+        XCTAssertTrue(fresh.text.contains("(fresh) (sent"), fresh.text)
+        XCTAssertTrue(wda.sent.contains("POST /wda/apps/terminate"))
+        XCTAssertTrue(wda.sent.contains("POST /wda/apps/launch"))
+    }
+
+    /// Seen on the phone: the last selection tap was batched with the Delete, so the whole batch waited
+    /// for approval and the Delete, once approved, would have missed a photo. The plain actions before
+    /// the first that needs approval go first, and the answer says which to send again.
+    func testTheSafePartOfABatchGoesBeforeApprovalIsAsked() async {
+        let (core, wda, _) = makeCore()
+        wda.source([("Button", "Photo"), ("Button", "Delete")], app: "Photos")
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["tap": 1], ["tap": 2]]])
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.text.contains("tap \"Photo\" (sent"), result.text)
+        XCTAssertTrue(result.text.contains("not_sent from action 2: approval_required"), result.text)
+        XCTAssertTrue(result.text.contains("Actions 1 to 1 were sent"), result.text)
+        XCTAssertTrue(result.text.contains("send action 2 again, on their own"), result.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 1)
+        XCTAssertEqual(core.pendingApproval?.summary, "Tap “Delete”")
+        core.resolveApproval(id: core.pendingApproval!.id, approved: true)
+        let again = await core.call("do", ["actions": [["tap": 2]]])
+        XCTAssertFalse(again.isError, again.text)
+        XCTAssertTrue(again.text.contains("approved on the phone"), again.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 2)
     }
 
     /// Found on the simulator: reads took 2.5 s, longer than a read inside wait_until was allowed, so

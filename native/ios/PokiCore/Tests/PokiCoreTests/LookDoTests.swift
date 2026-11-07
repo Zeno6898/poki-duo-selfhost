@@ -26,15 +26,37 @@ final class LookDoTests: XCTestCase {
         XCTAssertEqual(settings?["waitForIdleTimeout"]?.double, 0.5)
     }
 
-    func testAnElementUnderTheReplyBarIsNotHittableAndNothingIsSent() async {
+    /// The tree's order is not the drawing order, so a cover is a hint, never a refusal: the element
+    /// is touched at its centre and the answer names what the tree puts over it.
+    func testAnElementUnderTheReplyBarIsTappedAnywayAndTheAnswerSaysWhatLiesOverIt() async {
         let (core, wda, _) = makeCore()
         thread(wda, quotedY: 750)
         let look = await core.call("look", [:])
         XCTAssertTrue(look.text.contains("3 Cell \"Quoted post\" [0,750,390,120]"), look.text)
         let result = await core.call("do", ["actions": [["tap": 3]]])
-        XCTAssertTrue(result.text.contains("not_hittable: element 3 Cell \"Quoted post\": its visible part is covered by Other"), result.text)
-        XCTAssertTrue(result.text.contains("scroll_to"), result.text)
-        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 0)
+        XCTAssertFalse(result.text.contains("not_hittable"), result.text)
+        XCTAssertTrue(result.text.contains("at [195, 797] (Other and TextView \"Post your reply\" lies over all of its visible part in the tree; touched anyway"), result.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 1)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").first?["y"]?.double ?? 0, 797, accuracy: 0.5, "the centre of its visible part")
+    }
+
+    /// Seen on the phone: Photos' Select button came after the photo grid in the tree, and the
+    /// thumbnails that scroll under it counted as covering it. What scrolls inside a list never covers
+    /// what is outside the list.
+    func testWhatScrollsInsideAListDoesNotCoverAButtonOutsideIt() async {
+        let (core, wda, _) = makeCore()
+        wda.tree([
+            Node("Button", "Select", [300, 60, 80, 40]),
+            Node("CollectionView", nil, [0, 50, 390, 790], [Node("Image", "Photo", [260, 50, 130, 130]), Node("Image", "Photo", [130, 50, 130, 130])]),
+        ], app: "Photos")
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["tap": 1]]])
+        XCTAssertFalse(result.isError, result.text)
+        XCTAssertTrue(result.text.contains("tap \"Select\" (sent"), result.text)
+        XCTAssertFalse(result.text.contains("in the tree"), result.text)
+        let body = wda.bodies("POST /wda/tap").first
+        XCTAssertEqual(body?["x"]?.double ?? 0, 340, accuracy: 0.5)
+        XCTAssertEqual(body?["y"]?.double ?? 0, 80, accuracy: 0.5)
     }
 
     func testAPartlyCoveredElementIsTappedOnItsVisiblePart() async {
@@ -45,7 +67,7 @@ final class LookDoTests: XCTestCase {
         XCTAssertFalse(result.isError, result.text)
         let y = wda.bodies("POST /wda/tap").first?["y"]?.double ?? 0
         XCTAssertTrue(y > 690 && y < 744, "tapped at y \(y)")
-        XCTAssertTrue(result.text.contains("(its centre is off screen or covered)"), result.text)
+        XCTAssertTrue(result.text.contains("(its centre is under Other"), result.text)
     }
 
     func testAPointOffTheScreenIsNotHittable() async {

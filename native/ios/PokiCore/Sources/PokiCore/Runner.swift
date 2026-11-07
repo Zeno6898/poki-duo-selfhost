@@ -47,6 +47,10 @@ public final class URLSessionTransport: HTTPTransport {
     public func send(method: String, url: URL, body: Data?, timeout: Double) async throws -> (status: Int, body: Data) {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = method
+        // One connection per request. The runner drops a kept-alive connection when it fails to write
+        // an answer to it (a request we gave up on), and a request sent on that connection in the same
+        // moment is lost with "the network connection was lost" after no time at all.
+        request.setValue("close", forHTTPHeaderField: "Connection")
         if let body {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -79,6 +83,15 @@ public final class Runner: @unchecked Sendable {
     var unhealthyAfter = 2
     var probeTimeout: Double = 15
     private let probing = LockedBox(false)
+    /// The request this side gave up on while the runner was still serving it, until a later request
+    /// on the runner's queue is answered. WDA serves every request but a few (status, screenshot,
+    /// ending a session) one after another on its main thread, so until that one is done the runner
+    /// is busy, whatever is sent to it.
+    private let stall = LockedBox<(path: String, since: Double)?>(nil)
+    /// What the runner is still finishing, if anything: "GET /source, 7 s ago".
+    public var busyWith: String? { stall.value.map { "\($0.path) from \(Int((now() - $0.since).rounded())) s ago" } }
+    /// Requests WDA answers apart from its queue (FBRoute `.standalone`).
+    static let standalone: Set<String> = ["GET /status", "GET /screenshot", "DELETE /session"]
 
     public init(url: URL, transport: HTTPTransport = URLSessionTransport()) {
         self.url = url
@@ -86,6 +99,7 @@ public final class Runner: @unchecked Sendable {
     }
 
     public var consecutiveMisses: Int { state.value.misses }
+    public var hasSession: Bool { state.value.session != nil }
 
     /// Settings for every session. WDA waits after each gesture until the app has been still for up
     /// to `animationCoolOffTimeout` (2 s) and before each event until it is idle for up to
@@ -103,6 +117,9 @@ public final class Runner: @unchecked Sendable {
     /// (a gesture): its timeout is not taken as a sign that the runner is gone.
     public func raw(_ method: String, _ path: String, _ body: JSON? = nil, timeout: Double = 4, countsAsMiss: Bool = true) async throws -> JSON {
         let target = URL(string: url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!
+        let queued = !Self.standalone.contains("\(method) \(Self.short(path))")
+        let busyBefore = queued ? busyWith : nil
+        func busyNote() -> String { busyBefore.map { "; the runner is still finishing an earlier \($0)" } ?? "" }
         let result: (status: Int, body: Data)
         do {
             result = try await withDeadline(timeout + 0.5, "the runner's answer to \(method) \(Self.short(path))") { [transport] in
@@ -113,10 +130,12 @@ public final class Runner: @unchecked Sendable {
             throw RunnerError(message: "the runner is not running (connection refused at \(url.absoluteString)); it is being restarted", delivery: .notSent, silent: true)
         } catch let error as DeadlineExceeded {
             if countsAsMiss { miss(timedOut: true) }
-            throw RunnerError(message: error.description, delivery: .unknown, silent: true)
+            if queued { abandon(method, path) }
+            throw RunnerError(message: error.description + busyNote(), delivery: .unknown, silent: true)
         } catch TransportError.timedOut {
             if countsAsMiss { miss(timedOut: true) }
-            throw RunnerError(message: "the runner did not answer \(method) \(Self.short(path)) within \(DeadlineExceeded.format(timeout))", delivery: .unknown, silent: true)
+            if queued { abandon(method, path) }
+            throw RunnerError(message: "the runner did not answer \(method) \(Self.short(path)) within \(DeadlineExceeded.format(timeout))" + busyNote(), delivery: .unknown, silent: true)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -124,6 +143,7 @@ public final class Runner: @unchecked Sendable {
             throw RunnerError(message: "the runner did not answer \(method) \(Self.short(path)): \(error)", delivery: .unknown, silent: true)
         }
         state.update { $0.misses = 0 }
+        if queued { stall.value = nil }
         let parsed = (try? JSON.parse(result.body)) ?? (result.body.isEmpty ? .object([:]) : ["value": .string(String(decoding: result.body, as: UTF8.self))])
         let value = parsed["value"] ?? parsed
         if let code = value["error"]?.string {
@@ -134,6 +154,25 @@ public final class Runner: @unchecked Sendable {
             throw RunnerError(message: "the runner answered HTTP \(result.status) to \(method) \(Self.short(path))", delivery: .notSent, status: result.status)
         }
         return value
+    }
+
+    /// This side gave up on a queued request. The runner still serves it, and everything sent after
+    /// it waits its turn behind it, so the next action would run late, after the model had moved on
+    /// (seen on the phone: a feed's tree took longer than a read, and the swipes and taps sent after
+    /// it landed well after the agent had reported them failed). So the session is ended at once
+    /// (`DELETE /session`, answered apart from the queue): WDA answers every request still queued for
+    /// it with "session does not exist" and does not run them, and the request it is serving is the
+    /// last thing it does for that session. The next call opens a new session, which waits its turn
+    /// behind that request and is answered as busy when its turn does not come in time.
+    private func abandon(_ method: String, _ path: String) {
+        stall.update { if $0 == nil { $0 = ("\(method) \(Self.short(path))", now()) } }
+        guard let id = state.value.session, path.hasPrefix("/session/\(id)") else { return }
+        forgetSession()
+        Task { [transport, url] in
+            _ = try? await withDeadline(2.5, "ending the session") {
+                try await transport.send(method: "DELETE", url: URL(string: url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/session/\(id)")!, body: nil, timeout: 2)
+            }
+        }
     }
 
     private func miss(timedOut: Bool = false) {
@@ -154,6 +193,20 @@ public final class Runner: @unchecked Sendable {
     }
 
     func forgetSession() { state.update { $0.session = nil } }
+
+    /// Whether the runner is through with the request this side gave up on: a cheap queued request
+    /// (opening the session, or the active app) answered within `timeout` means the queue has
+    /// drained past it. Nothing is sent to a runner that is still busy.
+    func waitUntilFree(timeout: Double) async -> Bool {
+        guard busyWith != nil else { return true }
+        let t = max(0.3, timeout)
+        if hasSession {
+            _ = try? await call("GET", "/wda/activeAppInfo", timeout: t, countsAsMiss: false)
+        } else {
+            _ = try? await session(timeout: t)
+        }
+        return busyWith == nil
+    }
 
     private let opening = LockedBox<Task<String, Error>?>(nil)
 
@@ -181,7 +234,7 @@ public final class Runner: @unchecked Sendable {
         do {
             return try await withDeadline(max(0.2, min(8, timeout)), "opening a session with the runner") { try await task.value }
         } catch let error as DeadlineExceeded {
-            throw RunnerError(message: error.description, delivery: .notSent, silent: true)
+            throw RunnerError(message: error.description + (busyWith.map { "; the runner is still finishing an earlier \($0)" } ?? ""), delivery: .notSent, silent: true)
         }
     }
 

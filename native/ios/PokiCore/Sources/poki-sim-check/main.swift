@@ -28,7 +28,9 @@ final class Host: CoreHost, @unchecked Sendable {
 }
 
 let url = URL(string: ProcessInfo.processInfo.environment["POKI_WDA_URL"] ?? "http://127.0.0.1:8100")!
-let core = PokiCore(config: CoreConfig(runnerURL: url), host: Host())
+let treeFormat = ProcessInfo.processInfo.environment["POKI_TREE_FORMAT"] ?? "json"
+let core = PokiCore(config: CoreConfig(runnerURL: url, treeFormat: treeFormat), host: Host())
+print("tree format: \(treeFormat)")
 var session: String?
 var rows: [(String, Int, String)] = []
 var failures: [String] = []

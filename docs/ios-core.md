@@ -185,10 +185,14 @@ Each answer is facts only: the app in front, numbered elements, what each action
   is listed instead, numbered and tappable at its centre, under a heading that says so. When that
   yields nothing, the read's note says why: no text found, the text could not be read, or the reading
   did not finish in time (with its milliseconds).
-- **Taps are hit-tested.** A numbered element is touched at its centre, or, when the centre is off
-  screen or under a bar or a later element in the tree (a reply bar), at the nearest point of it that
-  is free; the answer says where. No free point: `not_hittable`, nothing is sent. Points off the screen
-  are `not_hittable` too.
+- **Taps are hit-tested, never held back.** A numbered element is touched at its centre, or, when
+  the centre is off screen or under a bar or a later element in the tree (a reply bar), at the nearest
+  point of it that is free, and the answer says where and what the tree puts over it. When no point of
+  it is free it is still touched, at the centre of its visible part, with a note to see whether it
+  took: the tree's order is not the drawing order (seen on the phone: Photos' Select button came after
+  the photo grid in the tree and was refused). What scrolls inside a list never counts as covering
+  what is outside the list. Only an element with no part on the screen, or a point off it, is
+  `not_hittable`, and nothing is sent then.
 - **Gestures.** `swipe` is a quick flick inside the biggest list on screen (or `in: n`), clear of bars
   and anything drawn across it, away from the screen's system edges. `drag` moves at its own speed
   (`ms`, default 400) and rests 150 ms before lifting, so the list stops where the finger stops
@@ -232,6 +236,21 @@ Each answer is facts only: the app in front, numbered elements, what each action
   keyboard's looping slide-to-type introduction. A call that finds the runner `.starting` (restarting, or woken from idle by
   the app) waits for it, checking every 250 ms for up to `runnerWait` (15 s) within its deadline, then
   goes on; a `.failed` runner is answered at once with its fix.
+- **A request this side gives up on ends the session.** WDA serves every request but a few (status,
+  screenshot, ending a session) one after another on its main thread, and goes on serving a request
+  after the client has stopped waiting. Seen on the phone: a feed's tree took longer than a read, and
+  the swipes and taps sent after it waited their turn behind it and landed long after the agent had
+  reported them failed. So when a queued request times out PokiCore sends `DELETE /session` at once
+  (answered apart from the queue): WDA answers everything still queued for that session with "session
+  does not exist" instead of running it, and the request it is serving is the last thing it does for
+  it. The next call opens a new session, which waits its turn behind that request; a `do` whose turn
+  does not come within the action time answers `not_sent: the runner is still finishing an earlier GET
+  /source from 9 s ago` without sending anything, and a `look` says the same in its note and shows the
+  picture (screenshots are served apart from the queue). The next queued request that is answered
+  clears the note.
+- A plain `launch` activates the app (to the front as it is, or started if not running); only `fresh:
+  true` ends it and starts it through XCTest's launch, whose handshake takes several seconds on the
+  phone (a Photos launch hit the 6 s action time there). A launch action gets 9 s of action time.
 - Buttons (Home, lock, volume) get 8 s and a slow answer does not count as a runner miss. WDA's
   `/wda/homescreen` waits for SpringBoard to come up and go idle before it answers: about 3 s on the CI
   simulator (a 3 s timeout failed there), and it holds WDA's main thread the same way on a phone, where
@@ -240,6 +259,16 @@ Each answer is facts only: the app in front, numbered elements, what each action
 
 - One tool call runs at a time per phone. A second one waits at most 2 s, then answers `busy` with what
   the first is doing.
+
+### The element tree's form
+
+`treeFormat` picks `GET /source?format=json` (the default so far) or `format=xml`, both with
+`visible, accessible, enabled, index` excluded. WDA's JSON tree adds every element's custom actions
+(`customActions`), fetched from the accessibility server one round trip per element whatever is
+excluded, so a big tree (a feed, a keyboard) costs hundreds of round trips; its XML tree leaves them
+out unless asked (`includeCustomActionsInPageSource`). The XML is parsed with Foundation's XMLParser
+into the same elements. The CI simulator job runs the checks with both and prints both tables; the
+phone has not been measured with XML yet.
 
 ### Measured on the CI simulator (run 42258166342)
 
@@ -277,10 +306,14 @@ and falls back to the picture.
 | Sending a message or mail (Send, 发送 in Messages, Mail, WeChat, WhatsApp, Telegram, …) | approval |
 | Apps on a list (banking, wallets; by bundle id) | approval for every input |
 
-When an action matches, nothing in that `do` is sent. PokiCore emits `approvalRequested` and holds up
-to `approvalWait`. If approved in time, the actions run and the answer says `approved on the phone`.
-If not, it answers `not_sent: approval_required (id …)`, and the same actions in a later `do` within
-2 minutes run once that approval is granted. Denied: `not_sent: the owner declined`.
+When an action matches, the plain actions before it in that `do` are sent first (seen on the phone:
+a last selection tap held back with the Delete after it meant the Delete, once approved, would have
+missed a photo), and from the first matching action on nothing is sent. PokiCore emits
+`approvalRequested` for those and holds up to `approvalWait`. If approved in time, they run and the
+answer says `approved on the phone`. If not, it answers `not_sent from action k: approval_required (id
+…)` after the read, saying which actions were sent, and those from k on, sent again on their own in a
+later `do` within 2 minutes, run once that approval is granted. Denied: `not_sent … the owner
+declined`.
 
 ## 3. PokiLauncher C ABI, v1
 
