@@ -28,7 +28,9 @@ final class ActivityController {
 
     /// How long an event tag stays on the Live Activity.
     private let eventLifetime: Duration = .seconds(6)
-    private let alertSpacing: TimeInterval = 8
+    /// Start, app switch and finish pop-ups are spaced this far apart; each step's pop-up a little less.
+    private let alertSpacing: TimeInterval = 6
+    private let stepSpacing: TimeInterval = 2.5
 
     private var lastAlert = Date.distantPast
     private var lastSent = Date.distantPast
@@ -164,13 +166,17 @@ final class ActivityController {
             alert = critical(String(localized: "Paired"), String(localized: "This iPhone is ready for Poki"))
         }
 
-        // The finish timer: re-armed by every change during a run. A headline change that is not the
-        // one right after a step (AppModel's "waiting for the next step") means a step began, and a run
-        // never finishes in the middle of a step, however long it takes.
+        // A step began (AppModel sets the headline to the step's words). Each one pops the island
+        // open as the small card, so the person sees what is happening in words; spaced so a fast
+        // agent does not flood the phone.
         if state.phase == .working, old.phase == .working, state.headline != old.headline, state.stepCount == old.stepCount {
-            if justRecorded { justRecorded = false } else { inStep = true }
+            if justRecorded { justRecorded = false } else {
+                inStep = true
+                if alert == nil, state.approval == nil { alert = step(state.headline, state.app) }
+            }
         }
         if state.stepCount != old.stepCount { inStep = false }
+        // The finish timer: re-armed by every change during a run; never fires in the middle of a step.
         if state.phase == .working, state.approval == nil, state.stepCount > 0 { armFinish() } else { finishTimer?.cancel() }
         return alert
     }
@@ -213,6 +219,14 @@ final class ActivityController {
         guard now.timeIntervalSince(lastAlert) >= alertSpacing else { return nil }
         lastAlert = now
         return AlertConfiguration(title: "\(title)", body: "\(body)", sound: .default)
+    }
+
+    /// A step's pop-up is silent (Silence.wav in the app bundle: ActivityKit has no "no sound" option).
+    private func step(_ title: String, _ app: String?) -> AlertConfiguration? {
+        let now = Date()
+        guard now.timeIntervalSince(lastAlert) >= stepSpacing else { return nil }
+        lastAlert = now
+        return AlertConfiguration(title: "\(title)", body: "\(app.map { String(localized: "In \($0)") } ?? String(localized: "On this iPhone"))", sound: .named("Silence.wav"))
     }
 
     private func critical(_ title: String, _ body: String) -> AlertConfiguration {

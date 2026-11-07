@@ -3,30 +3,34 @@ import AppIntents
 import SwiftUI
 import WidgetKit
 
-/// The Live Activity's views, shared so the app can draw them too (Debug > Live Activity preview, and
-/// the build's screenshots).
+/// The Live Activity's views.
 ///
-/// One layout idea for every phase, so the activity always reads the same way:
+/// Sizes (HIG, iPhone): Lock Screen and expanded island are 371-408 points wide and at most 160
+/// points tall; anything taller is cut. The Lock Screen card has large rounded corners, so content
+/// keeps the same 16 points from every edge, and stays within 128 points of
+/// height. The expanded island also spends ~44 points on its leading/trailing row, so its bottom
+/// region stays within ~90 points.
 ///
-///     [bear] Poki · WeChat                [status]   [screen]
-///     Headline, the one thing to know                [ of  ]
-///     detail: last steps, code, hint                 [phone]
-///     [footer: step count · time ............ action]
-///
-/// The right column is the phone's latest screen while the agent works (or a step counter, a setup
-/// ring, a countdown), so the full width is used and the text column never has to wrap a status word.
-/// Approvals put Deny and Allow full width under it. Everything stays inside 160 points tall on the
-/// Lock Screen, the system's limit.
+/// Two sizes of pop-up, as the owner asked: an action (each step) expands the island to a small
+/// card, one or two lines of plain text; an approval expands it to the large card with Deny and
+/// Allow. The Lock Screen always shows the full card.
 
 typealias PokiState = PokiActivityAttributes.ContentState
 
 enum Brand {
     static let blue = Color(red: 0x20 / 255, green: 0x84 / 255, blue: 0xFD / 255)
-    /// The Live Activity's own background, so it reads the same on any wallpaper.
-    static let night = Color(red: 0.04, green: 0.06, blue: 0.11)
+    /// The Live Activity's own background, so it reads the same on any wallpaper (a fixed dark
+    /// tint also avoids iOS 26/27's wrong-appearance bug with adaptive tints).
+    static let night = Color(red: 0.07, green: 0.08, blue: 0.11)
     static let approval = Color(red: 1.0, green: 0.62, blue: 0.04)
     static let done = Color(red: 0.19, green: 0.82, blue: 0.35)
     static let problem = Color(red: 1.0, green: 0.80, blue: 0.0)
+}
+
+/// Lock Screen padding (see the comment at the top).
+enum LockInsets {
+    static let horizontal: CGFloat = 16
+    static let vertical: CGFloat = 16
 }
 
 extension PokiState {
@@ -64,7 +68,7 @@ extension PokiState {
         }
     }
     var hasThumbnail: Bool { thumbnailVersion > 0 }
-    /// The app line next to "Poki" in the header, only when it means something.
+    /// The app line next to "Poki", only when it means something.
     var appLine: String? {
         switch phase {
         case .working, .approval, .done: app
@@ -75,25 +79,36 @@ extension PokiState {
         let steps = stepCount == 1 ? String(localized: "1 step") : String(localized: "\(stepCount) steps")
         return failedCount > 0 ? String(localized: "\(steps) · \(failedCount) missed") : steps
     }
+    /// The line under the headline: the last step while working, otherwise the phase's explanation.
+    var detailLine: String? {
+        switch phase {
+        case .working: steps.last.map(\.text) ?? String(localized: "Starting up")
+        case .done: runSummary
+        case .problem: String(localized: "Open Poki to fix it.")
+        case .idle: runnerPaused ? String(localized: "The runner wakes when an agent asks.") : String(localized: "Runner on. Waiting for the agent.")
+        default: nil
+        }
+    }
 }
 
 extension PokiActivityAttributes.Event {
     var symbol: String {
         switch kind {
         case .started: "play.fill"
-        case .app: "arrow.right.circle.fill"
-        case .finished: "checkmark.circle.fill"
+        case .app: "arrow.right"
+        case .step: "hand.tap.fill"
+        case .finished: "checkmark"
         case .approved: "checkmark.seal.fill"
-        case .denied: "xmark.circle.fill"
-        case .expired: "clock.badge.xmark"
+        case .denied: "xmark"
+        case .expired: "clock"
         case .problem: "exclamationmark.triangle.fill"
-        case .paired: "link.circle.fill"
-        case .code: "number.circle.fill"
+        case .paired: "link"
+        case .code: "number"
         }
     }
     var color: Color {
         switch kind {
-        case .started, .app, .code: Brand.blue
+        case .started, .app, .code, .step: Brand.blue
         case .finished, .approved, .paired: Brand.done
         case .denied, .expired: Color(white: 0.75)
         case .problem: Brand.problem
@@ -103,18 +118,17 @@ extension PokiActivityAttributes.Event {
 
 // MARK: Lock Screen
 
-/// Lock Screen and banner presentation. The widget pads it 14 by 12 points (HIG: 14 point margins),
-/// which leaves 136 points for the content under the 160 point limit.
+/// The Lock Screen (and banner) card. The widget adds `LockInsets`.
 struct LockScreenView: View {
     var state: PokiState
 
     var body: some View {
         Group {
             switch state.phase {
-            case .approval: ApprovalLayout(state: state, island: false)
-            case .pairing: PairingLayout(state: state, island: false)
-            case .setup: SetupLayout(state: state, island: false)
-            default: RunLayout(state: state, island: false)
+            case .approval: ActivityApprovalCard(state: state, island: false)
+            case .pairing: ActivityPairingCard(state: state, island: false)
+            case .setup: ActivitySetupCard(state: state, island: false)
+            default: ActivityRunCard(state: state)
             }
         }
         .foregroundStyle(.white)
@@ -122,8 +136,8 @@ struct LockScreenView: View {
     }
 }
 
-/// The top line: the bear, Poki, the app in use, and the status pill (or something better on the
-/// right, such as the approval countdown).
+/// The top line: the bear, Poki, the app in use, and on the right the status, or for a few seconds
+/// the latest event ("Started", "Now in WeChat") in its place.
 struct Header<Trailing: View>: View {
     var state: PokiState
     @ViewBuilder var trailing: Trailing
@@ -131,11 +145,10 @@ struct Header<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 7) {
             BearMark(size: 20)
-            Text("Poki").font(.system(size: 14, weight: .semibold))
-                .layoutPriority(2)
+            Text("Poki").font(.system(size: 14, weight: .semibold)).layoutPriority(2)
             if let app = state.appLine {
                 Text(app).font(.system(size: 14)).foregroundStyle(.white.opacity(0.55))
-                    .lineLimit(1).truncationMode(.tail)
+                    .truncationMode(.tail)
             }
             Spacer(minLength: 6)
             trailing.layoutPriority(3)
@@ -149,84 +162,85 @@ extension Header where Trailing == StatusPill {
     init(state: PokiState) { self.init(state: state) { StatusPill(state: state) } }
 }
 
+/// The status, or the latest event while it is fresh.
 struct StatusPill: View {
     var state: PokiState
     var body: some View {
+        let symbol = state.event?.symbol ?? state.symbol
+        let text = state.event?.text ?? state.status
+        let color = state.event?.color ?? state.accent
         HStack(spacing: 4) {
-            Image(systemName: state.symbol).font(.system(size: 10, weight: .bold))
-            Text(state.status).font(.system(size: 12, weight: .semibold))
+            Image(systemName: symbol).font(.system(size: 10, weight: .bold))
+            Text(text).font(.system(size: 12, weight: .semibold))
         }
         .lineLimit(1).fixedSize()
-        .padding(.horizontal, 8).frame(height: 22)
-        .foregroundStyle(state.accent)
-        .background(state.accent.opacity(0.18), in: .capsule)
-    }
-}
-
-/// The short-lived event tag ("Started", "Now in WeChat"), in place of nothing when there is none.
-struct EventTag: View {
-    var event: PokiActivityAttributes.Event
-    var body: some View {
-        Label { Text(event.text).lineLimit(1) } icon: { Image(systemName: event.symbol) }
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(event.color)
-            .labelStyle(.titleAndIcon)
+        .padding(.horizontal, 9).frame(height: 22)
+        .foregroundStyle(color)
+        .background(color.opacity(0.18), in: .capsule)
     }
 }
 
 // MARK: Working, done, idle, problem
 
-struct RunLayout: View {
+/// The Lock Screen card for a run (working, done) and the quiet phases (ready, idle, problem).
+struct ActivityRunCard: View {
     var state: PokiState
-    var island: Bool
+
+    private var tall: Bool { state.phase == .working || state.phase == .done }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 0) {
-                if !island { Header(state: state).padding(.bottom, 8) }
-                if let event = state.event { EventTag(event: event).padding(.bottom, 2) }
+                Header(state: state).padding(.bottom, 8)
                 Text(state.headline)
-                    .font(.system(size: island ? 16 : 17, weight: .semibold))
+                    .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(state.phase == .problem ? Brand.problem : .white)
                     .lineLimit(2).minimumScaleFactor(0.85)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 5)
-                detail
-                if tall { Spacer(minLength: 6) } else if hasFooter { Spacer().frame(height: 8) }
-                if hasFooter { footer }
+                if let detail = state.detailLine {
+                    DetailLine(state: state, text: detail).padding(.top, 3)
+                }
+                if tall || state.phase == .problem {
+                    Spacer(minLength: 8)
+                    Footer(state: state)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            side
+            if tall {
+                if state.hasThumbnail {
+                    Thumbnail(version: state.thumbnailVersion, accent: state.phase == .done ? Brand.done : .white.opacity(0.25))
+                        .frame(width: 54, height: 116)
+                } else {
+                    PhaseGlyph(state: state).frame(width: 54, height: 116)
+                }
+            }
         }
-        .frame(height: tall ? (island ? 104 : 128) : nil)
+        .frame(height: tall ? 116 : nil)
     }
+}
 
-    /// A run (working, done) has the full height for its screen column; the quiet phases (ready,
-    /// idle, problem) are only as tall as their text, as the HIG asks.
-    private var tall: Bool { state.phase == .working || state.phase == .done }
-    private var hasFooter: Bool { tall || state.phase == .problem }
-
-    @ViewBuilder private var detail: some View {
-        switch state.phase {
-        case .working where !state.steps.isEmpty:
-            StepList(steps: Array(state.steps.suffix(2)))
-        case .working:
-            Text("Starting up").font(.system(size: 13)).foregroundStyle(.white.opacity(0.6))
-        case .done:
-            Text(state.runSummary).font(.system(size: 13)).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
-        case .problem:
-            Text("Open Poki to fix it.").font(.system(size: 13)).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
-        case .idle where state.runnerPaused:
-            Text("The runner wakes when an agent asks.").font(.system(size: 13)).foregroundStyle(.white.opacity(0.6)).lineLimit(2)
-        case .idle:
-            Text("Runner on. Waiting for the agent.").font(.system(size: 13)).foregroundStyle(.white.opacity(0.6)).lineLimit(2)
-        default:
-            EmptyView()
+/// The last step with its result mark, or the phase's explanation.
+struct DetailLine: View {
+    var state: PokiState
+    var text: String
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            if state.phase == .working, let step = state.steps.last {
+                Image(systemName: step.ok ? "checkmark" : "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(step.ok ? Brand.done : Brand.approval)
+            }
+            Text(text).font(.system(size: 13)).foregroundStyle(.white.opacity(0.68))
+                .lineLimit(1).truncationMode(.tail)
         }
     }
+}
 
-    @ViewBuilder private var footer: some View {
-        HStack(spacing: 8) {
+/// Step count, time and the one button, along the bottom.
+struct Footer: View {
+    var state: PokiState
+    var body: some View {
+        HStack(spacing: 10) {
             switch state.phase {
             case .working:
                 Meta(symbol: "list.bullet", text: String(localized: "Step \(state.stepCount + 1)"))
@@ -243,41 +257,12 @@ struct RunLayout: View {
                 Spacer(minLength: 4)
             case .problem:
                 Spacer(minLength: 0)
-                OpenPokiButton(title: "Open Poki")
+                OpenPokiButton()
             default:
                 Spacer(minLength: 0)
             }
         }
         .frame(height: 28)
-    }
-
-    /// The right column: the latest screen while there is one, otherwise a big glyph for the phase.
-    @ViewBuilder private var side: some View {
-        let height: CGFloat = island ? 104 : 128
-        if state.hasThumbnail, state.phase == .working || state.phase == .done || state.phase == .idle && !state.runnerPaused {
-            Thumbnail(version: state.thumbnailVersion, accent: state.phase == .done ? Brand.done : .white.opacity(0.28))
-                .frame(width: height * 0.47, height: height)
-        } else if tall {
-            PhaseGlyph(state: state).frame(width: island ? 52 : 60, height: height)
-        }
-    }
-}
-
-struct StepList: View {
-    var steps: [PokiActivityAttributes.Step]
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(steps.enumerated()), id: \.offset) { i, step in
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Image(systemName: step.ok ? "checkmark" : "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(step.ok ? Brand.done : Brand.approval)
-                        .frame(width: 12)
-                    Text(step.text).font(.system(size: 13)).lineLimit(1).truncationMode(.middle)
-                        .foregroundStyle(.white.opacity(i == steps.count - 1 ? 0.85 : 0.55))
-                }
-            }
-        }
     }
 }
 
@@ -296,7 +281,7 @@ struct Meta: View {
 }
 
 /// A running clock. Text(timerInterval:) is sized for its longest value and shows dashes when its
-/// frame is narrower, so the frame fits h:mm:ss.
+/// frame is narrower, so the frame fits h:mm:ss. (The locked, dimmed screen shows "1:--" on purpose.)
 struct ElapsedMeta: View {
     var since: Date
     var body: some View {
@@ -328,10 +313,9 @@ struct StopButton: View {
 }
 
 struct OpenPokiButton: View {
-    var title: String
     var body: some View {
         Link(destination: URL(string: "poki://home")!) {
-            Text(title).font(.system(size: 13, weight: .semibold))
+            Text("Open Poki").font(.system(size: 13, weight: .semibold))
                 .padding(.horizontal, 12).frame(height: 28)
                 .background(.white.opacity(0.16), in: .capsule)
         }
@@ -340,18 +324,17 @@ struct OpenPokiButton: View {
     }
 }
 
-/// The right column when there is no screenshot: the phase's glyph in a soft tile, with the step
-/// count while working.
+/// The right column when there is no screenshot yet: the phase's glyph, and the step count.
 struct PhaseGlyph: View {
     var state: PokiState
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
                 Circle().fill(state.accent.opacity(0.16))
-                Image(systemName: state.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(state.accent)
+                Image(systemName: state.symbol).font(.system(size: 20, weight: .semibold)).foregroundStyle(state.accent)
             }
-            .frame(width: 48, height: 48)
-            if state.phase == .working || state.phase == .done, state.stepCount > 0 {
+            .frame(width: 44, height: 44)
+            if state.stepCount > 0 {
                 Text("\(state.stepCount)").font(.system(size: 13, weight: .semibold).monospacedDigit()).foregroundStyle(.white.opacity(0.7))
             }
         }
@@ -361,58 +344,49 @@ struct PhaseGlyph: View {
 
 // MARK: Approval
 
-struct ApprovalLayout: View {
+/// The approval card: what the agent wants to do, the time left draining, and Deny / Allow full width.
+/// The same card is the island's large pop-up (without the header, which the island's own top row
+/// replaces).
+struct ActivityApprovalCard: View {
     var state: PokiState
     var island: Bool
 
     var body: some View {
         if let approval = state.approval {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        if !island {
-                            Header(state: state) { Countdown(until: approval.expires) }.padding(.bottom, 6)
-                        }
-                        Text("Allow this step?")
-                            .font(.system(size: 12, weight: .semibold)).foregroundStyle(Brand.approval)
-                            .padding(.bottom, 2)
-                        Text(approval.summary)
-                            .font(.system(size: 16, weight: .semibold))
-                            .lineLimit(2).minimumScaleFactor(0.8)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 4)
-                        DrainBar(from: state.approvalSince ?? approval.expires.addingTimeInterval(-30), to: approval.expires)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    if state.hasThumbnail {
-                        Thumbnail(version: state.thumbnailVersion, accent: Brand.approval)
-                            .frame(width: island ? 38 : 44, height: island ? 70 : 92)
-                    }
+            VStack(alignment: .leading, spacing: 0) {
+                if !island {
+                    Header(state: state) { Countdown(until: approval.expires) }.padding(.bottom, 8)
                 }
-                .frame(height: island ? 70 : 92)
-                ApprovalButtons(approval: approval)
+                Text(approval.summary)
+                    .font(.system(size: 16, weight: .semibold))
+                    .lineLimit(2).minimumScaleFactor(0.8)
+                    .fixedSize(horizontal: false, vertical: true)
+                DrainBar(from: state.approvalSince ?? approval.expires.addingTimeInterval(-120), to: approval.expires)
+                    .padding(.top, 8)
+                ApprovalButtons(approval: approval).padding(.top, 10)
             }
         } else {
-            RunLayout(state: state, island: island)
+            ActivityRunCard(state: state)
         }
     }
 }
 
-/// The time left to answer, counting down. Fixed width, so it never pushes the header around.
+/// The time left to answer, counting down, with the hand so it also says what it is.
 struct Countdown: View {
     var until: Date
-    /// Counting down to `until`. The start is fixed just under an hour before it (not "now", which the system
-    /// may take at a different moment than it draws), so the remaining time is always `until - now`.
+    /// Counting down to `until`. The start is fixed just under an hour before it (not "now", which the
+    /// system may take at another moment than it draws), so the remaining time is always `until - now`.
     static func range(_ until: Date) -> ClosedRange<Date> { until.addingTimeInterval(-3599)...until }
+
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: "clock.fill").font(.system(size: 10, weight: .bold))
+            Image(systemName: "hand.raised.fill").font(.system(size: 10, weight: .bold))
             Text(timerInterval: Countdown.range(until), countsDown: true)
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                .frame(width: 44, alignment: .leading)
+                .frame(width: 40, alignment: .leading)
         }
         .foregroundStyle(Brand.approval)
-        .padding(.horizontal, 8).frame(height: 22)
+        .padding(.horizontal, 9).frame(height: 22)
         .background(Brand.approval.opacity(0.18), in: .capsule)
         .lineLimit(1).fixedSize()
     }
@@ -458,7 +432,7 @@ struct ApprovalButtons: View {
 
 // MARK: Pairing
 
-struct PairingLayout: View {
+struct ActivityPairingCard: View {
     var state: PokiState
     var island: Bool
 
@@ -467,27 +441,21 @@ struct PairingLayout: View {
             if !island { Header(state: state).padding(.bottom, 8) }
             if let pin = state.pin {
                 Text("Type this code in Settings").font(.system(size: 15, weight: .semibold)).lineLimit(1)
-                Text("Pair with Poki asks for it").font(.system(size: 12)).foregroundStyle(.white.opacity(0.6)).lineLimit(1)
                     .padding(.bottom, 8)
-                HStack(spacing: island ? 6 : 8) {
+                HStack(spacing: 7) {
                     ForEach(Array(pin.enumerated()), id: \.offset) { _, digit in
                         Text(String(digit))
-                            .font(.system(size: island ? 24 : 28, weight: .bold, design: .rounded).monospacedDigit())
-                            .frame(maxWidth: .infinity).frame(height: island ? 40 : 46)
-                            .background(.white.opacity(0.12), in: .rect(cornerRadius: 10, style: .continuous))
+                            .font(.system(size: island ? 22 : 26, weight: .bold, design: .rounded).monospacedDigit())
+                            .frame(maxWidth: .infinity).frame(height: island ? 36 : 42)
+                            .background(.white.opacity(0.12), in: .rect(cornerRadius: 9, style: .continuous))
                     }
                 }
             } else {
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Open Settings to pair").font(.system(size: 17, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.85)
-                        Text("Privacy & Security › Developer Mode › Pair with Poki. The code shows up here.")
-                            .font(.system(size: 13)).foregroundStyle(.white.opacity(0.65)).lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    PhaseGlyph(state: state).frame(width: 52, height: 60)
-                }
+                Text("Open Settings to pair").font(.system(size: 17, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.85)
+                Text("Privacy & Security › Developer Mode › Pair with Poki. The code shows up here.")
+                    .font(.system(size: 13)).foregroundStyle(.white.opacity(0.65)).lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 3)
             }
         }
     }
@@ -495,7 +463,7 @@ struct PairingLayout: View {
 
 // MARK: Setup
 
-struct SetupLayout: View {
+struct ActivitySetupCard: View {
     var state: PokiState
     var island: Bool
 
@@ -503,31 +471,24 @@ struct SetupLayout: View {
         if let guide = state.guide {
             VStack(alignment: .leading, spacing: 0) {
                 if !island { Header(state: state) { StepRingSmall(guide: guide) }.padding(.bottom, 8) }
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Step \(guide.number) of \(guide.count)")
-                            .font(.system(size: 12, weight: .semibold).monospacedDigit()).foregroundStyle(Brand.blue)
-                        Text(guide.title).font(.system(size: island ? 16 : 17, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
-                        Text(guide.hint).font(.system(size: 13)).foregroundStyle(.white.opacity(0.7))
-                            .lineLimit(island ? 2 : 3).fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                Spacer(minLength: 8)
+                Text(guide.title).font(.system(size: 16, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                Text(guide.hint).font(.system(size: 13)).foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
                 HStack(spacing: 4) {
                     ForEach(1...max(guide.count, 1), id: \.self) { i in
                         Capsule().fill(i < guide.number ? Brand.done : i == guide.number ? Brand.blue : .white.opacity(0.18)).frame(height: 4)
                     }
                 }
+                .padding(.top, 10)
             }
-            .frame(height: island ? 96 : 128)
         } else {
-            RunLayout(state: state, island: island)
+            ActivityRunCard(state: state)
         }
     }
 }
 
-/// "2/6" in a ring, for the header and the island.
+/// "2" in a ring that fills 2/6 of the way, for the header and the island.
 struct StepRingSmall: View {
     var guide: PokiActivityAttributes.Guide
     var body: some View {
@@ -544,27 +505,25 @@ struct StepRingSmall: View {
 
 // MARK: Dynamic Island
 
-/// The expanded island's leading region: the bear and Poki, inset so nothing is clipped by the
-/// island's rounded corner.
+/// Expanded leading region: the bear and Poki, with the app or the setup step under it.
 struct IslandLeading: View {
     var state: PokiState
     var body: some View {
-        HStack(spacing: 7) {
-            BearMark(size: 26)
+        HStack(spacing: 8) {
+            BearMark(size: 28)
             VStack(alignment: .leading, spacing: 0) {
                 Text("Poki").font(.system(size: 14, weight: .semibold))
-                if let app = state.appLine {
-                    Text(app).font(.system(size: 12)).foregroundStyle(.white.opacity(0.55))
+                if let sub = state.appLine ?? state.guide.map({ String(localized: "Step \($0.number) of \($0.count)") }) {
+                    Text(sub).font(.system(size: 12)).foregroundStyle(.white.opacity(0.55))
                 }
             }
             .lineLimit(1)
         }
-        .padding(.leading, 4)
         .frame(maxHeight: .infinity, alignment: .center)
     }
 }
 
-/// The expanded island's trailing region: the most useful short value for the phase.
+/// Expanded trailing region: the most useful short value for the phase.
 struct IslandTrailing: View {
     var state: PokiState
     var body: some View {
@@ -572,44 +531,64 @@ struct IslandTrailing: View {
             switch state.phase {
             case .approval:
                 if let approval = state.approval { Countdown(until: approval.expires) } else { StatusPill(state: state) }
-            case .setup:
-                if let guide = state.guide { StepRingSmall(guide: guide).scaleEffect(1.2) } else { StatusPill(state: state) }
-            case .working:
+            case .working where state.event == nil:
                 if let since = state.since {
                     Text(timerInterval: since...since.addingTimeInterval(12 * 3600), countsDown: false)
                         .font(.system(size: 15, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.blue)
                         .multilineTextAlignment(.trailing)
-                        .frame(width: 52, alignment: .trailing)
+                        .frame(width: 64, alignment: .trailing)
                 } else { StatusPill(state: state) }
             default:
                 StatusPill(state: state)
             }
         }
-        .padding(.trailing, 4)
         .frame(maxHeight: .infinity, alignment: .center)
     }
 }
 
-/// The expanded island's bottom region.
+/// Expanded bottom region. Small for actions and the quiet phases (a headline and one line), large
+/// for an approval (the full approval card).
 struct IslandBottom: View {
     var state: PokiState
     var body: some View {
         Group {
             switch state.phase {
-            case .approval: ApprovalLayout(state: state, island: true)
-            case .pairing: PairingLayout(state: state, island: true)
-            case .setup: SetupLayout(state: state, island: true)
-            default: RunLayout(state: state, island: true)
+            case .approval: ActivityApprovalCard(state: state, island: true)
+            case .pairing: ActivityPairingCard(state: state, island: true)
+            case .setup: ActivitySetupCard(state: state, island: true)
+            default: IslandSmall(state: state)
             }
         }
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 4)
     }
 }
 
-/// The compact trailing side: a short value rather than a word, so it never truncates.
+/// The small pop-up: what just happened in words, the next line under it, and Stop while working.
+struct IslandSmall: View {
+    var state: PokiState
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(state.headline)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(state.phase == .problem ? Brand.problem : .white)
+                    .lineLimit(2).minimumScaleFactor(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = state.detailLine { DetailLine(state: state, text: detail) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            switch state.phase {
+            case .working: StopButton()
+            case .problem: OpenPokiButton()
+            default: EmptyView()
+            }
+        }
+    }
+}
+
+/// Compact trailing: a short value rather than a word, so it never truncates.
 struct CompactTrailing: View {
     var state: PokiState
     var body: some View {
@@ -621,7 +600,7 @@ struct CompactTrailing: View {
                         .font(.system(size: 14, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.approval)
                         .multilineTextAlignment(.trailing)
-                        .frame(width: 36, alignment: .trailing)
+                        .frame(width: 40, alignment: .trailing)
                 } else { glyph }
             case .pairing where state.pin != nil:
                 Text(state.pin ?? "").font(.system(size: 13, weight: .bold).monospacedDigit()).foregroundStyle(Brand.blue)
@@ -634,13 +613,12 @@ struct CompactTrailing: View {
                         .font(.system(size: 14, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Brand.blue)
                         .multilineTextAlignment(.trailing)
-                        .frame(width: 40, alignment: .trailing)
+                        .frame(width: 44, alignment: .trailing)
                 } else { glyph }
             default:
                 glyph
             }
         }
-        .padding(.trailing, 2)
     }
 
     private var glyph: some View {
@@ -648,19 +626,16 @@ struct CompactTrailing: View {
     }
 }
 
-/// The compact leading side: the bear, or the hand while an approval waits.
+/// Compact leading: the bear, or the hand while an approval waits.
 struct CompactLeading: View {
     var state: PokiState
     var body: some View {
-        Group {
-            if state.phase == .approval {
-                Image(systemName: "hand.raised.fill").font(.system(size: 15, weight: .semibold)).foregroundStyle(Brand.approval)
-                    .frame(width: 22, height: 22)
-            } else {
-                BearMark(size: 22)
-            }
+        if state.phase == .approval {
+            Image(systemName: "hand.raised.fill").font(.system(size: 15, weight: .semibold)).foregroundStyle(Brand.approval)
+                .frame(width: 22, height: 22)
+        } else {
+            BearMark(size: 22)
         }
-        .padding(.leading, 2)
     }
 }
 
@@ -673,11 +648,6 @@ struct MinimalView: View {
             Image(systemName: "hand.raised.fill").foregroundStyle(Brand.approval)
         case .problem:
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Brand.problem)
-        case .working:
-            ZStack {
-                Circle().stroke(Brand.blue.opacity(0.3), lineWidth: 2)
-                BearMark(size: 16)
-            }
         default:
             BearMark(size: 20)
         }
@@ -686,7 +656,7 @@ struct MinimalView: View {
 
 // MARK: Pieces
 
-/// The bear on its blue tile, like the app icon, with the bear inset so no part of it is clipped.
+/// The bear on its blue tile, like the app icon, inset so no part of it is clipped.
 struct BearMark: View {
     var size: CGFloat
     var body: some View {
@@ -699,20 +669,20 @@ struct BearMark: View {
 }
 
 /// The latest screenshot, read from the App Group container and drawn like a small phone. `version`
-/// changes when the app writes a new one, which redraws the view. Without a file it draws an empty
+/// changes when the app writes a new one, which redraws the view. Without a file it draws a plain
 /// phone outline, so the layout never jumps.
 struct Thumbnail: View {
     /// The app's own previews draw this when there is no file (the widget never sets it).
     @MainActor static var previewImage: UIImage?
     var version: Int
-    var accent: Color = .white.opacity(0.28)
+    var accent: Color = .white.opacity(0.25)
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
         Group {
             if let image = (SharedContainer.thumbnailURL.flatMap { UIImage(contentsOfFile: $0.path) }) ?? Self.previewImage {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
-                LinearGradient(colors: [Brand.blue.opacity(0.35), Brand.night], startPoint: .top, endPoint: .bottom)
+                Color.white.opacity(0.08)
             }
         }
         .clipShape(shape)
