@@ -7,7 +7,7 @@ import WidgetKit
 ///
 /// Sizes (HIG, iPhone): Lock Screen and expanded island are 371-408 points wide and at most 160
 /// points tall; anything taller is cut. The Lock Screen card has large rounded corners, so content
-/// keeps 18 points from the sides and 16 from the top and bottom, and stays within 124 points of
+/// keeps the same 16 points from every edge, and stays within 128 points of
 /// height. The expanded island also spends ~44 points on its leading/trailing row, so its bottom
 /// region stays within ~90 points.
 ///
@@ -29,7 +29,7 @@ enum Brand {
 
 /// Lock Screen padding (see the comment at the top).
 enum LockInsets {
-    static let horizontal: CGFloat = 18
+    static let horizontal: CGFloat = 16
     static let vertical: CGFloat = 16
 }
 
