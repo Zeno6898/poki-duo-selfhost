@@ -90,8 +90,8 @@ let same = await call("no-op wait", "do", ["actions": [["wait": 300]]])
 // Simulator tolerance: the drag's scroll indicator can still be fading when this read comes, so a
 // picture-only change confined to a strip at the right edge, under 5 % of the picture, passes.
 let smallStrip = same.range(of: #"only the picture changed, in ([0-9]+) % of it, within \[([0-9]+), [0-9]+, ([0-9]+), [0-9]+\]"#, options: .regularExpression).map { r -> Bool in
-    let parts = same[r].split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
-    return parts.count >= 3 && parts[0] < 5 && parts[1] > 350 && parts[2] <= 40
+    let parts = same[r].split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }  // share, x, y, width, height
+    return parts.count >= 5 && parts[0] < 5 && parts[1] > 350 && parts[3] <= 40
 } ?? false
 check(same.contains("screen_changed: false") || smallStrip, "nothing done: screen_changed false (or only the scroll indicator faded)")
 let waited = await call("wait_until settled", "do", ["actions": [["wait_until": "settled"]]])
