@@ -26,15 +26,37 @@ final class LookDoTests: XCTestCase {
         XCTAssertEqual(settings?["waitForIdleTimeout"]?.double, 0.5)
     }
 
-    func testAnElementUnderTheReplyBarIsNotHittableAndNothingIsSent() async {
+    /// The tree's order is not the drawing order, so a cover is a hint, never a refusal: the element
+    /// is touched at its centre and the answer names what the tree puts over it.
+    func testAnElementUnderTheReplyBarIsTappedAnywayAndTheAnswerSaysWhatLiesOverIt() async {
         let (core, wda, _) = makeCore()
         thread(wda, quotedY: 750)
         let look = await core.call("look", [:])
         XCTAssertTrue(look.text.contains("3 Cell \"Quoted post\" [0,750,390,120]"), look.text)
         let result = await core.call("do", ["actions": [["tap": 3]]])
-        XCTAssertTrue(result.text.contains("not_hittable: element 3 Cell \"Quoted post\": its visible part is covered by Other"), result.text)
-        XCTAssertTrue(result.text.contains("scroll_to"), result.text)
-        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 0)
+        XCTAssertFalse(result.text.contains("not_hittable"), result.text)
+        XCTAssertTrue(result.text.contains("at [195, 797] (Other and TextView \"Post your reply\" lies over all of its visible part in the tree; touched anyway"), result.text)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").count, 1)
+        XCTAssertEqual(wda.bodies("POST /wda/tap").first?["y"]?.double ?? 0, 797, accuracy: 0.5, "the centre of its visible part")
+    }
+
+    /// Seen on the phone: Photos' Select button came after the photo grid in the tree, and the
+    /// thumbnails that scroll under it counted as covering it. What scrolls inside a list never covers
+    /// what is outside the list.
+    func testWhatScrollsInsideAListDoesNotCoverAButtonOutsideIt() async {
+        let (core, wda, _) = makeCore()
+        wda.tree([
+            Node("Button", "Select", [300, 60, 80, 40]),
+            Node("CollectionView", nil, [0, 50, 390, 790], [Node("Image", "Photo", [260, 50, 130, 130]), Node("Image", "Photo", [130, 50, 130, 130])]),
+        ], app: "Photos")
+        _ = await core.call("look", [:])
+        let result = await core.call("do", ["actions": [["tap": 1]]])
+        XCTAssertFalse(result.isError, result.text)
+        XCTAssertTrue(result.text.contains("tap \"Select\" (sent"), result.text)
+        XCTAssertFalse(result.text.contains("in the tree"), result.text)
+        let body = wda.bodies("POST /wda/tap").first
+        XCTAssertEqual(body?["x"]?.double ?? 0, 340, accuracy: 0.5)
+        XCTAssertEqual(body?["y"]?.double ?? 0, 80, accuracy: 0.5)
     }
 
     func testAPartlyCoveredElementIsTappedOnItsVisiblePart() async {
@@ -45,7 +67,7 @@ final class LookDoTests: XCTestCase {
         XCTAssertFalse(result.isError, result.text)
         let y = wda.bodies("POST /wda/tap").first?["y"]?.double ?? 0
         XCTAssertTrue(y > 690 && y < 744, "tapped at y \(y)")
-        XCTAssertTrue(result.text.contains("(its centre is off screen or covered)"), result.text)
+        XCTAssertTrue(result.text.contains("(its centre is under Other"), result.text)
     }
 
     func testAPointOffTheScreenIsNotHittable() async {
@@ -289,6 +311,48 @@ import CoreGraphics
 import CoreText
 import ImageIO
 import UniformTypeIdentifiers
+
+final class PictureSketchTests: XCTestCase {
+    func png(_ draw: (CGContext) -> Void) -> Data {
+        let width = 402, height = 874
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(CGColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1))
+        draw(context)
+        let data = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, context.makeImage()!, nil)
+        CGImageDestinationFinalize(destination)
+        return data as Data
+    }
+
+    /// Seen on the simulator: a scroll indicator fading out after a drag made a no-op wait answer
+    /// screen_changed: true. A picture change is what a person would see.
+    func testAFadingScrollIndicatorIsNotAChangeButASheetIs() throws {
+        let plain = PictureSketch(png: png { _ in })
+        let indicator = PictureSketch(png: png { $0.fill(CGRect(x: 396, y: 300, width: 3, height: 120)) })
+        let cursor = PictureSketch(png: png { $0.fill(CGRect(x: 40, y: 700, width: 2, height: 22)) })
+        let sheet = PictureSketch(png: png { $0.fill(CGRect(x: 0, y: 0, width: 402, height: 300)) })
+        let photo = PictureSketch(png: png { $0.fill(CGRect(x: 100, y: 400, width: 120, height: 120)) })
+        XCTAssertNil(plain.hash, "decoded, not hashed")
+        XCTAssertFalse(indicator.differs(from: plain))
+        XCTAssertFalse(cursor.differs(from: plain))
+        XCTAssertTrue(sheet.differs(from: plain))
+        XCTAssertTrue(photo.differs(from: plain))
+        XCTAssertFalse(plain.differs(from: PictureSketch(png: png { _ in })))
+        // A long indicator, as iOS draws it beside a two-page list, is a change (it moves a column of
+        // cells), and the change is told by its share and box, so the reader knows it is a strip.
+        let longIndicator = PictureSketch(png: png { $0.fill(CGRect(x: 396, y: 110, width: 3, height: 700)) })
+        let change = try XCTUnwrap(longIndicator.change(from: plain))
+        XCTAssertTrue(longIndicator.differs(from: plain))
+        XCTAssertTrue(change.share > 0.01 && change.share < 0.05, "\(change)")
+        XCTAssertTrue(change.x > 0.9 && change.width <= 2.0 / 32 && change.height > 0.7, "\(change)")
+        let page = try XCTUnwrap(sheet.change(from: plain))
+        // CoreGraphics draws from the bottom, so the sheet is the lower third of the picture.
+        XCTAssertTrue(page.share > 0.3 && page.width == 1 && page.height < 0.4 && page.y + page.height == 1, "\(page)")
+    }
+}
 
 final class TextRecognitionTests: XCTestCase {
     /// Vision reads a rendered word back, with its box in parts of the picture from the top left.

@@ -87,7 +87,7 @@ final class SoakTests: XCTestCase {
         wda.source([("Button", "General"), ("Button", "Privacy"), ("TextField", "Search"), ("Cell", "Wi-Fi"), ("Cell", "Bluetooth"), ("Cell", "Battery")])
         let chaos = ChaosRunner(base: wda, seed: seed)
         let host = RestartingHost()
-        var config = CoreConfig(approvalWait: 0.3, toolDeadline: 4, actionCap: 2, readTimeout: 1, busyWait: 0.2, runnerWait: 1)
+        var config = CoreConfig(approvalWait: 0.3, toolDeadline: 4, actionCap: 2, readTimeout: 1, busyWait: 0.2, runnerWait: 1, treeFormat: "json") // the fake speaks JSON
         config.sensitive.enabled = false
         let core = PokiCore(config: config, host: host, transport: chaos)
         let limit = config.toolDeadline + config.approvalWait + 1.5

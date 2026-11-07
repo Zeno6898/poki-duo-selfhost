@@ -30,19 +30,24 @@ struct Layout {
             if c.text.isEmpty && !all.contains(where: { c.contains($0) && !$0.text.isEmpty }) { return false }
             if Self.bars.contains(c.type) { return true }
             guard c.node > target.end, !Self.scrollers.contains(c.type) else { return false }
+            // What scrolls inside a list is drawn under everything outside that list (a floating
+            // button, a search field, a Select button over a photo grid), wherever it comes in the tree.
+            if all.contains(where: { Self.scrollers.contains($0.type) && $0.contains(c) && !$0.contains(target) }) { return false }
             return c.frame.area < 0.5 * screen.area
         }
     }
 
-    /// A point inside `target` that is on screen and not under anything: its centre when that is free,
-    /// otherwise the free point nearest to it. Nil when no part of it can be reached.
-    func hitPoint(_ target: Element) -> (x: Double, y: Double)? {
+    /// Where to touch `target`: its centre when that is on screen and under nothing in the tree,
+    /// else the free point of it nearest to its centre, else the centre of its visible part with
+    /// `over` naming what the tree puts on top of it. Nil only when no part of it is on the screen.
+    func touchPoint(_ target: Element) -> (point: (x: Double, y: Double), over: String?, free: Bool)? {
         let visible = target.frame.intersection(screen)
         guard visible.width >= 2, visible.height >= 2 else { return nil }
-        let over = covers(target).map(\.frame)
+        let covering = covers(target)
+        let over = covering.map(\.frame)
         func free(_ p: (x: Double, y: Double)) -> Bool { !over.contains { $0.contains(p) } }
         let centre = target.frame.centre
-        if visible.contains(centre), free(centre) { return centre }
+        if visible.contains(centre), free(centre) { return (centre, nil, true) }
         var best: (point: (x: Double, y: Double), distance: Double)?
         let steps = 9
         for i in 0..<steps {
@@ -53,17 +58,14 @@ struct Layout {
                 if best == nil || d < best!.distance { best = (p, d) }
             }
         }
-        return best?.point
+        let names = covering.prefix(2).map { "\($0.type)\($0.text.isEmpty ? "" : " \"\($0.text.prefix(30))\"")" }.joined(separator: " and ")
+        if let best { return (best.point, covering.isEmpty ? nil : names, true) }
+        return (visible.centre, names.isEmpty ? nil : names, false)
     }
 
-    /// Why `hitPoint` found nothing, in words.
+    /// Why `touchPoint` found nothing, in words.
     func unreachable(_ target: Element) -> String {
-        let visible = target.frame.intersection(screen)
-        if visible.width < 2 || visible.height < 2 {
-            return "its frame \(target.frame.described) is off the screen (\(Int(screen.width))x\(Int(screen.height)) points)"
-        }
-        let names = covers(target).prefix(2).map { "\($0.type)\($0.text.isEmpty ? "" : " \"\($0.text.prefix(30))\"") \($0.frame.described)" }
-        return "its visible part is covered by \(names.joined(separator: " and "))"
+        "its frame \(target.frame.described) is off the screen (\(Int(screen.width))x\(Int(screen.height)) points)"
     }
 
     /// The biggest scrolling container on screen, or the one named.

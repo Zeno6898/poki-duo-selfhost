@@ -14,11 +14,12 @@ final class FakeWDA: HTTPTransport, @unchecked Sendable {
     init() {
         set("POST /session") { _ in (200, ["value": ["sessionId": "s1"]]) }
         set("GET /status") { _ in (200, ["value": ["ready": true]]) }
+        set("DELETE /session") { _ in (200, ["value": .null]) }
         set("GET /wda/screen") { _ in (200, ["value": ["screenSize": ["width": 390, "height": 844]]]) }
         set("GET /screenshot") { _ in (200, ["value": .string(Data("png".utf8).base64EncodedString())]) }
         set("GET /wda/activeAppInfo") { _ in (200, ["value": ["bundleId": "com.apple.Preferences", "name": "Settings"]]) }
         source([("Button", "General"), ("Button", "Privacy")])
-        for path in ["POST /wda/tap", "POST /wda/keys", "POST /wda/dragfromtoforduration", "POST /wda/touchAndHold", "POST /wda/apps/launch", "POST /wda/apps/terminate", "POST /wda/homescreen", "POST /wda/lock", "POST /wda/pressButton", "POST /actions", "POST /wda/pressAndDragWithVelocity", "POST /appium/settings"] {
+        for path in ["POST /wda/tap", "POST /wda/keys", "POST /wda/dragfromtoforduration", "POST /wda/touchAndHold", "POST /wda/apps/launch", "POST /wda/apps/activate", "POST /wda/apps/terminate", "POST /wda/homescreen", "POST /wda/lock", "POST /wda/pressButton", "POST /actions", "POST /wda/pressAndDragWithVelocity", "POST /appium/settings"] {
             set(path) { _ in (200, ["value": .null]) }
         }
     }
@@ -164,7 +165,7 @@ func eventually(_ seconds: Double = 2, _ condition: () -> Bool) async -> Bool {
 }
 
 func makeCore(_ wda: FakeWDA = FakeWDA(), host: FakeHost = FakeHost(), configure: (inout CoreConfig) -> Void = { _ in }) -> (PokiCore, FakeWDA, FakeHost) {
-    var config = CoreConfig(approvalWait: 0.3, toolDeadline: 6, actionCap: 3, readTimeout: 1, busyWait: 0.2)
+    var config = CoreConfig(approvalWait: 0.3, toolDeadline: 6, actionCap: 3, readTimeout: 1, busyWait: 0.2, treeFormat: "json") // the fake speaks JSON
     configure(&config)
     return (PokiCore(config: config, host: host, transport: wda), wda, host)
 }
