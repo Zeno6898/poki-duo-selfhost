@@ -38,6 +38,41 @@ jobs:
                paths: [native/ios-app/**, native/ios/**, native/launcher/**, native/patches/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
            
            permissions:
+          diff --git a/native/ios-app/Poki/App/AppModel.swift b/native/ios-app/Poki/App/AppModel.swift
+          index b54f97c..c1e6637 100644
+          --- a/native/ios-app/Poki/App/AppModel.swift
+          +++ b/native/ios-app/Poki/App/AppModel.swift
+          @@ -171,6 +171,13 @@ final class AppModel {
+           
+               func restartRunner() { launcher.restart() }
+           
+          +    /// Restores the internet connection without closing the phone's developer tunnel.
+          +    func reconnectAgent() {
+          +        guard sessionOn, activityText == "Idle", approvals.isEmpty else { return }
+          +        log.add("relay", "owner requested agent reconnect; keeping the runner")
+          +        core.reconnectRelay()
+          +    }
+          +
+               private func launchRunner() {
+                   guard let launcherConfig else { return }
+                   do {
+          diff --git a/native/ios-app/Poki/App/HomeView.swift b/native/ios-app/Poki/App/HomeView.swift
+          index f6ce4dd..9d84799 100644
+          --- a/native/ios-app/Poki/App/HomeView.swift
+          +++ b/native/ios-app/Poki/App/HomeView.swift
+          @@ -92,6 +92,12 @@ private struct HeroCard: View {
+                       }
+                       .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
+                       .tint(model.sessionOn ? Color.white.opacity(0.22) : Color.white)
+          +            if model.sessionOn {
+          +                Button("Reconnect Agent") { model.reconnectAgent() }
+          +                    .font(.subheadline.weight(.semibold))
+          +                    .disabled(model.activityText != "Idle" || !model.approvals.isEmpty)
+          +                    .accessibilityHint("Reconnects the relay while keeping the runner running.")
+          +            }
+                   }
+                   .foregroundStyle(.white)
+                   .padding(18)
           diff --git a/native/ios-app/Poki/Connect/RelayIdentity.swift b/native/ios-app/Poki/Connect/RelayIdentity.swift
           index b0c2212..36599bf 100644
           --- a/native/ios-app/Poki/Connect/RelayIdentity.swift
@@ -51,6 +86,110 @@ jobs:
                private static let keyAccount = "relay.ed25519"
                private static let secretsAccount = "relay.secrets"
            
+          diff --git a/native/ios-app/Poki/Debug/ProbeView.swift b/native/ios-app/Poki/Debug/ProbeView.swift
+          index 4e2daaf..ece4808 100644
+          --- a/native/ios-app/Poki/Debug/ProbeView.swift
+          +++ b/native/ios-app/Poki/Debug/ProbeView.swift
+          @@ -1,10 +1,13 @@
+           import SwiftUI
+           
+           struct ProbeView: View {
+          +    @Environment(AppModel.self) private var model
+               @State private var results: [ProbeResult] = []
+               @State private var running = false
+               @State private var addresses: [LocalAddress] = localAddresses()
+               @StateObject private var hold = Hold()
+          +    @State private var tunnelResults: [TunnelProbeResult] = []
+          +    @State private var checkingTunnel = false
+           
+               var body: some View {
+                   NavigationStack {
+          @@ -30,6 +33,22 @@ struct ProbeView: View {
+                               }
+                               Button(running ? "Running…" : "Run checks") { Task { await run() } }.disabled(running)
+                           }
+          +                Section {
+          +                    Button(checkingTunnel ? "Testing pairing and tunnel…" : "Test pairing and tunnel") {
+          +                        Task { await checkTunnel() }
+          +                    }.disabled(checkingTunnel || model.pairingPath == nil)
+          +                    ForEach(tunnelResults.indices, id: \.self) { index in
+          +                        let result = tunnelResults[index]
+          +                        VStack(alignment: .leading, spacing: 4) {
+          +                            Text("\(result.address): \(result.ok ? "Verified" : result.stage)").font(.headline)
+          +                            Text(result.detail).font(.caption.monospaced()).textSelection(.enabled)
+          +                        }
+          +                    }
+          +                } header: {
+          +                    Text("Developer tunnel check")
+          +                } footer: {
+          +                    Text("Tests a fresh pairing handshake, TLS tunnel and RSD connection, then closes that test connection. Keeps the current runner running. TCP connected alone does not count as success.")
+          +                }
+                           Section("Background hold") {
+                               LabeledContent("Port on 10.7.0.1") {
+                                   TextField("49152", text: $hold.port).keyboardType(.numberPad).multilineTextAlignment(.trailing).monospacedDigit()
+          @@ -61,6 +80,18 @@ struct ProbeView: View {
+                   results = await runChecks()
+                   running = false
+               }
+          +
+          +    private func checkTunnel() async {
+          +        guard !checkingTunnel, let pairing = model.pairingPath else { return }
+          +        checkingTunnel = true
+          +        tunnelResults = []
+          +        for address in ["10.7.0.1", "127.0.0.1", "::1"] {
+          +            let result = await NativeTunnelProbe.run(address: address, pairingPath: pairing)
+          +            tunnelResults.append(result)
+          +            model.log.add("tunnel-probe", "\(address) \(result.ok ? "verified" : result.stage): \(result.detail)")
+          +        }
+          +        checkingTunnel = false
+          +    }
+           }
+           
+           /// Poki's log: copy it, share it, or read the last lines.
+          diff --git a/native/ios-app/Poki/Runtime/LiveCore.swift b/native/ios-app/Poki/Runtime/LiveCore.swift
+          index baff194..c0c3a0b 100644
+          --- a/native/ios-app/Poki/Runtime/LiveCore.swift
+          +++ b/native/ios-app/Poki/Runtime/LiveCore.swift
+          @@ -26,6 +26,7 @@ final class LiveCore: CoreSession {
+               deinit { pump?.cancel() }
+           
+               func start() { core.start() }
+          +    func reconnectRelay() { core.reconnectRelay() }
+               func stop() { core.stop(); continuation.yield(.relay(.off)) }
+               func resolveApproval(id: String, approved: Bool) { core.resolveApproval(id: id, approved: approved) }
+               func accessChanged() { core.accessChanged() }
+          diff --git a/native/ios-app/Poki/Runtime/RustLauncher.swift b/native/ios-app/Poki/Runtime/RustLauncher.swift
+          index d21af56..ed80440 100644
+          --- a/native/ios-app/Poki/Runtime/RustLauncher.swift
+          +++ b/native/ios-app/Poki/Runtime/RustLauncher.swift
+          @@ -1,5 +1,27 @@
+           import Foundation
+           
+          +struct TunnelProbeResult: Decodable, Sendable {
+          +    var ok: Bool
+          +    var address: String
+          +    var stage: String
+          +    var detail: String
+          +}
+          +
+          +enum NativeTunnelProbe {
+          +    static func run(address: String, pairingPath: String) async -> TunnelProbeResult {
+          +        let fallback = TunnelProbeResult(ok: false, address: address, stage: "diagnostic", detail: "The diagnostic returned no result.")
+          +        guard let data = try? JSONSerialization.data(withJSONObject: ["address": address, "pairing_file": pairingPath]),
+          +              let config = String(data: data, encoding: .utf8) else { return fallback }
+          +        return await Task.detached {
+          +            config.withCString { input in
+          +                guard let output = poki_remote_probe(input) else { return fallback }
+          +                defer { poki_string_free(output) }
+          +                return (try? JSONDecoder().decode(TunnelProbeResult.self, from: Data(String(cString: output).utf8))) ?? fallback
+          +            }
+          +        }.value
+          +    }
+          +}
+          +
+           /// PokiLauncher (Rust, native/launcher) through its C ABI: gets the runner up over the loopback and
+           /// keeps it up. Events arrive on a launcher thread as JSON.
+           final class RustLauncher: RunnerLauncher {
           diff --git a/native/ios-app/Shared/PokiActivityAttributes.swift b/native/ios-app/Shared/PokiActivityAttributes.swift
           index 63eecaf..554ca6f 100644
           --- a/native/ios-app/Shared/PokiActivityAttributes.swift
@@ -78,7 +217,7 @@ jobs:
                static var thumbnailURL: URL? { url?.appendingPathComponent("activity-thumbnail.jpg") }
                static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
           diff --git a/native/ios-app/project.yml b/native/ios-app/project.yml
-          index 9c8d321..e3ea280 100644
+          index 9c8d321..5fc9cd3 100644
           --- a/native/ios-app/project.yml
           +++ b/native/ios-app/project.yml
           @@ -14,7 +14,7 @@ packages:
@@ -86,12 +225,12 @@ jobs:
              base:
                MARKETING_VERSION: "0.1.0"
           -    CURRENT_PROJECT_VERSION: "1"
-          +    CURRENT_PROJECT_VERSION: "3"
+          +    CURRENT_PROJECT_VERSION: "4"
                SWIFT_VERSION: "5.0"
                TARGETED_DEVICE_FAMILY: "1"
                DEBUG_INFORMATION_FORMAT: dwarf
           diff --git a/native/ios/PokiCore/Sources/PokiCore/Core.swift b/native/ios/PokiCore/Sources/PokiCore/Core.swift
-          index a7d4ff6..610175a 100644
+          index a7d4ff6..d72fe70 100644
           --- a/native/ios/PokiCore/Sources/PokiCore/Core.swift
           +++ b/native/ios/PokiCore/Sources/PokiCore/Core.swift
           @@ -17,7 +17,7 @@ public struct CoreConfig: Sendable {
@@ -103,6 +242,81 @@ jobs:
                    self.relayURL = relayURL
                    self.runnerURL = runnerURL
                    self.sensitive = sensitive
+          @@ -131,6 +131,7 @@ public final class PokiCore: @unchecked Sendable {
+               private let gate = Gate()
+               private let sessions = LockedBox<Set<String>>([])
+               var relay: RelayClient?
+          +    private let relayGeneration = LockedBox(0)
+           
+               public init(config: CoreConfig, host: CoreHost, transport: HTTPTransport = URLSessionTransport()) {
+                   self.config = config
+          @@ -153,16 +154,32 @@ public final class PokiCore: @unchecked Sendable {
+           
+               public func start(socketFactory: WebSocketFactory = URLSessionWebSocketFactory()) {
+                   guard relay == nil, let host else { return }
+          +        let generation = relayGeneration.update { $0 += 1; return $0 }
+                   let client = RelayClient(baseURL: config.relayURL, host: host, factory: socketFactory, handler: { [weak self] request in
+                       await self?.handle(request) ?? RelayResponse(id: request.id, status: 503, headers: [:], body: "")
+          -        }, emit: { [weak self] in self?.emit(.relay($0)) })
+          +        }, emit: { [weak self] state in
+          +            guard let self else { return }
+          +            self.relayGeneration.update { current in
+          +                if current == generation { self.emit(.relay(state)) }
+          +            }
+          +        })
+                   relay = client
+                   client.start()
+               }
+           
+               public func stop() {
+          -        relay?.stop()
+          -        relay = nil
+          +        guard let relay else { return }
+          +        relayGeneration.update { $0 += 1 }
+          +        relay.stop()
+          +        self.relay = nil
+          +        emit(.relay(.offline("stopped")))
+          +    }
+          +
+          +    /// Replaces only the internet connection. Keeps the runner, WDA session and MCP state.
+          +    public func reconnectRelay(socketFactory: WebSocketFactory = URLSessionWebSocketFactory()) {
+          +        guard relay != nil else { return }
+          +        stop()
+          +        start(socketFactory: socketFactory)
+               }
+           
+               /// The connector secrets changed: tell the relay the new list.
+          diff --git a/native/ios/PokiCore/Sources/PokiCore/Relay.swift b/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          index 239285e..30a22e8 100644
+          --- a/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          +++ b/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          @@ -103,6 +103,7 @@ final class RelayClient: @unchecked Sendable {
+                           do {
+                               try await self.session { attempt = 0 }
+                           } catch {
+          +                    guard self.state.value.running, !Task.isCancelled else { break }
+                               self.set("offline: \(error)", .offline("\(error)"))
+                           }
+                           guard self.state.value.running else { break }
+          @@ -146,6 +147,10 @@ final class RelayClient: @unchecked Sendable {
+                   let label = base32(key.publicKey)
+                   let url = URL(string: "\(baseURL.absoluteString)/\(label)/connect")!
+                   let socket = try await withDeadline(15, "connecting to the relay") { [factory] in try await factory.connect(to: url) }
+          +        guard state.value.running, !Task.isCancelled else {
+          +            socket.close(code: 1000, reason: "stopped")
+          +            throw CancellationError()
+          +        }
+                   state.update { $0.socket = socket; $0.lastHeard = now() }
+                   defer {
+                       let inflight = state.update { s -> [Task<Void, Never>] in
+          @@ -169,6 +174,7 @@ final class RelayClient: @unchecked Sendable {
+                   try await socket.send(hello.serialized())
+                   let ready = try JSON.parse(try await withDeadline(15, "the relay's ready") { try await socket.receive() })
+                   guard ready["t"]?.string == "ready" else { throw RelayFailure("the relay refused the phone: \(ready["reason"]?.string ?? ready.serialized())") }
+          +        guard state.value.running, !Task.isCancelled else { throw CancellationError() }
+                   state.update { $0.maxBody = ready["max_body"]?.int ?? (4 << 20); $0.lastHeard = now() }
+                   onReady()
+                   set("ready as \(label)", .ready(url: "\(baseURL.absoluteString)/\(label)"))
           diff --git a/native/ios/PokiCore/Sources/PokiCore/Runner.swift b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
           index c41f7e9..97f9333 100644
           --- a/native/ios/PokiCore/Sources/PokiCore/Runner.swift
@@ -128,10 +342,79 @@ jobs:
                            return id
                        }
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
-          index 8cbbfe5..4d113f6 100644
+          index 8cbbfe5..b9d566d 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
           +++ b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
-          @@ -258,7 +258,7 @@ final class RelayTests: XCTestCase {
+          @@ -248,6 +248,68 @@ final class MCPTests: XCTestCase {
+           }
+           
+           final class RelayTests: XCTestCase {
+          +    private func readySocket(_ core: PokiCore, _ factory: FakeSockets) async throws -> FakeSocket {
+          +        let connected = await eventually { !factory.sockets.value.isEmpty }
+          +        XCTAssertTrue(connected)
+          +        let socket = try XCTUnwrap(factory.sockets.value.first)
+          +        socket.push((["t": "challenge", "nonce": .string(Data(repeating: 2, count: 32).base64EncodedString())] as JSON).serialized())
+          +        let hello = await eventually { !socket.sent.isEmpty }
+          +        XCTAssertTrue(hello)
+          +        socket.push((["t": "ready"] as JSON).serialized())
+          +        let ready = await eventually { core.relay?.stateDescription.hasPrefix("ready as ") == true }
+          +        XCTAssertTrue(ready)
+          +        return socket
+          +    }
+          +
+          +    func testRelayOnlyReconnectKeepsTheRunningWDASession() async throws {
+          +        let (core, wda, host) = makeCore()
+          +        let first = FakeSockets()
+          +        core.start(socketFactory: first)
+          +        defer { core.stop() }
+          +        let old = try await readySocket(core, first)
+          +        let before = await core.call("look", [:])
+          +        XCTAssertFalse(before.isError)
+          +        XCTAssertEqual(wda.bodies("POST /session").count, 1)
+          +
+          +        let second = FakeSockets()
+          +        core.reconnectRelay(socketFactory: second)
+          +        let current = try await readySocket(core, second)
+          +        XCTAssertTrue(old.closed)
+          +        let body = (["jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": ["name": "look", "arguments": .object([:])]] as JSON).serialized()
+          +        current.push((["t": "req", "id": "after-reconnect", "method": "POST", "headers": ["content-type": "application/json"], "body": .string(body)] as JSON).serialized())
+          +        let answered = await eventually { current.sent.contains { $0.contains("after-reconnect") } }
+          +        XCTAssertTrue(answered)
+          +        let response = try JSON.parse(try XCTUnwrap(current.sent.first { $0.contains("after-reconnect") }))
+          +        XCTAssertEqual(response["status"], 200)
+          +        let result = try JSON.parse(try XCTUnwrap(response["body"]?.string))["result"]
+          +        XCTAssertEqual(result?["isError"], false)
+          +        XCTAssertEqual(result?["content"]?[1]?["type"], "image")
+          +        XCTAssertEqual(wda.bodies("POST /session").count, 1, "a relay reconnect must keep the WDA session")
+          +        XCTAssertEqual(host.restarts.value, 0, "a relay reconnect must not ask the host to restart")
+          +    }
+          +
+          +    func testLateEventsFromARetiredRelayCannotOverwriteTheNewConnection() async throws {
+          +        let (core, _, _) = makeCore()
+          +        var events = core.events.makeAsyncIterator()
+          +        let first = FakeSockets()
+          +        core.start(socketFactory: first)
+          +        defer { core.stop() }
+          +        _ = try await readySocket(core, first)
+          +        let retired = try XCTUnwrap(core.relay)
+          +        let second = FakeSockets()
+          +        core.reconnectRelay(socketFactory: second)
+          +        _ = try await readySocket(core, second)
+          +        // Simulate an old transport callback arriving after the new socket is ready.
+          +        retired.emit(.offline("late close from the old network"))
+          +        core.relay?.emit(.ready(url: "test-event-barrier"))
+          +        var sawBarrier = false
+          +        while let event = await events.next() {
+          +            XCTAssertNotEqual(event, .relay(.offline("late close from the old network")))
+          +            if event == .relay(.ready(url: "test-event-barrier")) { sawBarrier = true; break }
+          +        }
+          +        XCTAssertTrue(sawBarrier)
+          +    }
+          +
+               func testHandshakeRequestsAndKeepalive() async throws {
+                   let (core, _, _) = makeCore()
+                   let sockets = FakeSockets()
+          @@ -258,7 +320,7 @@ final class RelayTests: XCTestCase {
                    do { let ok = await eventually { !sockets.sockets.value.isEmpty }; XCTAssertTrue(ok) }
                    let socket = sockets.sockets.value[0]
                    let label = base32(FakeKey().publicKey)
@@ -140,7 +423,7 @@ jobs:
            
                    let nonce = Data(repeating: 7, count: 32)
                    socket.push((["t": "challenge", "nonce": .string(nonce.base64EncodedString())] as JSON).serialized())
-          @@ -271,7 +271,7 @@ final class RelayTests: XCTestCase {
+          @@ -271,7 +333,7 @@ final class RelayTests: XCTestCase {
                    XCTAssertEqual(hello["sig"]?.string, try FakeKey().sign(signed).base64EncodedString())
            
                    socket.push((["t": "ready", "max_body": 4_194_304] as JSON).serialized())
@@ -246,6 +529,110 @@ jobs:
            let seconds = args.count > 2 ? Double(args[2]) ?? 60 : 60
            
            struct Key: RelayKey {
+          diff --git a/native/launcher/include/poki_launcher.h b/native/launcher/include/poki_launcher.h
+          index 9336955..db21675 100644
+          --- a/native/launcher/include/poki_launcher.h
+          +++ b/native/launcher/include/poki_launcher.h
+          @@ -27,6 +27,12 @@ char *poki_launcher_status(PokiLauncher *launcher);
+           void poki_launcher_free(PokiLauncher *launcher);
+           void poki_string_free(char *text);
+           
+          +// Blocking diagnostic, up to 15 s; call off the UI thread. Does not launch/stop a runner.
+          +// config_json: {"address": "10.7.0.1|127.0.0.1|::1", "pairing_file": "..."}
+          +// JSON result: {"ok": bool, "address": "...", "stage": "...", "detail": "..."}.
+          +// Free the result with poki_string_free. No pairing keys are returned.
+          +char *poki_remote_probe(const char *config_json);
+          +
+           // config_json: {"host_name": "Poki", "out_path": "...", "identity_path": "..."}
+           // Events: {"event": "advertise", "service_type": "_remotepairing-pairable-host._tcp", "instance": "...",
+           //   "port": n, "txt": {...}} (publish it with Bonjour), {"event": "pin", "pin": "123456"},
+          diff --git a/native/launcher/src/lib.rs b/native/launcher/src/lib.rs
+          index 6bc0ece..0dc78f3 100644
+          --- a/native/launcher/src/lib.rs
+          +++ b/native/launcher/src/lib.rs
+          @@ -114,6 +114,46 @@ pub unsafe extern "C" fn poki_string_free(text: *mut c_char) {
+               }
+           }
+           
+          +/// Opens a fresh authenticated developer tunnel without starting or stopping a runner.
+          +/// Blocking (at most 15 seconds): the app calls this on a background thread.
+          +#[unsafe(no_mangle)]
+          +pub unsafe extern "C" fn poki_remote_probe(config_json: *const c_char) -> *mut c_char {
+          +    let value = match unsafe { read_str(config_json) } {
+          +        Some(text) => runtime().block_on(remote_probe(&text)),
+          +        None => serde_json::json!({"ok": false, "address": "", "stage": "config", "detail": "missing configuration"}),
+          +    };
+          +    CString::new(value.to_string()).expect("JSON contains no literal NUL").into_raw()
+          +}
+          +
+          +async fn remote_probe(text: &str) -> Value {
+          +    #[derive(serde::Deserialize)]
+          +    struct ProbeConfig { address: std::net::IpAddr, pairing_file: std::path::PathBuf }
+          +    let config: ProbeConfig = match serde_json::from_str(text) {
+          +        Ok(config) => config,
+          +        Err(_) => return serde_json::json!({"ok": false, "address": "", "stage": "config", "detail": "invalid configuration"}),
+          +    };
+          +    let address = config.address.to_string();
+          +    let fail = |stage: &str, detail: String| serde_json::json!({"ok": false, "address": address, "stage": stage, "detail": detail});
+          +    // Diagnostic targets are fixed local endpoints; never send pairing credentials to a remote host.
+          +    if !config.address.is_loopback() && config.address != std::net::IpAddr::from([10, 7, 0, 1]) {
+          +        return fail("config", "only loopback or 10.7.0.1 is allowed".into());
+          +    }
+          +    let (mut pairing, host) = match remote::read_pairing_file(&config.pairing_file, Some("Poki")) {
+          +        Ok(value) => value,
+          +        Err(_) => return fail("pairing_file", "the remote pairing file could not be read".into()),
+          +    };
+          +    let step = std::sync::Mutex::new(String::from("remote pairing connect"));
+          +    let result = tokio::time::timeout(std::time::Duration::from_secs(15),
+          +        remote::connect(config.address, &mut pairing, &host, |stage| *step.lock().unwrap() = stage.into())
+          +    ).await;
+          +    match result {
+          +        // The new test connection is dropped here. The existing launcher's Device is untouched.
+          +        Ok(Ok(_connection)) => serde_json::json!({"ok": true, "address": address, "stage": "RSD verified", "detail": "pair-verify, TLS tunnel and RSD handshake succeeded"}),
+          +        Ok(Err(error)) => fail(&format!("{:?}", error.stage), error.detail),
+          +        Err(_) => fail(&step.lock().unwrap(), "diagnostic timed out after 15 seconds".into()),
+          +    }
+          +}
+          +
+           pub struct PokiPairing {
+               task: tokio::task::JoinHandle<()>,
+           }
+          diff --git a/native/launcher/src/tests.rs b/native/launcher/src/tests.rs
+          index 4bd4c0a..a351726 100644
+          --- a/native/launcher/src/tests.rs
+          +++ b/native/launcher/src/tests.rs
+          @@ -31,6 +31,31 @@ fn config_defaults_to_the_loopback_and_local_runner() {
+               assert_eq!(config.wda_port, 8100);
+           }
+           
+          +#[test]
+          +fn remote_probe_rejects_remote_targets_before_reading_pairing_keys() {
+          +    for address in ["8.8.8.8", "192.168.1.2", "10.7.0.2"] {
+          +        let result = runtime().block_on(remote_probe(&json!({"address": address, "pairing_file": "/not-read"}).to_string()));
+          +        assert_eq!(result["ok"], false);
+          +        assert_eq!(result["stage"], "config");
+          +    }
+          +    for address in ["10.7.0.1", "127.0.0.1", "::1"] {
+          +        let result = runtime().block_on(remote_probe(&json!({"address": address, "pairing_file": "/not-present"}).to_string()));
+          +        assert_eq!(result["stage"], "pairing_file");
+          +        assert!(!result.to_string().contains("/not-present"));
+          +    }
+          +}
+          +
+          +#[test]
+          +fn remote_probe_distinguishes_tcp_refusal_from_pair_verification() {
+          +    let path = temp("probe-pairing.plist");
+          +    std::fs::write(&path, RpPairingFile::generate("Poki").to_bytes()).unwrap();
+          +    // The host test has no device pairing service on localhost:49152.
+          +    let result = runtime().block_on(remote_probe(&json!({"address": "127.0.0.1", "pairing_file": path}).to_string()));
+          +    assert_eq!(result["ok"], false);
+          +    assert_eq!(result["stage"], "Connect");
+          +    std::fs::remove_file(path).unwrap();
+          +}
+          +
+           #[test]
+           fn pairing_files_of_either_kind_are_told_apart() {
+               let path = temp("rp.plist");
           DUO_PATCH
           git apply --check "$RUNNER_TEMP/duo-selfhost.patch"
           git apply "$RUNNER_TEMP/duo-selfhost.patch"
@@ -293,6 +680,41 @@ jobs:
                paths: [native/ios-app/**, native/ios/**, native/launcher/**, native/patches/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
            
            permissions:
+          diff --git a/native/ios-app/Poki/App/AppModel.swift b/native/ios-app/Poki/App/AppModel.swift
+          index b54f97c..c1e6637 100644
+          --- a/native/ios-app/Poki/App/AppModel.swift
+          +++ b/native/ios-app/Poki/App/AppModel.swift
+          @@ -171,6 +171,13 @@ final class AppModel {
+           
+               func restartRunner() { launcher.restart() }
+           
+          +    /// Restores the internet connection without closing the phone's developer tunnel.
+          +    func reconnectAgent() {
+          +        guard sessionOn, activityText == "Idle", approvals.isEmpty else { return }
+          +        log.add("relay", "owner requested agent reconnect; keeping the runner")
+          +        core.reconnectRelay()
+          +    }
+          +
+               private func launchRunner() {
+                   guard let launcherConfig else { return }
+                   do {
+          diff --git a/native/ios-app/Poki/App/HomeView.swift b/native/ios-app/Poki/App/HomeView.swift
+          index f6ce4dd..9d84799 100644
+          --- a/native/ios-app/Poki/App/HomeView.swift
+          +++ b/native/ios-app/Poki/App/HomeView.swift
+          @@ -92,6 +92,12 @@ private struct HeroCard: View {
+                       }
+                       .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
+                       .tint(model.sessionOn ? Color.white.opacity(0.22) : Color.white)
+          +            if model.sessionOn {
+          +                Button("Reconnect Agent") { model.reconnectAgent() }
+          +                    .font(.subheadline.weight(.semibold))
+          +                    .disabled(model.activityText != "Idle" || !model.approvals.isEmpty)
+          +                    .accessibilityHint("Reconnects the relay while keeping the runner running.")
+          +            }
+                   }
+                   .foregroundStyle(.white)
+                   .padding(18)
           diff --git a/native/ios-app/Poki/Connect/RelayIdentity.swift b/native/ios-app/Poki/Connect/RelayIdentity.swift
           index b0c2212..36599bf 100644
           --- a/native/ios-app/Poki/Connect/RelayIdentity.swift
@@ -306,6 +728,110 @@ jobs:
                private static let keyAccount = "relay.ed25519"
                private static let secretsAccount = "relay.secrets"
            
+          diff --git a/native/ios-app/Poki/Debug/ProbeView.swift b/native/ios-app/Poki/Debug/ProbeView.swift
+          index 4e2daaf..ece4808 100644
+          --- a/native/ios-app/Poki/Debug/ProbeView.swift
+          +++ b/native/ios-app/Poki/Debug/ProbeView.swift
+          @@ -1,10 +1,13 @@
+           import SwiftUI
+           
+           struct ProbeView: View {
+          +    @Environment(AppModel.self) private var model
+               @State private var results: [ProbeResult] = []
+               @State private var running = false
+               @State private var addresses: [LocalAddress] = localAddresses()
+               @StateObject private var hold = Hold()
+          +    @State private var tunnelResults: [TunnelProbeResult] = []
+          +    @State private var checkingTunnel = false
+           
+               var body: some View {
+                   NavigationStack {
+          @@ -30,6 +33,22 @@ struct ProbeView: View {
+                               }
+                               Button(running ? "Running…" : "Run checks") { Task { await run() } }.disabled(running)
+                           }
+          +                Section {
+          +                    Button(checkingTunnel ? "Testing pairing and tunnel…" : "Test pairing and tunnel") {
+          +                        Task { await checkTunnel() }
+          +                    }.disabled(checkingTunnel || model.pairingPath == nil)
+          +                    ForEach(tunnelResults.indices, id: \.self) { index in
+          +                        let result = tunnelResults[index]
+          +                        VStack(alignment: .leading, spacing: 4) {
+          +                            Text("\(result.address): \(result.ok ? "Verified" : result.stage)").font(.headline)
+          +                            Text(result.detail).font(.caption.monospaced()).textSelection(.enabled)
+          +                        }
+          +                    }
+          +                } header: {
+          +                    Text("Developer tunnel check")
+          +                } footer: {
+          +                    Text("Tests a fresh pairing handshake, TLS tunnel and RSD connection, then closes that test connection. Keeps the current runner running. TCP connected alone does not count as success.")
+          +                }
+                           Section("Background hold") {
+                               LabeledContent("Port on 10.7.0.1") {
+                                   TextField("49152", text: $hold.port).keyboardType(.numberPad).multilineTextAlignment(.trailing).monospacedDigit()
+          @@ -61,6 +80,18 @@ struct ProbeView: View {
+                   results = await runChecks()
+                   running = false
+               }
+          +
+          +    private func checkTunnel() async {
+          +        guard !checkingTunnel, let pairing = model.pairingPath else { return }
+          +        checkingTunnel = true
+          +        tunnelResults = []
+          +        for address in ["10.7.0.1", "127.0.0.1", "::1"] {
+          +            let result = await NativeTunnelProbe.run(address: address, pairingPath: pairing)
+          +            tunnelResults.append(result)
+          +            model.log.add("tunnel-probe", "\(address) \(result.ok ? "verified" : result.stage): \(result.detail)")
+          +        }
+          +        checkingTunnel = false
+          +    }
+           }
+           
+           /// Poki's log: copy it, share it, or read the last lines.
+          diff --git a/native/ios-app/Poki/Runtime/LiveCore.swift b/native/ios-app/Poki/Runtime/LiveCore.swift
+          index baff194..c0c3a0b 100644
+          --- a/native/ios-app/Poki/Runtime/LiveCore.swift
+          +++ b/native/ios-app/Poki/Runtime/LiveCore.swift
+          @@ -26,6 +26,7 @@ final class LiveCore: CoreSession {
+               deinit { pump?.cancel() }
+           
+               func start() { core.start() }
+          +    func reconnectRelay() { core.reconnectRelay() }
+               func stop() { core.stop(); continuation.yield(.relay(.off)) }
+               func resolveApproval(id: String, approved: Bool) { core.resolveApproval(id: id, approved: approved) }
+               func accessChanged() { core.accessChanged() }
+          diff --git a/native/ios-app/Poki/Runtime/RustLauncher.swift b/native/ios-app/Poki/Runtime/RustLauncher.swift
+          index d21af56..ed80440 100644
+          --- a/native/ios-app/Poki/Runtime/RustLauncher.swift
+          +++ b/native/ios-app/Poki/Runtime/RustLauncher.swift
+          @@ -1,5 +1,27 @@
+           import Foundation
+           
+          +struct TunnelProbeResult: Decodable, Sendable {
+          +    var ok: Bool
+          +    var address: String
+          +    var stage: String
+          +    var detail: String
+          +}
+          +
+          +enum NativeTunnelProbe {
+          +    static func run(address: String, pairingPath: String) async -> TunnelProbeResult {
+          +        let fallback = TunnelProbeResult(ok: false, address: address, stage: "diagnostic", detail: "The diagnostic returned no result.")
+          +        guard let data = try? JSONSerialization.data(withJSONObject: ["address": address, "pairing_file": pairingPath]),
+          +              let config = String(data: data, encoding: .utf8) else { return fallback }
+          +        return await Task.detached {
+          +            config.withCString { input in
+          +                guard let output = poki_remote_probe(input) else { return fallback }
+          +                defer { poki_string_free(output) }
+          +                return (try? JSONDecoder().decode(TunnelProbeResult.self, from: Data(String(cString: output).utf8))) ?? fallback
+          +            }
+          +        }.value
+          +    }
+          +}
+          +
+           /// PokiLauncher (Rust, native/launcher) through its C ABI: gets the runner up over the loopback and
+           /// keeps it up. Events arrive on a launcher thread as JSON.
+           final class RustLauncher: RunnerLauncher {
           diff --git a/native/ios-app/Shared/PokiActivityAttributes.swift b/native/ios-app/Shared/PokiActivityAttributes.swift
           index 63eecaf..554ca6f 100644
           --- a/native/ios-app/Shared/PokiActivityAttributes.swift
@@ -333,7 +859,7 @@ jobs:
                static var thumbnailURL: URL? { url?.appendingPathComponent("activity-thumbnail.jpg") }
                static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
           diff --git a/native/ios-app/project.yml b/native/ios-app/project.yml
-          index 9c8d321..e3ea280 100644
+          index 9c8d321..5fc9cd3 100644
           --- a/native/ios-app/project.yml
           +++ b/native/ios-app/project.yml
           @@ -14,7 +14,7 @@ packages:
@@ -341,12 +867,12 @@ jobs:
              base:
                MARKETING_VERSION: "0.1.0"
           -    CURRENT_PROJECT_VERSION: "1"
-          +    CURRENT_PROJECT_VERSION: "3"
+          +    CURRENT_PROJECT_VERSION: "4"
                SWIFT_VERSION: "5.0"
                TARGETED_DEVICE_FAMILY: "1"
                DEBUG_INFORMATION_FORMAT: dwarf
           diff --git a/native/ios/PokiCore/Sources/PokiCore/Core.swift b/native/ios/PokiCore/Sources/PokiCore/Core.swift
-          index a7d4ff6..610175a 100644
+          index a7d4ff6..d72fe70 100644
           --- a/native/ios/PokiCore/Sources/PokiCore/Core.swift
           +++ b/native/ios/PokiCore/Sources/PokiCore/Core.swift
           @@ -17,7 +17,7 @@ public struct CoreConfig: Sendable {
@@ -358,6 +884,81 @@ jobs:
                    self.relayURL = relayURL
                    self.runnerURL = runnerURL
                    self.sensitive = sensitive
+          @@ -131,6 +131,7 @@ public final class PokiCore: @unchecked Sendable {
+               private let gate = Gate()
+               private let sessions = LockedBox<Set<String>>([])
+               var relay: RelayClient?
+          +    private let relayGeneration = LockedBox(0)
+           
+               public init(config: CoreConfig, host: CoreHost, transport: HTTPTransport = URLSessionTransport()) {
+                   self.config = config
+          @@ -153,16 +154,32 @@ public final class PokiCore: @unchecked Sendable {
+           
+               public func start(socketFactory: WebSocketFactory = URLSessionWebSocketFactory()) {
+                   guard relay == nil, let host else { return }
+          +        let generation = relayGeneration.update { $0 += 1; return $0 }
+                   let client = RelayClient(baseURL: config.relayURL, host: host, factory: socketFactory, handler: { [weak self] request in
+                       await self?.handle(request) ?? RelayResponse(id: request.id, status: 503, headers: [:], body: "")
+          -        }, emit: { [weak self] in self?.emit(.relay($0)) })
+          +        }, emit: { [weak self] state in
+          +            guard let self else { return }
+          +            self.relayGeneration.update { current in
+          +                if current == generation { self.emit(.relay(state)) }
+          +            }
+          +        })
+                   relay = client
+                   client.start()
+               }
+           
+               public func stop() {
+          -        relay?.stop()
+          -        relay = nil
+          +        guard let relay else { return }
+          +        relayGeneration.update { $0 += 1 }
+          +        relay.stop()
+          +        self.relay = nil
+          +        emit(.relay(.offline("stopped")))
+          +    }
+          +
+          +    /// Replaces only the internet connection. Keeps the runner, WDA session and MCP state.
+          +    public func reconnectRelay(socketFactory: WebSocketFactory = URLSessionWebSocketFactory()) {
+          +        guard relay != nil else { return }
+          +        stop()
+          +        start(socketFactory: socketFactory)
+               }
+           
+               /// The connector secrets changed: tell the relay the new list.
+          diff --git a/native/ios/PokiCore/Sources/PokiCore/Relay.swift b/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          index 239285e..30a22e8 100644
+          --- a/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          +++ b/native/ios/PokiCore/Sources/PokiCore/Relay.swift
+          @@ -103,6 +103,7 @@ final class RelayClient: @unchecked Sendable {
+                           do {
+                               try await self.session { attempt = 0 }
+                           } catch {
+          +                    guard self.state.value.running, !Task.isCancelled else { break }
+                               self.set("offline: \(error)", .offline("\(error)"))
+                           }
+                           guard self.state.value.running else { break }
+          @@ -146,6 +147,10 @@ final class RelayClient: @unchecked Sendable {
+                   let label = base32(key.publicKey)
+                   let url = URL(string: "\(baseURL.absoluteString)/\(label)/connect")!
+                   let socket = try await withDeadline(15, "connecting to the relay") { [factory] in try await factory.connect(to: url) }
+          +        guard state.value.running, !Task.isCancelled else {
+          +            socket.close(code: 1000, reason: "stopped")
+          +            throw CancellationError()
+          +        }
+                   state.update { $0.socket = socket; $0.lastHeard = now() }
+                   defer {
+                       let inflight = state.update { s -> [Task<Void, Never>] in
+          @@ -169,6 +174,7 @@ final class RelayClient: @unchecked Sendable {
+                   try await socket.send(hello.serialized())
+                   let ready = try JSON.parse(try await withDeadline(15, "the relay's ready") { try await socket.receive() })
+                   guard ready["t"]?.string == "ready" else { throw RelayFailure("the relay refused the phone: \(ready["reason"]?.string ?? ready.serialized())") }
+          +        guard state.value.running, !Task.isCancelled else { throw CancellationError() }
+                   state.update { $0.maxBody = ready["max_body"]?.int ?? (4 << 20); $0.lastHeard = now() }
+                   onReady()
+                   set("ready as \(label)", .ready(url: "\(baseURL.absoluteString)/\(label)"))
           diff --git a/native/ios/PokiCore/Sources/PokiCore/Runner.swift b/native/ios/PokiCore/Sources/PokiCore/Runner.swift
           index c41f7e9..97f9333 100644
           --- a/native/ios/PokiCore/Sources/PokiCore/Runner.swift
@@ -383,10 +984,79 @@ jobs:
                            return id
                        }
           diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
-          index 8cbbfe5..4d113f6 100644
+          index 8cbbfe5..b9d566d 100644
           --- a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
           +++ b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
-          @@ -258,7 +258,7 @@ final class RelayTests: XCTestCase {
+          @@ -248,6 +248,68 @@ final class MCPTests: XCTestCase {
+           }
+           
+           final class RelayTests: XCTestCase {
+          +    private func readySocket(_ core: PokiCore, _ factory: FakeSockets) async throws -> FakeSocket {
+          +        let connected = await eventually { !factory.sockets.value.isEmpty }
+          +        XCTAssertTrue(connected)
+          +        let socket = try XCTUnwrap(factory.sockets.value.first)
+          +        socket.push((["t": "challenge", "nonce": .string(Data(repeating: 2, count: 32).base64EncodedString())] as JSON).serialized())
+          +        let hello = await eventually { !socket.sent.isEmpty }
+          +        XCTAssertTrue(hello)
+          +        socket.push((["t": "ready"] as JSON).serialized())
+          +        let ready = await eventually { core.relay?.stateDescription.hasPrefix("ready as ") == true }
+          +        XCTAssertTrue(ready)
+          +        return socket
+          +    }
+          +
+          +    func testRelayOnlyReconnectKeepsTheRunningWDASession() async throws {
+          +        let (core, wda, host) = makeCore()
+          +        let first = FakeSockets()
+          +        core.start(socketFactory: first)
+          +        defer { core.stop() }
+          +        let old = try await readySocket(core, first)
+          +        let before = await core.call("look", [:])
+          +        XCTAssertFalse(before.isError)
+          +        XCTAssertEqual(wda.bodies("POST /session").count, 1)
+          +
+          +        let second = FakeSockets()
+          +        core.reconnectRelay(socketFactory: second)
+          +        let current = try await readySocket(core, second)
+          +        XCTAssertTrue(old.closed)
+          +        let body = (["jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": ["name": "look", "arguments": .object([:])]] as JSON).serialized()
+          +        current.push((["t": "req", "id": "after-reconnect", "method": "POST", "headers": ["content-type": "application/json"], "body": .string(body)] as JSON).serialized())
+          +        let answered = await eventually { current.sent.contains { $0.contains("after-reconnect") } }
+          +        XCTAssertTrue(answered)
+          +        let response = try JSON.parse(try XCTUnwrap(current.sent.first { $0.contains("after-reconnect") }))
+          +        XCTAssertEqual(response["status"], 200)
+          +        let result = try JSON.parse(try XCTUnwrap(response["body"]?.string))["result"]
+          +        XCTAssertEqual(result?["isError"], false)
+          +        XCTAssertEqual(result?["content"]?[1]?["type"], "image")
+          +        XCTAssertEqual(wda.bodies("POST /session").count, 1, "a relay reconnect must keep the WDA session")
+          +        XCTAssertEqual(host.restarts.value, 0, "a relay reconnect must not ask the host to restart")
+          +    }
+          +
+          +    func testLateEventsFromARetiredRelayCannotOverwriteTheNewConnection() async throws {
+          +        let (core, _, _) = makeCore()
+          +        var events = core.events.makeAsyncIterator()
+          +        let first = FakeSockets()
+          +        core.start(socketFactory: first)
+          +        defer { core.stop() }
+          +        _ = try await readySocket(core, first)
+          +        let retired = try XCTUnwrap(core.relay)
+          +        let second = FakeSockets()
+          +        core.reconnectRelay(socketFactory: second)
+          +        _ = try await readySocket(core, second)
+          +        // Simulate an old transport callback arriving after the new socket is ready.
+          +        retired.emit(.offline("late close from the old network"))
+          +        core.relay?.emit(.ready(url: "test-event-barrier"))
+          +        var sawBarrier = false
+          +        while let event = await events.next() {
+          +            XCTAssertNotEqual(event, .relay(.offline("late close from the old network")))
+          +            if event == .relay(.ready(url: "test-event-barrier")) { sawBarrier = true; break }
+          +        }
+          +        XCTAssertTrue(sawBarrier)
+          +    }
+          +
+               func testHandshakeRequestsAndKeepalive() async throws {
+                   let (core, _, _) = makeCore()
+                   let sockets = FakeSockets()
+          @@ -258,7 +320,7 @@ final class RelayTests: XCTestCase {
                    do { let ok = await eventually { !sockets.sockets.value.isEmpty }; XCTAssertTrue(ok) }
                    let socket = sockets.sockets.value[0]
                    let label = base32(FakeKey().publicKey)
@@ -395,7 +1065,7 @@ jobs:
            
                    let nonce = Data(repeating: 7, count: 32)
                    socket.push((["t": "challenge", "nonce": .string(nonce.base64EncodedString())] as JSON).serialized())
-          @@ -271,7 +271,7 @@ final class RelayTests: XCTestCase {
+          @@ -271,7 +333,7 @@ final class RelayTests: XCTestCase {
                    XCTAssertEqual(hello["sig"]?.string, try FakeKey().sign(signed).base64EncodedString())
            
                    socket.push((["t": "ready", "max_body": 4_194_304] as JSON).serialized())
@@ -501,6 +1171,110 @@ jobs:
            let seconds = args.count > 2 ? Double(args[2]) ?? 60 : 60
            
            struct Key: RelayKey {
+          diff --git a/native/launcher/include/poki_launcher.h b/native/launcher/include/poki_launcher.h
+          index 9336955..db21675 100644
+          --- a/native/launcher/include/poki_launcher.h
+          +++ b/native/launcher/include/poki_launcher.h
+          @@ -27,6 +27,12 @@ char *poki_launcher_status(PokiLauncher *launcher);
+           void poki_launcher_free(PokiLauncher *launcher);
+           void poki_string_free(char *text);
+           
+          +// Blocking diagnostic, up to 15 s; call off the UI thread. Does not launch/stop a runner.
+          +// config_json: {"address": "10.7.0.1|127.0.0.1|::1", "pairing_file": "..."}
+          +// JSON result: {"ok": bool, "address": "...", "stage": "...", "detail": "..."}.
+          +// Free the result with poki_string_free. No pairing keys are returned.
+          +char *poki_remote_probe(const char *config_json);
+          +
+           // config_json: {"host_name": "Poki", "out_path": "...", "identity_path": "..."}
+           // Events: {"event": "advertise", "service_type": "_remotepairing-pairable-host._tcp", "instance": "...",
+           //   "port": n, "txt": {...}} (publish it with Bonjour), {"event": "pin", "pin": "123456"},
+          diff --git a/native/launcher/src/lib.rs b/native/launcher/src/lib.rs
+          index 6bc0ece..0dc78f3 100644
+          --- a/native/launcher/src/lib.rs
+          +++ b/native/launcher/src/lib.rs
+          @@ -114,6 +114,46 @@ pub unsafe extern "C" fn poki_string_free(text: *mut c_char) {
+               }
+           }
+           
+          +/// Opens a fresh authenticated developer tunnel without starting or stopping a runner.
+          +/// Blocking (at most 15 seconds): the app calls this on a background thread.
+          +#[unsafe(no_mangle)]
+          +pub unsafe extern "C" fn poki_remote_probe(config_json: *const c_char) -> *mut c_char {
+          +    let value = match unsafe { read_str(config_json) } {
+          +        Some(text) => runtime().block_on(remote_probe(&text)),
+          +        None => serde_json::json!({"ok": false, "address": "", "stage": "config", "detail": "missing configuration"}),
+          +    };
+          +    CString::new(value.to_string()).expect("JSON contains no literal NUL").into_raw()
+          +}
+          +
+          +async fn remote_probe(text: &str) -> Value {
+          +    #[derive(serde::Deserialize)]
+          +    struct ProbeConfig { address: std::net::IpAddr, pairing_file: std::path::PathBuf }
+          +    let config: ProbeConfig = match serde_json::from_str(text) {
+          +        Ok(config) => config,
+          +        Err(_) => return serde_json::json!({"ok": false, "address": "", "stage": "config", "detail": "invalid configuration"}),
+          +    };
+          +    let address = config.address.to_string();
+          +    let fail = |stage: &str, detail: String| serde_json::json!({"ok": false, "address": address, "stage": stage, "detail": detail});
+          +    // Diagnostic targets are fixed local endpoints; never send pairing credentials to a remote host.
+          +    if !config.address.is_loopback() && config.address != std::net::IpAddr::from([10, 7, 0, 1]) {
+          +        return fail("config", "only loopback or 10.7.0.1 is allowed".into());
+          +    }
+          +    let (mut pairing, host) = match remote::read_pairing_file(&config.pairing_file, Some("Poki")) {
+          +        Ok(value) => value,
+          +        Err(_) => return fail("pairing_file", "the remote pairing file could not be read".into()),
+          +    };
+          +    let step = std::sync::Mutex::new(String::from("remote pairing connect"));
+          +    let result = tokio::time::timeout(std::time::Duration::from_secs(15),
+          +        remote::connect(config.address, &mut pairing, &host, |stage| *step.lock().unwrap() = stage.into())
+          +    ).await;
+          +    match result {
+          +        // The new test connection is dropped here. The existing launcher's Device is untouched.
+          +        Ok(Ok(_connection)) => serde_json::json!({"ok": true, "address": address, "stage": "RSD verified", "detail": "pair-verify, TLS tunnel and RSD handshake succeeded"}),
+          +        Ok(Err(error)) => fail(&format!("{:?}", error.stage), error.detail),
+          +        Err(_) => fail(&step.lock().unwrap(), "diagnostic timed out after 15 seconds".into()),
+          +    }
+          +}
+          +
+           pub struct PokiPairing {
+               task: tokio::task::JoinHandle<()>,
+           }
+          diff --git a/native/launcher/src/tests.rs b/native/launcher/src/tests.rs
+          index 4bd4c0a..a351726 100644
+          --- a/native/launcher/src/tests.rs
+          +++ b/native/launcher/src/tests.rs
+          @@ -31,6 +31,31 @@ fn config_defaults_to_the_loopback_and_local_runner() {
+               assert_eq!(config.wda_port, 8100);
+           }
+           
+          +#[test]
+          +fn remote_probe_rejects_remote_targets_before_reading_pairing_keys() {
+          +    for address in ["8.8.8.8", "192.168.1.2", "10.7.0.2"] {
+          +        let result = runtime().block_on(remote_probe(&json!({"address": address, "pairing_file": "/not-read"}).to_string()));
+          +        assert_eq!(result["ok"], false);
+          +        assert_eq!(result["stage"], "config");
+          +    }
+          +    for address in ["10.7.0.1", "127.0.0.1", "::1"] {
+          +        let result = runtime().block_on(remote_probe(&json!({"address": address, "pairing_file": "/not-present"}).to_string()));
+          +        assert_eq!(result["stage"], "pairing_file");
+          +        assert!(!result.to_string().contains("/not-present"));
+          +    }
+          +}
+          +
+          +#[test]
+          +fn remote_probe_distinguishes_tcp_refusal_from_pair_verification() {
+          +    let path = temp("probe-pairing.plist");
+          +    std::fs::write(&path, RpPairingFile::generate("Poki").to_bytes()).unwrap();
+          +    // The host test has no device pairing service on localhost:49152.
+          +    let result = runtime().block_on(remote_probe(&json!({"address": "127.0.0.1", "pairing_file": path}).to_string()));
+          +    assert_eq!(result["ok"], false);
+          +    assert_eq!(result["stage"], "Connect");
+          +    std::fs::remove_file(path).unwrap();
+          +}
+          +
+           #[test]
+           fn pairing_files_of_either_kind_are_told_apart() {
+               let path = temp("rp.plist");
           DUO_PATCH
           git apply --check "$RUNNER_TEMP/duo-selfhost.patch"
           git apply "$RUNNER_TEMP/duo-selfhost.patch"
@@ -521,6 +1295,7 @@ jobs:
           git -C .deps/idevice apply ../../native/patches/idevice-xctest-run-over-rsd.patch
           rustup update stable --no-self-update && rustup default stable
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          cargo test --release --locked --lib --manifest-path native/launcher/Cargo.toml
           cargo build --release --locked --target aarch64-apple-ios --manifest-path native/launcher/Cargo.toml
           cargo build --release --locked --target aarch64-apple-ios-sim --manifest-path native/launcher/Cargo.toml
           ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
