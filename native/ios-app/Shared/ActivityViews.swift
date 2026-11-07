@@ -125,10 +125,10 @@ struct LockScreenView: View {
     var body: some View {
         Group {
             switch state.phase {
-            case .approval: ApprovalCard(state: state, island: false)
-            case .pairing: PairingCard(state: state, island: false)
-            case .setup: SetupCard(state: state, island: false)
-            default: RunCard(state: state)
+            case .approval: ActivityApprovalCard(state: state, island: false)
+            case .pairing: ActivityPairingCard(state: state, island: false)
+            case .setup: ActivitySetupCard(state: state, island: false)
+            default: ActivityRunCard(state: state)
             }
         }
         .foregroundStyle(.white)
@@ -183,7 +183,7 @@ struct StatusPill: View {
 // MARK: Working, done, idle, problem
 
 /// The Lock Screen card for a run (working, done) and the quiet phases (ready, idle, problem).
-struct RunCard: View {
+struct ActivityRunCard: View {
     var state: PokiState
 
     private var tall: Bool { state.phase == .working || state.phase == .done }
@@ -347,7 +347,7 @@ struct PhaseGlyph: View {
 /// The approval card: what the agent wants to do, the time left draining, and Deny / Allow full width.
 /// The same card is the island's large pop-up (without the header, which the island's own top row
 /// replaces).
-struct ApprovalCard: View {
+struct ActivityApprovalCard: View {
     var state: PokiState
     var island: Bool
 
@@ -366,7 +366,7 @@ struct ApprovalCard: View {
                 ApprovalButtons(approval: approval).padding(.top, 10)
             }
         } else {
-            RunCard(state: state)
+            ActivityRunCard(state: state)
         }
     }
 }
@@ -432,7 +432,7 @@ struct ApprovalButtons: View {
 
 // MARK: Pairing
 
-struct PairingCard: View {
+struct ActivityPairingCard: View {
     var state: PokiState
     var island: Bool
 
@@ -463,7 +463,7 @@ struct PairingCard: View {
 
 // MARK: Setup
 
-struct SetupCard: View {
+struct ActivitySetupCard: View {
     var state: PokiState
     var island: Bool
 
@@ -483,7 +483,7 @@ struct SetupCard: View {
                 .padding(.top, 10)
             }
         } else {
-            RunCard(state: state)
+            ActivityRunCard(state: state)
         }
     }
 }
@@ -554,9 +554,9 @@ struct IslandBottom: View {
     var body: some View {
         Group {
             switch state.phase {
-            case .approval: ApprovalCard(state: state, island: true)
-            case .pairing: PairingCard(state: state, island: true)
-            case .setup: SetupCard(state: state, island: true)
+            case .approval: ActivityApprovalCard(state: state, island: true)
+            case .pairing: ActivityPairingCard(state: state, island: true)
+            case .setup: ActivitySetupCard(state: state, island: true)
             default: IslandSmall(state: state)
             }
         }
