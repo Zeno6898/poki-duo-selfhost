@@ -44,7 +44,7 @@ struct PokiActivityAttributes: ActivityAttributes {
         var event: Event?
     }
     struct Event: Codable, Hashable {
-        enum Kind: String, Codable, Hashable { case started, app, finished, approved, denied, expired, problem, paired, code }
+        enum Kind: String, Codable, Hashable { case started, app, step, finished, approved, denied, expired, problem, paired, code }
         var kind: Kind
         var text: String
     }

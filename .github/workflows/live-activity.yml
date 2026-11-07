@@ -74,7 +74,7 @@ jobs:
           # 1. The app's preview of each phase, in light and dark.
           for look in dark light; do
             xcrun simctl ui "$UDID" appearance "$look"
-            for s in start working approval done ready idle problem pairing code setup; do
+            for s in start working step approval done ready idle problem pairing code setup; do
               xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
               xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityState "$s" > /dev/null
               sleep 3
@@ -84,7 +84,7 @@ jobs:
           xcrun simctl ui "$UDID" appearance dark
           osascript -e 'tell application "Simulator" to activate' || true
           # 2. Real Live Activities: compact island, the alert's expanded island, then the Lock Screen.
-          for s in working approval code done setup problem ready; do
+          for s in working step approval code done setup problem ready; do
             xcrun simctl terminate "$UDID" nz.zheha.poki > /dev/null 2>&1 || true
             xcrun simctl launch "$UDID" nz.zheha.poki -pokiScreen activity -pokiActivityDemo "$s" > /dev/null
             sleep 2

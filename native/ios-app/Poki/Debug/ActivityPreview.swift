@@ -29,7 +29,7 @@ struct ActivityPreview: View {
             .padding(.vertical).padding(.horizontal, 16)
             .frame(maxWidth: .infinity)
         }
-        .background(LinearGradient(colors: [Color(red: 0.32, green: 0.36, blue: 0.55), Color(red: 0.75, green: 0.55, blue: 0.5)], startPoint: .top, endPoint: .bottom).ignoresSafeArea())
+        .background(Color(red: 0.36, green: 0.40, blue: 0.56).ignoresSafeArea())
         .navigationTitle("Live Activity")
         .navigationBarTitleDisplayMode(.inline)
         .task {
@@ -51,8 +51,14 @@ struct ActivityPreview: View {
         working.app = "WeChat"
         working.since = now.addingTimeInterval(-42)
         working.stepCount = 6; working.failedCount = 1
-        working.steps = [.init(text: "Type “On my way” in the message box", ok: true), .init(text: "Tap at 212, 640", ok: false)]
+        working.steps = [.init(text: "Type “On my way” in the message box", ok: true), .init(text: "Tap the Send button", ok: true)]
         working.event = .init(kind: .app, text: "Now in WeChat")
+
+        var step = working
+        step.event = nil
+        step.headline = "Scroll down the chat list"
+        step.stepCount = 7
+        step.steps.append(.init(text: "Tap “Send”", ok: true))
 
         var approval = PokiState(phase: .approval, headline: "Allow this step?", thumbnailVersion: 1)
         approval.app = "Messages"
@@ -82,7 +88,7 @@ struct ActivityPreview: View {
         var setup = PokiState(phase: .setup, headline: "Setting up Poki", thumbnailVersion: 0)
         setup.guide = .init(number: 2, count: 6, title: SetupStep.developerMode.title, hint: SetupStep.developerMode.hint)
 
-        return [("start", start), ("working", working), ("approval", approval), ("done", done), ("ready", ready), ("idle", idle),
+        return [("start", start), ("working", working), ("step", step), ("approval", approval), ("done", done), ("ready", ready), ("idle", idle),
                 ("problem", problem), ("pairing", pairWait), ("code", pairCode), ("setup", setup)]
     }()
 
@@ -112,9 +118,9 @@ private struct LockScreenFrame: View {
     var state: PokiState
     var body: some View {
         LockScreenView(state: state)
-            .padding(.horizontal, 14).padding(.vertical, 12)
+            .padding(.horizontal, LockInsets.horizontal).padding(.vertical, LockInsets.vertical)
             .frame(maxWidth: 371)
-            .background(Brand.night.opacity(0.94), in: .rect(cornerRadius: 24, style: .continuous))
+            .background(Brand.night, in: .rect(cornerRadius: 28, style: .continuous))
             .overlay(alignment: .bottomTrailing) { HeightBadge() }
             .environment(\.colorScheme, .dark)
     }
@@ -125,19 +131,19 @@ private struct LockScreenFrame: View {
 private struct IslandExpandedFrame: View {
     var state: PokiState
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             HStack(alignment: .center) {
-                IslandLeading(state: state).frame(height: 36)
+                IslandLeading(state: state).frame(height: 40)
                 Spacer(minLength: 120)
-                IslandTrailing(state: state).frame(height: 36)
+                IslandTrailing(state: state).frame(height: 40)
             }
             IslandBottom(state: state)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 16)
+        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 14)
         .frame(maxWidth: 371)
         .background(.black, in: .rect(cornerRadius: 44, style: .continuous))
-        .overlay(alignment: .top) { Capsule().fill(Color(white: 0.08)).frame(width: 120, height: 36).padding(.top, 11) }
+        .overlay(alignment: .top) { Capsule().fill(Color(white: 0.08)).frame(width: 120, height: 36).padding(.top, 14) }
         .environment(\.colorScheme, .dark)
     }
 }

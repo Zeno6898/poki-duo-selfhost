@@ -18,8 +18,8 @@ struct PokiLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: PokiActivityAttributes.self) { context in
             LockScreenView(state: context.shown)
-                .padding(.horizontal, 14).padding(.vertical, 12)
-                .activityBackgroundTint(Brand.night.opacity(0.94))
+                .padding(.horizontal, LockInsets.horizontal).padding(.vertical, LockInsets.vertical)
+                .activityBackgroundTint(Brand.night)
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             let state = context.shown
@@ -35,7 +35,8 @@ struct PokiLiveActivity: Widget {
                 MinimalView(state: state)
             }
             .keylineTint(state.accent)
-            .contentMargins(.horizontal, 14, for: .expanded)
+            .contentMargins(.horizontal, 16, for: .expanded)
+            .contentMargins(.bottom, 14, for: .expanded)
         }
     }
 }
