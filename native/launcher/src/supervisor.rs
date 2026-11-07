@@ -155,7 +155,14 @@ impl Launcher {
                 None => {
                     // Stopped: end the runner now. Left alone it lives on for about 30 s after the
                     // developer connection closes, with iOS's automation banner on screen.
-                    let _ = tokio::time::timeout(Duration::from_secs(6), Self::end_runner(&self.config)).await;
+                    // The outcome goes in the status (and the app's log): "ended 1 runner process" or why not.
+                    let detail = match tokio::time::timeout(Duration::from_secs(6), Self::end_runner(&self.config)).await {
+                        Ok(Ok(0)) => "no runner process was running".to_string(),
+                        Ok(Ok(n)) => format!("ended {n} runner process{}", if n == 1 { "" } else { "es" }),
+                        Ok(Err(why)) => format!("could not end the runner: {why}"),
+                        Err(_) => "could not end the runner: the developer services did not answer in 6 s".to_string(),
+                    };
+                    self.set("idle", 0, json!({"detail": detail}));
                     return;
                 }
             }
@@ -170,11 +177,11 @@ impl Launcher {
         }
     }
 
-    /// Ends the runner's process through the developer services (best effort).
-    async fn end_runner(config: &Config) {
-        let Ok(mut pairing) = Pairing::read(&config.pairing_file, config.host_name.as_deref()) else { return };
-        let Ok(mut device) = Device::open(config.device_address, &mut pairing, Duration::from_secs(4)).await else { return };
-        let _ = launch::end(&mut device).await;
+    /// Ends the runner's process through the developer services. How many were ended, or why not.
+    async fn end_runner(config: &Config) -> std::result::Result<usize, String> {
+        let mut pairing = Pairing::read(&config.pairing_file, config.host_name.as_deref()).map_err(|e| e.detail)?;
+        let mut device = Device::open(config.device_address, &mut pairing, Duration::from_secs(4)).await.map_err(|e| e.detail)?;
+        launch::end(&mut device).await.map_err(|e| e.to_string())
     }
 
     /// One launch and the watch over it. Ok when a running runner later stopped answering.

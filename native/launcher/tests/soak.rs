@@ -84,9 +84,10 @@ fn stop_goes_idle_at_once_even_while_an_attempt_hangs() {
     launcher.stop();
     assert_eq!(launcher.status()["state"], "idle");
     assert!(asked.elapsed() < Duration::from_millis(200), "stop took {:?}", asked.elapsed());
-    // After stop, nothing more is attempted (the thread ends; its runner cleanup is bounded at 6 s).
+    // After stop, nothing more is attempted (the thread ends; its runner cleanup is bounded at 6 s and
+    // reports what it did as one more "idle" status).
     std::thread::sleep(Duration::from_secs(7));
-    let after: Vec<String> = events.lock().unwrap().iter().filter(|(t, _)| *t > asked + Duration::from_millis(50)).map(|(_, e)| e["state"].to_string()).collect();
+    let after: Vec<String> = events.lock().unwrap().iter().filter(|(t, e)| *t > asked + Duration::from_millis(50) && e["state"] != "idle").map(|(_, e)| e["state"].to_string()).collect();
     assert!(after.is_empty(), "events after stop: {after:?}");
 }
 
