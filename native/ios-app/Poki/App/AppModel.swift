@@ -470,11 +470,22 @@ enum RunnerProbe {
     /// Asks the runner to shut itself down: it ends its test and exits, which takes the automation
     /// banner with it. Nothing happens when it is not running.
     static func shutdown() async {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:8100/wda/shutdown")!, timeoutInterval: 2)
-        request.httpMethod = "GET"
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
-        _ = try? await URLSession(configuration: configuration).data(for: request)
+        let session = URLSession(configuration: configuration)
+        func send(_ method: String, _ path: String) async -> Data? {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8100\(path)")!, timeoutInterval: 2)
+            request.httpMethod = method
+            return try? await session.data(for: request).0
+        }
+        // The shutdown request waits in WDA's queue behind a slow tree read; ending the session first
+        // voids whatever is queued, so the shutdown is handled at once.
+        if let status = await send("GET", "/status"),
+           let json = try? JSONSerialization.jsonObject(with: status) as? [String: Any],
+           let id = json["sessionId"] as? String, !id.isEmpty {
+            _ = await send("DELETE", "/session/\(id)")
+        }
+        _ = await send("GET", "/wda/shutdown")
     }
 
     static func answers() async -> Bool {
