@@ -329,7 +329,7 @@ final class PictureSketchTests: XCTestCase {
 
     /// Seen on the simulator: a scroll indicator fading out after a drag made a no-op wait answer
     /// screen_changed: true. A picture change is what a person would see.
-    func testAFadingScrollIndicatorIsNotAChangeButASheetIs() {
+    func testAFadingScrollIndicatorIsNotAChangeButASheetIs() throws {
         let plain = PictureSketch(png: png { _ in })
         let indicator = PictureSketch(png: png { $0.fill(CGRect(x: 396, y: 300, width: 3, height: 120)) })
         let cursor = PictureSketch(png: png { $0.fill(CGRect(x: 40, y: 700, width: 2, height: 22)) })
@@ -341,6 +341,15 @@ final class PictureSketchTests: XCTestCase {
         XCTAssertTrue(sheet.differs(from: plain))
         XCTAssertTrue(photo.differs(from: plain))
         XCTAssertFalse(plain.differs(from: PictureSketch(png: png { _ in })))
+        // A long indicator, as iOS draws it beside a two-page list, is a change (it moves a column of
+        // cells), and the change is told by its share and box, so the reader knows it is a strip.
+        let longIndicator = PictureSketch(png: png { $0.fill(CGRect(x: 396, y: 110, width: 3, height: 700)) })
+        let change = try XCTUnwrap(longIndicator.change(from: plain))
+        XCTAssertTrue(longIndicator.differs(from: plain))
+        XCTAssertTrue(change.share > 0.01 && change.share < 0.05, "\(change)")
+        XCTAssertTrue(change.x > 0.9 && change.width <= 2.0 / 32 && change.height > 0.7, "\(change)")
+        let page = try XCTUnwrap(sheet.change(from: plain))
+        XCTAssertTrue(page.share > 0.3 && page.y == 0 && page.width == 1, "\(page)")
     }
 }
 

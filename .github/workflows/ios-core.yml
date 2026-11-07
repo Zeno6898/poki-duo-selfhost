@@ -136,13 +136,13 @@ jobs:
         working-directory: native/ios/PokiCore
         run: |
           set -o pipefail
-          swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check.txt
+          POKI_PICTURES=../../../build/pictures swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check.txt
       - name: look/do in Settings (JSON tree, for comparison)
         if: always()
         working-directory: native/ios/PokiCore
         run: |
           set -o pipefail
-          POKI_TREE_FORMAT=json swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check-json.txt
+          POKI_TREE_FORMAT=json POKI_PICTURES=../../../build/pictures-json swift run -c release poki-sim-check 2>&1 | tee ../../../build/sim-check-json.txt
       - name: Summary
         if: always()
         run: |
@@ -157,3 +157,5 @@ jobs:
             build/sim-check.txt
             build/sim-check-json.txt
             build/wda.log
+            build/pictures
+            build/pictures-json

@@ -172,10 +172,11 @@ Each answer is facts only: the app in front, numbered elements, what each action
   numbers; `look` and `full=true` list everything.
 - **`screen_changed`** in every `do`: whether the elements, or only the picture, differ from the read
   before, so a no-op action is visible at once. The picture is compared as a 32 by 64 grid of grey
-  levels, and counts as changed when over 1 % of the cells move by more than 12 of 255: a scroll
-  indicator fading out, a cursor blinking or the clock ticking is not a change (seen on the
-  simulator: the indicator fading after a drag made a no-op wait answer `true`); a sheet, a photo or
-  a page coming in is.
+  levels, and counts as changed when over 1 % of the cells move by more than 12 of 255: a cursor
+  blinking or the clock ticking is not a change; a sheet, a photo or a page coming in is. A
+  picture-only change says how much and where (`in 3 % of it, within [372, 110, 13, 690]`), so the
+  long scroll indicator iOS draws beside a two-page list fading out (seen on the simulator after a
+  drag: 2-3 % in a strip at the right edge) reads as what it is without a look at the picture.
 - **The screenshot is one pixel per screen point** (402 px wide on a 402-point iPhone 17 Pro), and the
   answer says so: a point on the picture is a point to tap.
 - **Lean lists.** Text an element around it already says (a post's text and then each of its lines),

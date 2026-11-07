@@ -96,8 +96,15 @@ final class Computer: @unchecked Sendable {
         var changedLine: String?
         if changes, treeRead, let before = lastTree {
             let pictureChanged: Bool? = picture.flatMap { now in lastPicture.map { now.differs(from: $0) } }
+            // Where and how much the picture moved, so a small change (an indicator fading, a badge)
+            // can be told from a page coming in without looking.
+            var where_ = ""
+            if pictureChanged == true, let now = picture, let last = lastPicture, let change = now.change(from: last), size != nil {
+                let box = [change.x * screen.width, change.y * screen.height, change.width * screen.width, change.height * screen.height].map { Int($0.rounded()) }
+                where_ = ", in \(max(1, Int((change.share * 100).rounded()))) % of it, within [\(box.map(String.init).joined(separator: ", "))]"
+            }
             if tree != before { changedLine = "screen_changed: true (the elements changed)" }
-            else if pictureChanged == true { changedLine = "screen_changed: true (only the picture changed; the elements are the same)" }
+            else if pictureChanged == true { changedLine = "screen_changed: true (only the picture changed\(where_); the elements are the same)" }
             else { changedLine = "screen_changed: false (the elements\(pictureChanged == false ? " and the picture" : "") are the same as in the read before)" }
         }
         if treeRead { lastTree = tree }
