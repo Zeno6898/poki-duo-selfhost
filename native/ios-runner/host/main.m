@@ -6,7 +6,7 @@
 // test calls PokiRunnerShowInUse too, once it serves.
 //
 // Opened by hand from the home screen, XCTRunner's app delegate is emptied, so it starts no test: no
-// UI Automation, no passcode prompt. It shows a short screen and then opens Poki.
+// UI Automation, no passcode prompt. It shows a short screen with an Open Poki button.
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
@@ -18,7 +18,6 @@ static BOOL PokiStartedByTestManager(void) {
 }
 
 static UIColor *PokiBlue(void) { return [UIColor colorWithRed:0x20/255.0 green:0x84/255.0 blue:0xFD/255.0 alpha:1]; }
-static UIColor *PokiIndigo(void) { return [UIColor colorWithRed:0.29 green:0.33 blue:0.96 alpha:1]; }
 
 static void PokiOpenPokiNow(void) {
   [UIApplication.sharedApplication openURL:[NSURL URLWithString:@"poki://"] options:@{} completionHandler:nil];
@@ -62,17 +61,10 @@ static UIView *PokiTip(NSString *symbol, NSString *text) {
 @property (nonatomic) BOOL inUse;
 @end
 
-@implementation PokiRunnerScreen {
-  CAGradientLayer *_gradient;
-}
+@implementation PokiRunnerScreen
 
 - (void)viewDidLoad {
   [super viewDidLoad];
-  _gradient = [CAGradientLayer layer];
-  _gradient.colors = @[(id)PokiBlue().CGColor, (id)PokiIndigo().CGColor];
-  _gradient.startPoint = CGPointMake(0.2, 0);
-  _gradient.endPoint = CGPointMake(0.8, 1);
-  [self.view.layer insertSublayer:_gradient atIndex:0];
   self.view.backgroundColor = PokiBlue();
   self.view.accessibilityIdentifier = @"PokiRunnerScreen";
 
@@ -159,11 +151,6 @@ static UIView *PokiTip(NSString *symbol, NSString *text) {
   [NSLayoutConstraint activateConstraints:constraints];
 }
 
-- (void)viewDidLayoutSubviews {
-  [super viewDidLayoutSubviews];
-  _gradient.frame = self.view.bounds;
-}
-
 - (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleLightContent; }
 @end
 
@@ -206,14 +193,6 @@ static void PokiSceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSessi
   NSLog(@"PokiRunnerHost: showing Poki Runner's screen");
 }
 
-/// Opened by hand: after a moment on the screen (so it is never a blank flash), open Poki, which starts
-/// the runner itself when an agent needs it. Each time the runner comes to the front.
-static void PokiOpenPoki(id self, SEL _cmd, UIScene *scene) {
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) { PokiOpenPokiNow(); }
-  });
-}
-
 /// Runs when the library loads, before XCTRunner's main. (Running a whole app from here instead would
 /// hold dyld's lock and hang.)
 __attribute__((constructor)) static void PokiRunnerHostTakeOver(void) {
@@ -240,6 +219,5 @@ __attribute__((constructor)) static void PokiRunnerHostTakeOver(void) {
   }
   free(methods);
   class_replaceMethod(delegate, @selector(scene:willConnectToSession:options:), (IMP)PokiSceneWillConnect, "v@:@@@");
-  class_replaceMethod(delegate, @selector(sceneDidBecomeActive:), (IMP)PokiOpenPoki, "v@:@");
   NSLog(@"PokiRunnerHost: opened by hand; %u of %u XCTRunner delegate methods emptied", emptied, count);
 }
