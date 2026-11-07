@@ -13,6 +13,206 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fa05a26f4a479e218a9a78b290f13bd391d4c609
+
+      - name: Apply the reviewed self-hosted build changes
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/duo-selfhost.patch" <<'DUO_PATCH'
+          diff --git a/.github/workflows/ios-app.yml b/.github/workflows/ios-app.yml
+          index 7b0b7ad..d5b970b 100644
+          --- a/.github/workflows/ios-app.yml
+          +++ b/.github/workflows/ios-app.yml
+          @@ -6,7 +6,7 @@ name: iOS app
+           on:
+             workflow_dispatch:
+             push:
+          -    branches: [dev/ios-app]
+          +    branches: [dev/ios-app, duo/selfhost]
+               paths: [native/ios-app/**, native/ios/**, native/launcher/**, native/patches/**, native/ios-runner/branding/**, docs/images/**, .github/workflows/ios-app.yml]
+           
+           permissions:
+          diff --git a/native/ios-app/Poki/Connect/RelayIdentity.swift b/native/ios-app/Poki/Connect/RelayIdentity.swift
+          index b0c2212..36599bf 100644
+          --- a/native/ios-app/Poki/Connect/RelayIdentity.swift
+          +++ b/native/ios-app/Poki/Connect/RelayIdentity.swift
+          @@ -16,7 +16,7 @@ struct ConnectorSecret: Codable, Identifiable, Hashable {
+           @MainActor
+           @Observable
+           final class RelayIdentity {
+          -    static let relayBase = URL(string: "https://pokimcp.zheha.nz/v1")!
+          +    static let relayBase = URL(string: "https://poki-duo-20261107.poki-cf-relay.workers.dev/v1")!
+               private static let keyAccount = "relay.ed25519"
+               private static let secretsAccount = "relay.secrets"
+           
+          diff --git a/native/ios-app/Shared/PokiActivityAttributes.swift b/native/ios-app/Shared/PokiActivityAttributes.swift
+          index 63eecaf..554ca6f 100644
+          --- a/native/ios-app/Shared/PokiActivityAttributes.swift
+          +++ b/native/ios-app/Shared/PokiActivityAttributes.swift
+          @@ -70,7 +70,20 @@ struct PendingApproval: Codable, Hashable {
+           }
+           
+           enum SharedContainer {
+          -    static let appGroup = "group.nz.zheha.poki"
+          +    // Sideloaders rewrite App Group IDs. Both the app and widget must use the
+          +    // group granted by their signed provisioning profiles, rather than the source ID.
+          +    static let appGroup: String = {
+          +        let original = "group.nz.zheha.poki"
+          +        guard let profileURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          +              let profile = try? Data(contentsOf: profileURL),
+          +              let start = profile.range(of: Data("<plist".utf8)),
+          +              let end = profile.range(of: Data("</plist>".utf8), in: start.lowerBound..<profile.endIndex),
+          +              let plist = try? PropertyListSerialization.propertyList(from: profile.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any],
+          +              let entitlements = plist["Entitlements"] as? [String: Any],
+          +              let groups = entitlements["com.apple.security.application-groups"] as? [String]
+          +        else { return original }
+          +        return groups.first { $0 == original || $0.hasPrefix(original + ".") } ?? original
+          +    }()
+               static var url: URL? { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) }
+               static var thumbnailURL: URL? { url?.appendingPathComponent("activity-thumbnail.jpg") }
+               static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
+          diff --git a/native/ios-app/project.yml b/native/ios-app/project.yml
+          index 9c8d321..1ba6c70 100644
+          --- a/native/ios-app/project.yml
+          +++ b/native/ios-app/project.yml
+          @@ -14,7 +14,7 @@ packages:
+           settings:
+             base:
+               MARKETING_VERSION: "0.1.0"
+          -    CURRENT_PROJECT_VERSION: "1"
+          +    CURRENT_PROJECT_VERSION: "2"
+               SWIFT_VERSION: "5.0"
+               TARGETED_DEVICE_FAMILY: "1"
+               DEBUG_INFORMATION_FORMAT: dwarf
+          diff --git a/native/ios/PokiCore/Sources/PokiCore/Core.swift b/native/ios/PokiCore/Sources/PokiCore/Core.swift
+          index a7d4ff6..610175a 100644
+          --- a/native/ios/PokiCore/Sources/PokiCore/Core.swift
+          +++ b/native/ios/PokiCore/Sources/PokiCore/Core.swift
+          @@ -17,7 +17,7 @@ public struct CoreConfig: Sendable {
+               /// How long a call waits for a runner that is starting (the app wakes it when a call comes in).
+               public var runnerWait: Double
+           
+          -    public init(relayURL: URL = URL(string: "wss://pokimcp.zheha.nz/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2, runnerWait: Double = 15) {
+          +    public init(relayURL: URL = URL(string: "wss://poki-duo-20261107.poki-cf-relay.workers.dev/v1")!, runnerURL: URL = URL(string: "http://127.0.0.1:8100")!, sensitive: SensitivityRules = SensitivityRules(), approvalWait: Double = 20, toolDeadline: Double = 25, actionCap: Double = 6, readTimeout: Double = 4, busyWait: Double = 2, runnerWait: Double = 15) {
+                   self.relayURL = relayURL
+                   self.runnerURL = runnerURL
+                   self.sensitive = sensitive
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
+          index 8cbbfe5..4d113f6 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/CoreTests.swift
+          @@ -258,7 +258,7 @@ final class RelayTests: XCTestCase {
+                   do { let ok = await eventually { !sockets.sockets.value.isEmpty }; XCTAssertTrue(ok) }
+                   let socket = sockets.sockets.value[0]
+                   let label = base32(FakeKey().publicKey)
+          -        XCTAssertEqual(sockets.urls.value[0].absoluteString, "wss://pokimcp.zheha.nz/v1/\(label)/connect")
+          +        XCTAssertEqual(sockets.urls.value[0].absoluteString, "wss://poki-duo-20261107.poki-cf-relay.workers.dev/v1/\(label)/connect")
+           
+                   let nonce = Data(repeating: 7, count: 32)
+                   socket.push((["t": "challenge", "nonce": .string(nonce.base64EncodedString())] as JSON).serialized())
+          @@ -271,7 +271,7 @@ final class RelayTests: XCTestCase {
+                   XCTAssertEqual(hello["sig"]?.string, try FakeKey().sign(signed).base64EncodedString())
+           
+                   socket.push((["t": "ready", "max_body": 4_194_304] as JSON).serialized())
+          -        do { let ok = await eventually { events.value.contains(.relay(.ready(url: "wss://pokimcp.zheha.nz/v1/\(label)"))) }; XCTAssertTrue(ok) }
+          +        do { let ok = await eventually { events.value.contains(.relay(.ready(url: "wss://poki-duo-20261107.poki-cf-relay.workers.dev/v1/\(label)"))) }; XCTAssertTrue(ok) }
+                   do { let ok = await eventually { socket.sent.contains("ping") }; XCTAssertTrue(ok) }
+           
+                   let body = (["jsonrpc": "2.0", "id": 1, "method": "tools/list"] as JSON).serialized()
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift b/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          index 26f6c3f..ab32a72 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          @@ -136,12 +136,18 @@ final class FakeSocket: WebSocketConnection, @unchecked Sendable {
+                   }
+               }
+               func close(code: Int, reason: String) {
+          +        _ = closeAndSnapshot(code: code, reason: reason)
+          +    }
+          +    /// Capture delivered messages at the exact close boundary, under the send lock.
+          +    func closeAndSnapshot(code: Int, reason: String) -> [String] {
+                   lock.lock()
+                   closed = true
+          +        let snapshot = outbox
+                   let w = waiting
+                   waiting = nil
+                   lock.unlock()
+                   w?.resume(throwing: RelayFailure("closed"))
+          +        return snapshot
+               }
+               var sent: [String] { lock.lock(); defer { lock.unlock() }; return outbox }
+           }
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          index 8a0dc8f..1e4867a 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          @@ -13,7 +13,11 @@ final class RelaySoakTests: XCTestCase {
+               }
+           
+               func answers(_ socket: FakeSocket) -> [String] {
+          -        socket.sent.compactMap { text in
+          +        answers(socket.sent)
+          +    }
+          +
+          +    func answers(_ messages: [String]) -> [String] {
+          +        messages.compactMap { text in
+                       guard let frame = try? JSON.parse(text), frame["t"] == "res" else { return nil }
+                       return frame["id"]?.string
+                   }
+          @@ -55,8 +59,10 @@ final class RelaySoakTests: XCTestCase {
+                       }
+                       if round % 2 == 1 {
+                           // Cut the connection while requests are still running.
+          -                dropped[round] = Set(plan.filter { $0.socket == round }.map(\.id)).subtracting(answers(socket))
+          -                socket.close(code: 1006, reason: "gone")
+          +                // Reading sent first and closing later can classify an answer delivered
+          +                // between those operations as a response sent after the close.
+          +                let delivered = answers(socket.closeAndSnapshot(code: 1006, reason: "gone"))
+          +                dropped[round] = Set(plan.filter { $0.socket == round }.map(\.id)).subtracting(delivered)
+                       } else {
+                           let expected = Set(plan.filter { $0.socket == round && !$0.cancelled }.map(\.id))
+                           let done = await eventually(20) { expected.isSubset(of: Set(self.answers(socket))) }
+          diff --git a/native/ios/RelayCheck/Sources/relay-check/main.swift b/native/ios/RelayCheck/Sources/relay-check/main.swift
+          index 67d903e..fe29e3c 100644
+          --- a/native/ios/RelayCheck/Sources/relay-check/main.swift
+          +++ b/native/ios/RelayCheck/Sources/relay-check/main.swift
+          @@ -5,7 +5,7 @@ import PokiCore
+           // relay-check [wss://relay/v1] [seconds]: connects as a phone, prints the connector URL on one line
+           // ("connector: …"), the relay states, and each tool call, then exits after `seconds`.
+           let args = CommandLine.arguments
+          -let relay = URL(string: args.count > 1 ? args[1] : "wss://pokimcp.zheha.nz/v1")!
+          +let relay = URL(string: args.count > 1 ? args[1] : "wss://poki-duo-20261107.poki-cf-relay.workers.dev/v1")!
+           let seconds = args.count > 2 ? Double(args[2]) ?? 60 : 60
+           
+           struct Key: RelayKey {
+          DUO_PATCH
+          git apply --check "$RUNNER_TEMP/duo-selfhost.patch"
+          git apply "$RUNNER_TEMP/duo-selfhost.patch"
+          git diff --check
+
+      - name: Use the newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Repeat the corrected relay disconnect test
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            swift test --package-path native/ios/PokiCore --filter RelaySoakTests
+          done
+
+      - name: PokiCore tests
+        timeout-minutes: 12
+        run: swift test --package-path native/ios/PokiCore
+
   app:
     runs-on: macos-latest
     timeout-minutes: 60
@@ -125,6 +325,59 @@ jobs:
                    do { let ok = await eventually { socket.sent.contains("ping") }; XCTAssertTrue(ok) }
            
                    let body = (["jsonrpc": "2.0", "id": 1, "method": "tools/list"] as JSON).serialized()
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift b/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          index 26f6c3f..ab32a72 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/Fakes.swift
+          @@ -136,12 +136,18 @@ final class FakeSocket: WebSocketConnection, @unchecked Sendable {
+                   }
+               }
+               func close(code: Int, reason: String) {
+          +        _ = closeAndSnapshot(code: code, reason: reason)
+          +    }
+          +    /// Capture delivered messages at the exact close boundary, under the send lock.
+          +    func closeAndSnapshot(code: Int, reason: String) -> [String] {
+                   lock.lock()
+                   closed = true
+          +        let snapshot = outbox
+                   let w = waiting
+                   waiting = nil
+                   lock.unlock()
+                   w?.resume(throwing: RelayFailure("closed"))
+          +        return snapshot
+               }
+               var sent: [String] { lock.lock(); defer { lock.unlock() }; return outbox }
+           }
+          diff --git a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          index 8a0dc8f..1e4867a 100644
+          --- a/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          +++ b/native/ios/PokiCore/Tests/PokiCoreTests/RelaySoakTests.swift
+          @@ -13,7 +13,11 @@ final class RelaySoakTests: XCTestCase {
+               }
+           
+               func answers(_ socket: FakeSocket) -> [String] {
+          -        socket.sent.compactMap { text in
+          +        answers(socket.sent)
+          +    }
+          +
+          +    func answers(_ messages: [String]) -> [String] {
+          +        messages.compactMap { text in
+                       guard let frame = try? JSON.parse(text), frame["t"] == "res" else { return nil }
+                       return frame["id"]?.string
+                   }
+          @@ -55,8 +59,10 @@ final class RelaySoakTests: XCTestCase {
+                       }
+                       if round % 2 == 1 {
+                           // Cut the connection while requests are still running.
+          -                dropped[round] = Set(plan.filter { $0.socket == round }.map(\.id)).subtracting(answers(socket))
+          -                socket.close(code: 1006, reason: "gone")
+          +                // Reading sent first and closing later can classify an answer delivered
+          +                // between those operations as a response sent after the close.
+          +                let delivered = answers(socket.closeAndSnapshot(code: 1006, reason: "gone"))
+          +                dropped[round] = Set(plan.filter { $0.socket == round }.map(\.id)).subtracting(delivered)
+                       } else {
+                           let expected = Set(plan.filter { $0.socket == round && !$0.cancelled }.map(\.id))
+                           let done = await eventually(20) { expected.isSubset(of: Set(self.answers(socket))) }
           diff --git a/native/ios/RelayCheck/Sources/relay-check/main.swift b/native/ios/RelayCheck/Sources/relay-check/main.swift
           index 67d903e..fe29e3c 100644
           --- a/native/ios/RelayCheck/Sources/relay-check/main.swift
@@ -163,10 +416,6 @@ jobs:
           ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
           # The C ABI's symbols, for the log (the app's link step is the real check).
           (nm -g native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a 2>/dev/null | grep -E '_poki_(launcher|pair|string)_' | sort -u) || echo "nm listed no poki_ symbols"
-
-      - name: PokiCore tests
-        timeout-minutes: 12
-        run: swift test --package-path native/ios/PokiCore
 
       - name: Developer disk image mirror answers
         run: |
